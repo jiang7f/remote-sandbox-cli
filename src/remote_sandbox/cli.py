@@ -196,7 +196,7 @@ def peek_file(*, path: str, lines: int, tail: bool) -> int:
 
 def list_servers() -> int:
     settings = load_settings()
-    hosts = load_configured_hosts(require_identity=True)
+    hosts = load_configured_hosts(require_identity=False)
     records = list_binding_records()
     if not hosts:
         print(f"placeholder-limit: {format_size_compact(settings.placeholder_limit)}")
