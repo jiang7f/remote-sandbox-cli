@@ -1,37 +1,64 @@
 [project]
-name = "remote-sandbox-mcp"
-version = "0.7.5"
-description = "MCP server for SSH-based remote sandboxes: multi-server management, persistent sessions, background tmux tasks, and GPU/CPU/memory resource monitoring"
+name = "remote-sandbox"
+version = "0.1.0"
+description = "Editor-agnostic remote workspace sandbox with SSH-backed execution and sync"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+license-files = ["LICENSE"]
 authors = [
-  { name = "db.xiang" }
+    { name = "jiang7f", email = "jiang7ff@163.com" }
 ]
-keywords = ["mcp", "ssh", "sandbox", "remote", "claude", "ai", "tmux", "gpu"]
-classifiers = [
-  "Development Status :: 4 - Beta",
-  "Intended Audience :: Developers",
-  "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Topic :: Software Development :: Libraries",
-  "Topic :: System :: Systems Administration",
-]
+requires-python = ">=3.11"
 dependencies = [
-  "mcp>=1.12.0",
-  "paramiko>=3.4.0",
+    "watchdog>=6.0.0",
+]
+keywords = ["ssh", "remote", "sandbox", "sync", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: System :: Shells",
+    "Topic :: Utilities",
 ]
 
 [project.urls]
-Homepage = "https://github.com/DebinXiangQuantum/remote-sandbox-mcp"
-Repository = "https://github.com/DebinXiangQuantum/remote-sandbox-mcp"
-Issues = "https://github.com/DebinXiangQuantum/remote-sandbox-mcp/issues"
+Homepage = "https://github.com/jiang7f/remote-sandbox"
+Repository = "https://github.com/jiang7f/remote-sandbox"
+Issues = "https://github.com/jiang7f/remote-sandbox/issues"
 
 [project.scripts]
-remote-sandbox-mcp = "remote_sandbox_mcp.server:main"
+remote-sandbox = "remote_sandbox.cli:main"
+rsb = "remote_sandbox.cli:main"
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["uv_build>=0.11.26,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+source-include = ["LICENSE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_configs = true
+
+[dependency-groups]
+dev = [
+    "mypy>=2.1.0",
+    "pytest>=9.1.1",
+    "ruff>=0.15.20",
+]
