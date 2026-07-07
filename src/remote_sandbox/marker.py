@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import tomllib
 import uuid
@@ -95,6 +96,25 @@ def write_local_marker(root: Path, marker: WorkspaceMarker) -> None:
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
+
+
+def remove_local_metadata(root: Path) -> bool:
+    """Delete the local ``.remote-sandbox`` directory (marker + sync state).
+
+    Returns True if something was removed. Used by ``forget`` so a forgotten
+    connection leaves no local binding metadata behind.
+    """
+    metadata_dir = root.expanduser() / METADATA_DIR
+    if metadata_dir.is_symlink():
+        metadata_dir.unlink()
+        return True
+    if metadata_dir.is_dir():
+        shutil.rmtree(metadata_dir)
+        return True
+    if metadata_dir.exists():
+        metadata_dir.unlink()
+        return True
+    return False
 
 
 def marker_to_toml(marker: WorkspaceMarker) -> str:

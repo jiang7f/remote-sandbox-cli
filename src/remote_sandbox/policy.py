@@ -22,6 +22,20 @@ class PolicyDecision(StrEnum):
 
 POLICY_FILE_NAME = ".rsbignore"
 
+# OS / editor cruft that should never sync. Applied as soft defaults (a user `.rsbignore`
+# rule can still re-enable one), so a directory containing only these counts as empty.
+_JUNK_IGNORE_PATTERNS = (
+    ".DS_Store",
+    "*/.DS_Store",
+    "._*",
+    "*/._*",
+    ".Spotlight-V100",
+    ".Trashes",
+    ".fseventsd",
+    "Thumbs.db",
+    "*/Thumbs.db",
+)
+
 
 class PolicyEngine(Protocol):
     def is_ignored(self, path: str) -> bool: ...
@@ -50,6 +64,10 @@ class StaticPolicyEngine:
             PolicyRule(PolicyDecision.IGNORE, ".remote-sandbox/**", explicit=True),
             PolicyRule(PolicyDecision.IGNORE, ".remote-sandbox/", explicit=True),
         ]
+        rules.extend(
+            PolicyRule(PolicyDecision.IGNORE, pattern, explicit=False)
+            for pattern in _JUNK_IGNORE_PATTERNS
+        )
         rules.extend(PolicyRule(PolicyDecision.IGNORE, pattern) for pattern in ignore_patterns)
         rules.extend(
             PolicyRule(PolicyDecision.PLACEHOLDER, pattern) for pattern in placeholder_patterns

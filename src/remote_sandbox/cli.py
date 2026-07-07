@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import os
 import secrets
+import shutil
 import sys
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from remote_sandbox.daemon import (
     stop_daemon_result,
 )
 from remote_sandbox.fetch import FetchError, fetch_placeholders
+from remote_sandbox.marker import METADATA_DIR, read_local_marker, remove_local_metadata
 from remote_sandbox.peek import PeekError, peek_placeholder
 from remote_sandbox.registry import (
     BindingRecord,
@@ -39,6 +42,7 @@ from remote_sandbox.shell import enter_shell_loop
 from remote_sandbox.ssh import SshError, SubprocessSshRunner
 from remote_sandbox.ssh_config import SshHost, load_configured_hosts
 from remote_sandbox.sync import SyncExecutionError
+from remote_sandbox.syncsession import SyncSession
 
 CLI_ERRORS = (
     BindError,
@@ -167,7 +171,7 @@ def fetch_placeholder(*, path: str | None, fetch_all: bool) -> int:
         raise ValueError("fetch requires a path or --all")
     count, cancelled = fetch_placeholders(
         local_root=_workspace_root_for_cwd(Path.cwd()),
-        runner=SubprocessSshRunner(),
+        runner=_runner_for_cwd(),
         path=path,
         fetch_all=fetch_all,
         confirm=confirm_prompt,
@@ -185,7 +189,7 @@ def fetch_placeholder(*, path: str | None, fetch_all: bool) -> int:
 def peek_file(*, path: str, lines: int, tail: bool) -> int:
     content = peek_placeholder(
         local_root=_workspace_root_for_cwd(Path.cwd()),
-        runner=SubprocessSshRunner(),
+        runner=_runner_for_cwd(),
         path=path,
         lines=lines,
         tail=tail,
@@ -243,7 +247,9 @@ def show_status() -> int:
 
 def start_binding_daemon(name: str | None) -> int:
     record = _record_for_execution(name)
-    status = ensure_daemon(Path(record.local_path))
+    local_root = _require_live_workspace(record)
+    _ensure_master(record.target)
+    status = ensure_daemon(local_root)
     pid = f" pid={status.pid}" if status.pid is not None else ""
     print(f"Daemon running for {record.name}:{pid}")
     return 0
@@ -261,14 +267,44 @@ def stop_binding_daemon(name: str | None) -> int:
     return 0
 
 
+def forget_connection(name: str) -> int:
+    record = find_binding_record(name)
+    if record is None:
+        print(f"{_error_prefix()} no connection named {name!r}", file=sys.stderr)
+        return 2
+    local_root = Path(record.local_path)
+    status = daemon_status(local_root)
+    if status.running:
+        pid = f" (pid={status.pid})" if status.pid is not None else ""
+        if not confirm_prompt(
+            f"A sync daemon is running for {record.name}{pid}; a transfer may be in progress. "
+            "Stop it and forget anyway? [y/N] "
+        ):
+            print(f"Kept connection {record.name}")
+            return 0
+        if stop_daemon_result(local_root) is StopResult.TIMEOUT:
+            print(
+                f"{_error_prefix()} daemon for {record.name} did not stop; "
+                "try again once it settles",
+                file=sys.stderr,
+            )
+            return 2
+    delete_binding_record(record.name)
+    if remove_local_metadata(local_root):
+        print(f"Forgot connection {record.name}; removed {local_root / METADATA_DIR}")
+    else:
+        print(f"Forgot connection {record.name}")
+    return 0
+
+
 def open_wrapped_shell(name: str | None) -> int:
     return _open_wrapped_shell_for_record(_record_for_execution(name))
 
 
 def _open_wrapped_shell_for_record(record: BindingRecord) -> int:
-    local_root = Path(record.local_path)
+    local_root = _require_live_workspace(record)
+    runner = _connected_runner(record.target)
     ensure_daemon(local_root)
-    runner = SubprocessSshRunner()
 
     barrier_seen = False
 
@@ -305,9 +341,10 @@ def _ensure_daemon_for_record(record: BindingRecord) -> None:
 def run_remote_command(items: list[str]) -> int:
     record_name, command_argv = _parse_run_items(items)
     record = _record_for_execution(record_name)
-    local_root = Path(record.local_path)
+    local_root = _require_live_workspace(record)
+    runner = _connected_runner(record.target)
     ensure_daemon(local_root)
-    result = SubprocessSshRunner().run_command(
+    result = runner.run_command(
         record.target,
         record.remote_path,
         tuple(command_argv),
@@ -316,8 +353,26 @@ def run_remote_command(items: list[str]) -> int:
         sys.stdout.write(result.stdout)
     if result.stderr:
         sys.stderr.write(result.stderr)
-    _poke_or_restart_daemon(local_root, "run")
+    # Block until the remote's output files are actually local, so the caller (an AI)
+    # can read real content immediately instead of a mid-transfer "syncing" stub.
+    _sync_now(local_root, runner, record)
     return result.returncode
+
+
+def _sync_now(local_root: Path, runner: SubprocessSshRunner, record: BindingRecord) -> None:
+    """Run one foreground sync and report completion; keep the daemon as a fallback."""
+    try:
+        SyncSession(
+            local_root=local_root,
+            runner=runner,
+            target=record.target,
+            remote=record.remote_path,
+        ).sync_once()
+        print("[rsb] synced", file=sys.stderr)
+    except CLI_ERRORS as exc:
+        # Don't fail the command over a sync hiccup; let the daemon retry and tell the user.
+        print(f"{_error_prefix()} sync after run failed: {exc}", file=sys.stderr)
+        _poke_or_restart_daemon(local_root, "run")
 
 
 def _parse_run_items(items: list[str]) -> tuple[str | None, list[str]]:
@@ -346,30 +401,75 @@ def _record_for_execution(name: str | None) -> BindingRecord:
     return record
 
 
-def enter_and_bind(*, target: str, remote: str, local: Path, open_shell: bool) -> int:
-    enter_result = enter_shell_loop(target, remote, nonce=secrets.token_hex(8))
-    if enter_result.exit_code != 0:
-        return enter_result.exit_code
-    if enter_result.remote is None:
-        return 0
-    selected_local = Path(enter_result.local) if enter_result.local is not None else local
-    try:
-        result = bind_workspace(
-            target=target,
-            remote=enter_result.remote,
-            local=selected_local,
-            runner=SubprocessSshRunner(),
-            confirm=confirm_prompt,
-            connection_name=enter_result.name,
+def _ensure_master(target: str) -> None:
+    """Establish the shared SSH master (prompting for a password once) from the foreground."""
+    SubprocessSshRunner().ensure_master(target)
+
+
+def _connected_runner(target: str) -> SubprocessSshRunner:
+    """A runner with its SSH master already established, so later calls never re-prompt."""
+    runner = SubprocessSshRunner()
+    runner.ensure_master(target)
+    return runner
+
+
+def _require_live_workspace(record: BindingRecord) -> Path:
+    """Resolve a record's local root, failing with an actionable message if it is stale.
+
+    A binding can outlive its local directory (for example a temporary workspace that
+    was cleaned up). The low-level daemon only sees a missing marker and reports the
+    cryptic "not a bound workspace"; surface the recovery steps instead.
+    """
+    local = Path(record.local_path)
+    if not local.exists() or read_local_marker(local) is None:
+        raise RegistryError(
+            f"connection {record.name!r} points to a missing or unbound local path: "
+            f"{record.local_path}. "
+            f"Run `rsb reconnect {record.name} --local <new-path>` to repair it, "
+            f"or `rsb forget {record.name}` to remove it from {registry_path()}"
         )
-    except CLI_ERRORS as exc:
-        print(f"{_error_prefix()} {exc}", file=sys.stderr)
-        return 2
-    _print_connection(result.connection)
-    if open_shell:
-        return _open_wrapped_shell_for_record(result.connection)
-    _ensure_daemon_for_record(result.connection)
-    return 0
+    return local
+
+
+def enter_and_bind(*, target: str, remote: str, local: Path, open_shell: bool) -> int:
+    runner = SubprocessSshRunner()
+    remote_cwd = remote
+    decision = {"declined": False}
+
+    def _confirm(prompt: str) -> bool:
+        answer = confirm_prompt(prompt)
+        decision["declined"] = not answer
+        return answer
+
+    while True:
+        decision["declined"] = False
+        enter_result = enter_shell_loop(target, remote_cwd, nonce=secrets.token_hex(8))
+        if enter_result.exit_code != 0:
+            return enter_result.exit_code
+        if enter_result.remote is None:
+            return 0
+        selected_local = Path(enter_result.local) if enter_result.local is not None else local
+        try:
+            result = bind_workspace(
+                target=target,
+                remote=enter_result.remote,
+                local=selected_local,
+                runner=runner,
+                confirm=_confirm,
+                connection_name=enter_result.name,
+            )
+        except CLI_ERRORS as exc:
+            if decision["declined"]:
+                # Answered N: keep browsing, resuming at the directory they tried to bind.
+                remote_cwd = enter_result.remote
+                continue
+            print(f"{_error_prefix()} {exc}", file=sys.stderr)
+            return 2
+        _print_connection(result.connection)
+        if open_shell:
+            return _open_wrapped_shell_for_record(result.connection)
+        _ensure_daemon_for_record(result.connection)
+        return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -467,7 +567,7 @@ def main(argv: list[str] | None = None) -> int:
                 target=args.target,
                 remote=args.remote,
                 local=Path(args.local),
-                runner=SubprocessSshRunner(),
+                runner=_connected_runner(args.target),
                 confirm=confirm_prompt,
                 connection_name=args.name,
             )
@@ -510,7 +610,7 @@ def main(argv: list[str] | None = None) -> int:
                 target=record.target,
                 remote=record.remote_path,
                 local=local,
-                runner=SubprocessSshRunner(),
+                runner=_connected_runner(record.target),
                 confirm=confirm_prompt,
                 connection_name=record.name,
             )
@@ -525,15 +625,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "forget":
         try:
-            removed = delete_binding_record(args.name)
+            return forget_connection(args.name)
         except CLI_ERRORS as exc:
             print(f"{_error_prefix()} {exc}", file=sys.stderr)
             return 2
-        if not removed:
-            print(f"{_error_prefix()} no connection named {args.name!r}", file=sys.stderr)
-            return 2
-        print(f"Forgot connection {args.name}")
-        return 0
 
     if args.command == "fetch":
         try:
@@ -567,33 +662,36 @@ def _format_servers_table(
     records_by_target: dict[str, list[BindingRecord]] = {}
     for record in records:
         records_by_target.setdefault(record.target, []).append(record)
-    lines = [
-        f"placeholder-limit: {format_size_compact(placeholder_limit)}",
-        "",
-        "TARGET | BOUND | CONNECTIONS | CPU | MEM | GPU",
-    ]
+    headers = ["TARGET", "BOUND", "CONNECTIONS", "CPU", "MEM", "GPU"]
+    rows_wide = []
+    rows_tall = []
     for host in hosts:
+        probe = probes.get(host.alias)
+        if probe is not None and (probe.error is not None or probe.resources is None):
+            continue
         target_records = sorted(records_by_target.get(host.alias, ()), key=lambda item: item.name)
         bound = "yes" if target_records else "-"
-        names = ", ".join(record.name for record in target_records) if target_records else "-"
+        names = [record.name for record in target_records]
         cpu, mem, gpu = (
-            _list_resource_columns(probes[host.alias])
-            if host.alias in probes
+            _list_resource_columns(probe)
+            if probe is not None
             else ("pending", "pending", "pending")
         )
-        lines.append(
-            " | ".join(
-                [
-                    host.alias,
-                    bound,
-                    names,
-                    cpu,
-                    mem,
-                    gpu,
-                ]
-            )
-        )
-    return "\n".join(lines)
+        # Wide layout comma-joins the names; the narrow fallback lists one per line so a
+        # long connection list no longer blows the table past the terminal width.
+        joined = ", ".join(names) if names else "-"
+        stacked = "\n".join(names) if names else "-"
+        rows_wide.append([host.alias, bound, joined, cpu, mem, gpu])
+        rows_tall.append([host.alias, bound, stacked, cpu, mem, gpu])
+    table = _format_table(headers, rows_wide)
+    body = table if _table_fits(table) else _format_records_vertical(headers, rows_tall)
+    return "\n".join(
+        [
+            f"placeholder-limit: {format_size_compact(placeholder_limit)}",
+            "",
+            body,
+        ]
+    )
 
 
 def _format_status_table(
@@ -605,15 +703,83 @@ def _format_status_table(
         records,
         key=lambda record: (record.target, record.name, record.local_path, record.remote_path),
     )
-    lines = ["NAME | REMOTE | LOCAL | REMOTE_PATH | DAEMON | CURRENT"]
+    headers = ["NAME", "REMOTE", "LOCAL", "REMOTE_PATH", "DAEMON", "CURRENT"]
+    rows = []
     for record in sorted_records:
         current = "*" if record.workspace_id == current_workspace_id else ""
         daemon = _daemon_column(record)
-        lines.append(
-            f"{record.name} | {record.target} | "
-            f"{record.local_path} | {record.remote_path} | {daemon} | {current}"
+        rows.append(
+            [
+                record.name,
+                record.target,
+                record.local_path,
+                record.remote_path,
+                daemon,
+                current,
+            ]
         )
-    return "\n".join(lines)
+    table = _format_table(headers, rows)
+    # A single long temp path can push the horizontal table past the terminal width,
+    # so it wraps and the columns misalign (looks like garbled output). Fall back to a
+    # per-record vertical layout that never wraps when it would not fit.
+    if _table_fits(table):
+        return table
+    return _format_records_vertical(headers, rows)
+
+
+def _format_table(headers: list[str], rows: list[list[str]]) -> str:
+    widths = [_display_width(header) for header in headers]
+    for row in rows:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], _display_width(value))
+
+    def format_row(row: list[str]) -> str:
+        cells = [
+            value + " " * (widths[index] - _display_width(value))
+            for index, value in enumerate(row)
+        ]
+        return "  ".join(cells).rstrip()
+
+    return "\n".join([format_row(headers), *(format_row(row) for row in rows)])
+
+
+def _terminal_width() -> int | None:
+    if not os.isatty(1):
+        return None
+    return shutil.get_terminal_size(fallback=(80, 24)).columns
+
+
+def _table_fits(table: str) -> bool:
+    width = _terminal_width()
+    if width is None:
+        return True
+    return all(_display_width(line) <= width for line in table.splitlines())
+
+
+def _format_records_vertical(headers: list[str], rows: list[list[str]]) -> str:
+    label_width = max(_display_width(header) for header in headers)
+    indent = " " * (label_width + 2)
+    blocks = []
+    for row in rows:
+        lines = []
+        for header, value in zip(headers, row, strict=True):
+            pad = " " * (label_width - _display_width(header))
+            parts = value.split("\n") if value else [""]
+            lines.append(f"{header}{pad}  {parts[0]}".rstrip())
+            # A multi-line cell (e.g. one connection name per line) aligns under the value.
+            lines.extend(f"{indent}{cont}".rstrip() for cont in parts[1:])
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _display_width(value: str) -> int:
+    width = 0
+    for char in value:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    return width
+
 
 
 def _daemon_column(record: BindingRecord) -> str:
@@ -652,6 +818,14 @@ def _workspace_root_for_cwd(cwd: Path) -> Path:
     if record is not None:
         return Path(record.local_path)
     return cwd
+
+
+def _runner_for_cwd() -> SubprocessSshRunner:
+    """A runner with the SSH master established for the current workspace's target."""
+    record = current_workspace_record(None, Path.cwd())
+    if record is None:
+        return SubprocessSshRunner()
+    return _connected_runner(record.target)
 
 
 def _print_connection(record: BindingRecord) -> None:

@@ -113,9 +113,9 @@ rsb list
 ```text
 placeholder-limit: 10MB
 
-TARGET | BOUND | CONNECTIONS | CPU | MEM | GPU
-server-a | yes | train | 0.42/32 | 18.5% | 0:12% 2048/24576MB
-server-b | - | - | 1.10/64 | 33.2% | none
+TARGET    BOUND  CONNECTIONS  CPU      MEM    GPU
+server-a  yes    train        0.42/32  18.5%  0:12% 2048/24576MB
+server-b  -      -            1.10/64  33.2%  none
 ```
 
 字段含义：
@@ -138,9 +138,9 @@ rsb status
 输出格式：
 
 ```text
-NAME | REMOTE | LOCAL | REMOTE_PATH | DAEMON | CURRENT
-train | server-a | /local/path/project | ~/workspaces/project | running:12345 | *
-eval | server-b | /local/path/other | /data/other | stopped |
+NAME   REMOTE    LOCAL                REMOTE_PATH           DAEMON         CURRENT
+train  server-a  /local/path/project  ~/workspaces/project  running:12345  *
+eval   server-b  /local/path/other    /data/other           stopped
 ```
 
 `DAEMON` 显示该绑定工作区的同步 daemon 是否正在运行；`CURRENT` 为 `*` 表示当前目录属于该绑定工作区。

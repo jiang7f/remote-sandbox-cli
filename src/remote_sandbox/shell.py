@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import json
 import os
 import pty
 import re
 import select
 import shlex
+import struct
 import sys
+import termios
+import tty
 from collections.abc import Callable, Iterable
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 
 from remote_sandbox.registry import RegistryError, validate_connection_name
-from remote_sandbox.ssh import validate_remote_path, validate_target
+from remote_sandbox.ssh import ssh_control_opts, validate_remote_path, validate_target
 
 _SAFE_LABEL_CHARS = re.compile(r"[^A-Za-z0-9_.@:-]")
 
@@ -71,11 +75,15 @@ def build_managed_remote_shell_command(target: str, cwd: str, *, nonce: str) -> 
         "  {\n"
         "    printf '__rsb_nonce=%s\\n' \"$nonce\"\n"
         "    cat <<'EOF'\n"
+        "if [ -f /etc/bash.bashrc ]; then . /etc/bash.bashrc; fi\n"
+        "if [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n"
         "__rsb_prompt() {\n"
         "  local s=$?\n"
         "  printf '\\033]777;remote-sandbox;cmd-done;%s;%s\\007' "
         "\"$__rsb_nonce\" \"$s\"\n"
-        "  PS1='[${RSB_DISPLAY_LABEL}] ${USER:-user}@\\h \\W % '\n"
+        "  PS1='\\[\\e[01;36m\\][${RSB_DISPLAY_LABEL}]\\[\\e[00m\\] "
+        "${CONDA_PROMPT_MODIFIER}\\[\\e[01;32m\\]${USER:-user}@\\h\\[\\e[00m\\]:"
+        "\\[\\e[01;34m\\]\\W\\[\\e[00m\\] % '\n"
         "}\n"
         "PROMPT_COMMAND=__rsb_prompt\n"
         "trap 'rm -f \"${BASH_SOURCE[0]}\"' EXIT\n"
@@ -97,7 +105,7 @@ def build_managed_remote_shell_command(target: str, cwd: str, *, nonce: str) -> 
             shlex.quote(nonce),
         ]
     )
-    return ["ssh", "-tt", target, remote_command]
+    return ["ssh", *ssh_control_opts(), "-tt", target, remote_command]
 
 
 def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> list[str]:
@@ -119,6 +127,8 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "  {\n"
         "    printf '__rsb_nonce=%s\\n' \"$nonce\"\n"
         "    cat <<'EOF'\n"
+        "if [ -f /etc/bash.bashrc ]; then . /etc/bash.bashrc; fi\n"
+        "if [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n"
         "rsb() {\n"
         "  if [ \"${1:-}\" = connect ]; then\n"
         "    shift\n"
@@ -202,7 +212,12 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "  fi\n"
         "  command rsb \"$@\"\n"
         "}\n"
-        "PS1='[${RSB_DISPLAY_LABEL}:enter] ${USER:-user}@\\h \\W % '\n"
+        "__rsb_enter_prompt() {\n"
+        "  PS1='\\[\\e[01;33m\\][${RSB_DISPLAY_LABEL}:enter]\\[\\e[00m\\] "
+        "${CONDA_PROMPT_MODIFIER}\\[\\e[01;32m\\]${USER:-user}@\\h\\[\\e[00m\\]:"
+        "\\[\\e[01;34m\\]\\W\\[\\e[00m\\] % '\n"
+        "}\n"
+        "PROMPT_COMMAND=__rsb_enter_prompt\n"
         "trap 'rm -f \"${BASH_SOURCE[0]}\"' EXIT\n"
         "EOF\n"
         "  } > \"$rc\"\n"
@@ -222,7 +237,7 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
             shlex.quote(nonce),
         ]
     )
-    return ["ssh", "-tt", target, remote_command]
+    return ["ssh", *ssh_control_opts(), "-tt", target, remote_command]
 
 
 class ShellOutputParser:
@@ -353,15 +368,21 @@ def enter_shell_loop(
     selected_remote: str | None = None
     selected_local: str | None = None
     selected_name: str | None = None
+    # Once a connect-request arrives the remote shell exits immediately; the bytes that
+    # follow are just bash's "exit" line and OpenSSH's "Connection to ... closed." notice.
+    # Stop echoing after the request so the local binding prompt starts on a clean screen.
+    connecting = False
 
     def on_event(event: ShellEvent) -> None:
-        nonlocal selected_remote, selected_local, selected_name
+        nonlocal selected_remote, selected_local, selected_name, connecting
         if isinstance(event, BytesEvent):
-            os.write(sys.stdout.fileno(), event.data)
+            if not connecting:
+                os.write(sys.stdout.fileno(), event.data)
         elif isinstance(event, ConnectRequestEvent):
             selected_remote = event.remote
             selected_local = event.local
             selected_name = event.name
+            connecting = True
 
     shell_backend = backend or _pty_enter_shell_backend
     exit_code = shell_backend(argv, nonce, on_event)
@@ -378,26 +399,28 @@ def _pty_shell_backend(argv: list[str], nonce: str, on_barrier: Callable[[int], 
     if pid == 0:
         os.execvp(argv[0], argv)
     parser = ShellOutputParser(nonce)
-    try:
-        while True:
-            readable, _, _ = select.select([master_fd, sys.stdin.fileno()], [], [])
-            if master_fd in readable:
-                try:
-                    data = os.read(master_fd, 4096)
-                except OSError:
-                    break
-                if not data:
-                    break
-                _handle_shell_events(parser.feed(data), on_barrier=on_barrier)
-            if sys.stdin.fileno() in readable:
-                data = os.read(sys.stdin.fileno(), 4096)
-                if not data:
-                    break
-                os.write(master_fd, data)
-    finally:
-        _handle_shell_events(parser.flush(), on_barrier=on_barrier)
-        with suppress(OSError):
-            os.close(master_fd)
+    stdin_fd = sys.stdin.fileno()
+    with _raw_terminal(stdin_fd), _mirrored_window_size(master_fd):
+        try:
+            while True:
+                readable, _, _ = select.select([master_fd, stdin_fd], [], [])
+                if master_fd in readable:
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    _handle_shell_events(parser.feed(data), on_barrier=on_barrier)
+                if stdin_fd in readable:
+                    data = os.read(stdin_fd, 4096)
+                    if not data:
+                        break
+                    os.write(master_fd, data)
+        finally:
+            _handle_shell_events(parser.flush(), on_barrier=on_barrier)
+            with suppress(OSError):
+                os.close(master_fd)
     _, status = os.waitpid(pid, 0)
     if os.WIFEXITED(status):
         return os.WEXITSTATUS(status)
@@ -415,34 +438,65 @@ def _pty_enter_shell_backend(
     if pid == 0:
         os.execvp(argv[0], argv)
     parser = ShellOutputParser(nonce)
-    try:
-        while True:
-            readable, _, _ = select.select([master_fd, sys.stdin.fileno()], [], [])
-            if master_fd in readable:
-                try:
-                    data = os.read(master_fd, 4096)
-                except OSError:
-                    break
-                if not data:
-                    break
-                for event in parser.feed(data):
-                    on_event(event)
-            if sys.stdin.fileno() in readable:
-                data = os.read(sys.stdin.fileno(), 4096)
-                if not data:
-                    break
-                os.write(master_fd, data)
-    finally:
-        for event in parser.flush():
-            on_event(event)
-        with suppress(OSError):
-            os.close(master_fd)
+    stdin_fd = sys.stdin.fileno()
+    with _raw_terminal(stdin_fd), _mirrored_window_size(master_fd):
+        try:
+            while True:
+                readable, _, _ = select.select([master_fd, stdin_fd], [], [])
+                if master_fd in readable:
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    for event in parser.feed(data):
+                        on_event(event)
+                if stdin_fd in readable:
+                    data = os.read(stdin_fd, 4096)
+                    if not data:
+                        break
+                    os.write(master_fd, data)
+        finally:
+            for event in parser.flush():
+                on_event(event)
+            with suppress(OSError):
+                os.close(master_fd)
     _, status = os.waitpid(pid, 0)
     if os.WIFEXITED(status):
         return os.WEXITSTATUS(status)
     if os.WIFSIGNALED(status):
         return 128 + os.WTERMSIG(status)
     return 1
+
+
+@contextmanager
+def _raw_terminal(fd: int):  # type: ignore[no-untyped-def]
+    try:
+        old_attrs = termios.tcgetattr(fd)
+    except termios.error:
+        yield
+        return
+    try:
+        tty.setraw(fd)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+
+@contextmanager
+def _mirrored_window_size(master_fd: int):  # type: ignore[no-untyped-def]
+    _copy_window_size(master_fd)
+    yield
+
+
+def _copy_window_size(master_fd: int) -> None:
+    try:
+        size = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+        rows, cols, xpix, ypix = struct.unpack("HHHH", size)
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, xpix, ypix))
+    except OSError:
+        return
 
 
 def _handle_shell_events(

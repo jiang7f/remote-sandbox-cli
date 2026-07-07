@@ -15,6 +15,7 @@ from remote_sandbox.marker import (
     read_local_marker,
     write_local_marker,
 )
+from remote_sandbox.policy import POLICY_FILE_NAME, PolicyEngine, StaticPolicyEngine
 from remote_sandbox.registry import (
     BindingRecord,
     ensure_connection_name_available,
@@ -88,7 +89,7 @@ def bind_workspace(
     remote_marker = _read_remote_marker_checked(runner, safe_target, safe_remote)
 
     if local_marker is None and remote_marker is None:
-        _require_new_binding_confirmation_if_needed(
+        _guard_new_pairing(
             runner,
             safe_target,
             safe_remote,
@@ -118,7 +119,7 @@ def bind_workspace(
             remote_path=safe_remote,
         )
         created = False
-        _require_new_binding_confirmation_if_needed(
+        _guard_new_pairing(
             runner,
             safe_target,
             safe_remote,
@@ -130,6 +131,13 @@ def bind_workspace(
     elif local_marker is None and remote_marker is not None:
         if not _same_remote_binding(remote_marker, safe_target, safe_remote):
             raise BindError("Remote workspace marker points to a different binding")
+        _guard_new_pairing(
+            runner,
+            safe_target,
+            safe_remote,
+            local_root,
+            confirm,
+        )
         marker = remote_marker.with_binding(
             target=safe_target,
             local_path=str(local_root),
@@ -215,37 +223,71 @@ def _write_remote_marker(
         raise BindError(f"Failed to write remote workspace marker: {exc}") from exc
 
 
-def _remote_has_user_content(runner: SshRunner, target: str, remote: str) -> bool:
-    return any(name != METADATA_DIR for name in runner.listdir(target, remote))
+def _remote_user_content(
+    runner: SshRunner, target: str, remote: str, policy: PolicyEngine
+) -> list[str]:
+    """Top-level remote names that would actually sync (ignored/junk excluded)."""
+    return sorted(name for name in runner.listdir(target, remote) if not policy.is_ignored(name))
 
 
-def _require_new_binding_confirmation_if_needed(
+def _local_user_content(local_root: Path, policy: PolicyEngine) -> list[str]:
+    """Top-level local names that would actually sync (ignored/junk excluded).
+
+    A directory that is empty, or holds only ignored entries (`.remote-sandbox`, OS
+    cruft like `.DS_Store`), counts as empty for binding purposes.
+    """
+    try:
+        return sorted(
+            entry.name for entry in local_root.iterdir() if not policy.is_ignored(entry.name)
+        )
+    except FileNotFoundError:
+        return []
+
+
+def _guard_new_pairing(
     runner: SshRunner,
     target: str,
     remote: str,
     local_root: Path,
     confirm: ConfirmCallback | None,
 ) -> None:
-    has_user_content = _remote_has_user_content(runner, target, remote)
+    """Gate a *new* local<->remote pairing on directory emptiness.
+
+    Binding runs a bidirectional merge, so pairing two independent non-empty
+    directories would silently union them (or fail mid-sync on conflicts). Require
+    at least one empty side; when exactly one side has content, confirm the sync
+    direction first. Files the policy ignores (`.remote-sandbox`, OS cruft) don't count.
+    Not called for an already-bound same-workspace reconnect.
+    """
+    policy = StaticPolicyEngine.from_file(local_root / POLICY_FILE_NAME)
+    local_names = _local_user_content(local_root, policy)
+    remote_names = _remote_user_content(runner, target, remote, policy)
+    local_content = bool(local_names)
+    remote_content = bool(remote_names)
+    if local_content and remote_content:
+        raise BindError(
+            "Refusing to bind two non-empty directories: "
+            f"local {_display_safe(str(local_root))} (e.g. {_display_safe(local_names[0])}) "
+            f"and remote {_display_safe(target)}:{_display_safe(remote)} "
+            f"(e.g. {_display_safe(remote_names[0])}) both contain files. "
+            "Binding needs at least one empty side; clear or move one side first."
+        )
     if confirm is None:
-        if has_user_content:
-            raise BindError(f"Binding cancelled for non-empty remote directory: {target}:{remote}")
         return
-    remote_note = (
-        "Remote directory is not empty and is not bound yet."
-        if has_user_content
-        else "Remote directory is empty or newly created."
-    )
+    if remote_content:
+        note = "Remote has files; they will sync down into the empty local directory."
+    elif local_content:
+        note = "Local has files; they will sync up into the empty remote directory."
+    else:
+        note = "Both directories are empty or newly created."
     prompt = (
         "Create a new remote-sandbox binding?\n"
         f"  remote: {_display_safe(target)}:{_display_safe(remote)}\n"
         f"  local:  {_display_safe(str(local_root))}\n"
-        f"  note:   {remote_note}\n\n"
+        f"  note:   {note}\n\n"
         "Continue? [y/N] "
     )
     if not confirm(prompt):
-        if has_user_content:
-            raise BindError(f"Binding cancelled for non-empty remote directory: {target}:{remote}")
         raise BindError(f"Binding cancelled: {target}:{remote} -> {local_root}")
 
 

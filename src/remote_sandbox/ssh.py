@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -98,6 +99,33 @@ def remote_marker_path(remote_root: str) -> str:
     return posixpath.join(base, METADATA_DIR, WORKSPACE_FILE)
 
 
+def _control_dir() -> str:
+    """Directory holding SSH ControlMaster sockets (kept short for the sun_path limit)."""
+    base = os.environ.get("REMOTE_SANDBOX_CONTROL_DIR") or f"/tmp/remote-sandbox-{os.getuid()}/cm"
+    os.makedirs(base, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(base, 0o700)
+    return base
+
+
+def ssh_control_opts() -> list[str]:
+    """SSH options that share one authenticated master connection per target.
+
+    The first connection authenticates (a password is typed once); ``ControlPersist``
+    keeps the master socket alive so every later connection — including the background
+    daemon — reuses it without prompting. ``%C`` derives a unique socket per target, so
+    the same option list works for every call site.
+    """
+    return [
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        f"ControlPath={_control_dir()}/%C",
+        "-o",
+        "ControlPersist=10m",
+    ]
+
+
 def build_remote_shell_command(target: str, cwd: str) -> list[str]:
     validate_target(target)
     validate_remote_path(cwd)
@@ -111,7 +139,7 @@ def build_remote_shell_command(target: str, cwd: str) -> list[str]:
         'exec "${SHELL:-/bin/sh}" -i\n'
     )
     remote_command = f"sh -c {shlex.quote(script)} sh {shlex.quote(cwd)}"
-    return ["ssh", "-tt", target, remote_command]
+    return ["ssh", *ssh_control_opts(), "-tt", target, remote_command]
 
 
 @dataclass(frozen=True)
@@ -345,6 +373,34 @@ class FakeSshRunner:
 
 class SubprocessSshRunner:
     timeout_s = 30.0
+
+    def ensure_master(self, target: str) -> None:
+        """Ensure a shared SSH master connection exists, authenticating once if needed.
+
+        Reuses a live master when present; otherwise opens one interactively (inheriting
+        this process's TTY so a password can be typed a single time). Batch calls and the
+        background daemon then multiplex over it without further prompts.
+        """
+        validate_target(target)
+        check = subprocess.run(
+            ["ssh", *ssh_control_opts(), "-O", "check", target],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout_s,
+        )
+        if check.returncode == 0:
+            return
+        established = subprocess.run(
+            ["ssh", *ssh_control_opts(), "-o", "ConnectTimeout=10", target, "true"],
+            check=False,
+        )
+        if established.returncode != 0:
+            raise SshError(
+                f"could not open an SSH connection to {target}. "
+                "If this host needs a password, run the command from an interactive "
+                "terminal; otherwise configure an SSH key."
+            )
 
     def exists(self, target: str, path: str) -> bool:
         result = self._run_test(target, path, "-e")
@@ -606,6 +662,7 @@ class SubprocessSshRunner:
     def _ssh_batch_args() -> list[str]:
         return [
             "ssh",
+            *ssh_control_opts(),
             "-o",
             "BatchMode=yes",
             "-o",
