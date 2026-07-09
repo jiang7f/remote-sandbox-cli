@@ -86,6 +86,33 @@ class StateStore:
         ).fetchall()
         return {str(row["path"]): _entry_from_row(row) for row in rows}
 
+    def load_hash_cache(self) -> dict[str, tuple[int, int, str]]:
+        """Return the cached content hashes keyed by path -> (size, mtime_ns, hash).
+
+        Lets a scan skip re-hashing a file whose (size, mtime_ns) is unchanged since the
+        last sync — the single biggest reason ongoing sync felt far slower than git, which
+        likewise trusts its index rather than re-hashing the whole tree every time.
+        """
+        rows = self._conn.execute(
+            "SELECT path, size, mtime_ns, hash FROM hash_cache"
+        ).fetchall()
+        return {
+            str(row["path"]): (int(row["size"]), int(row["mtime_ns"]), str(row["hash"]))
+            for row in rows
+        }
+
+    def save_hash_cache(self, cache: dict[str, tuple[int, int, str]]) -> None:
+        rows = [
+            (path, size, mtime_ns, digest)
+            for path, (size, mtime_ns, digest) in cache.items()
+        ]
+        with self._conn:
+            self._conn.execute("DELETE FROM hash_cache")
+            self._conn.executemany(
+                "INSERT INTO hash_cache(path, size, mtime_ns, hash) VALUES (?, ?, ?, ?)",
+                rows,
+            )
+
     def _init_schema(self) -> None:
         self._conn.executescript(
             """
@@ -101,6 +128,13 @@ class StateStore:
                 mtime REAL,
                 hash TEXT,
                 is_placeholder INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS hash_cache (
+                path TEXT PRIMARY KEY,
+                size INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL,
+                hash TEXT NOT NULL
             );
             """
         )

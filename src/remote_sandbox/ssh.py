@@ -274,7 +274,7 @@ class FakeSshRunner:
             raise FileNotFoundError(path)
         self.python_file_calls.append((target, normalized, args))
         if args == ("self-check",):
-            return "remote-sandbox-agent 0.1.0\n"
+            return f"{_fake_agent_selfcheck(self.files.get((target, normalized), ''))}\n"
         if args == ("manifest",):
             return self._manifest_json(target, normalized)
         return "ok\n"
@@ -719,6 +719,16 @@ def _workspace_root_from_agent_path(agent_path: str) -> str:
         raise SshError(f"Invalid agent path: {agent_path}")
     root = agent_path[: -len(suffix)]
     return root or "/"
+
+
+def _fake_agent_selfcheck(source: str) -> str:
+    """Echo the agent's own VERSION so the fake never drifts from AGENT_VERSION."""
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("VERSION ="):
+            version = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+            return f"remote-sandbox-agent {version}"
+    return "remote-sandbox-agent unknown"
 
 
 def _fake_manifest_ignored(path: str) -> bool:

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from remote_sandbox.marker import METADATA_DIR
 from remote_sandbox.ssh import SshRunner
 
-AGENT_VERSION = "0.1.0"
+AGENT_VERSION = "0.2.0"
 AGENT_FILE = "agent.py"
 
 AGENT_SOURCE = f'''# remote-sandbox remote agent
@@ -24,6 +24,10 @@ def workspace_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def cache_path() -> Path:
+    return Path(__file__).resolve().parent / "hashcache.json"
+
+
 def should_ignore(path: str) -> bool:
     return path == ".remote-sandbox" or path.startswith(".remote-sandbox/")
 
@@ -36,9 +40,30 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def manifest() -> dict[str, object]:
+def load_cache() -> dict:
+    try:
+        with cache_path().open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {{}}
+    return data if isinstance(data, dict) else {{}}
+
+
+def save_cache(cache: dict) -> None:
+    tmp = cache_path().with_name("hashcache.json.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(cache, handle, separators=(",", ":"))
+        tmp.replace(cache_path())
+    except OSError:
+        pass
+
+
+def manifest() -> dict:
     root = workspace_root()
-    entries: list[dict[str, object]] = []
+    cache = load_cache()
+    new_cache = {{}}
+    entries = []
     for path in sorted(root.rglob("*")):
         rel = path.relative_to(root).as_posix()
         if should_ignore(rel):
@@ -64,18 +89,35 @@ def manifest() -> dict[str, object]:
                 "is_placeholder": False,
             }})
         elif path.is_file():
+            size = stat.st_size
+            mtime_ns = stat.st_mtime_ns
+            cached = cache.get(rel)
+            # Trust the cached hash when size + mtime are unchanged, so a manifest scan does
+            # not re-read the whole tree on every sync (the remote-side analogue of git's
+            # index). A changed file falls through to a fresh hash.
+            if (
+                isinstance(cached, list)
+                and len(cached) == 3
+                and cached[0] == size
+                and cached[1] == mtime_ns
+            ):
+                digest = cached[2]
+            else:
+                digest = sha256_file(path)
+            new_cache[rel] = [size, mtime_ns, digest]
             entries.append({{
                 "kind": "file",
                 "path": rel,
-                "size": stat.st_size,
+                "size": size,
                 "mtime": stat.st_mtime,
-                "hash": sha256_file(path),
+                "hash": digest,
                 "is_placeholder": False,
             }})
+    save_cache(new_cache)
     return {{"entries": entries}}
 
 
-def main(argv: list[str]) -> int:
+def main(argv: list) -> int:
     if argv == ["self-check"]:
         print("remote-sandbox-agent " + VERSION)
         return 0

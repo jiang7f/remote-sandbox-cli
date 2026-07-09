@@ -14,9 +14,22 @@ from remote_sandbox.ssh import SshRunner
 PLACEHOLDER_HEADER = b"REMOTE-SANDBOX PLACEHOLDER\n"
 
 
-def scan_local_manifest(root: Path, policy: PolicyEngine) -> dict[str, FileEntry]:
+def scan_local_manifest(
+    root: Path,
+    policy: PolicyEngine,
+    *,
+    hash_cache: dict[str, tuple[int, int, str]] | None = None,
+) -> dict[str, FileEntry]:
+    """Build the local manifest, reusing cached hashes for unchanged files.
+
+    When ``hash_cache`` (path -> (size, mtime_ns, hash)) is supplied it is used and updated
+    in place: a file whose ``(size, mtime_ns)`` matches its cache entry is NOT re-read, and
+    entries for vanished paths are pruned. This is what makes a no-op sync near-instant
+    instead of re-hashing the whole tree every cycle.
+    """
     root = root.expanduser().resolve()
     entries: dict[str, FileEntry] = {}
+    seen: set[str] = set()
     for dirpath, dirnames, filenames in os.walk(root):
         current_dir = Path(dirpath)
         rel_dir = current_dir.relative_to(root).as_posix()
@@ -82,14 +95,37 @@ def scan_local_manifest(root: Path, policy: PolicyEngine) -> dict[str, FileEntry
                 if placeholder is not None:
                     entries[rel_path] = placeholder
                     continue
+                digest = _cached_or_hash(path, stat, rel_path, hash_cache)
+                seen.add(rel_path)
                 entries[rel_path] = FileEntry(
                     kind=EntryKind.FILE,
                     path=rel_path,
                     size=stat.st_size,
                     mtime=stat.st_mtime,
-                    hash=_sha256_file(path),
+                    hash=digest,
                 )
+    if hash_cache is not None:
+        for stale in set(hash_cache) - seen:
+            del hash_cache[stale]
     return entries
+
+
+def _cached_or_hash(
+    path: Path,
+    stat: os.stat_result,
+    rel_path: str,
+    hash_cache: dict[str, tuple[int, int, str]] | None,
+) -> str:
+    size = stat.st_size
+    mtime_ns = stat.st_mtime_ns
+    if hash_cache is not None:
+        cached = hash_cache.get(rel_path)
+        if cached is not None and cached[0] == size and cached[1] == mtime_ns:
+            return cached[2]
+    digest = _sha256_file(path)
+    if hash_cache is not None:
+        hash_cache[rel_path] = (size, mtime_ns, digest)
+    return digest
 
 
 def scan_remote_manifest(

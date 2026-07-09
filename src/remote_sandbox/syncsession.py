@@ -82,12 +82,16 @@ class SyncSession:
         policy = self.policy
         if not self.runner.exists(self.target, remote_agent_path(self.remote)):
             bootstrap_agent(self.runner, self.target, self.remote)
-        report(SyncProgress(phase="scanning-remote"))
-        remote_entries = scan_remote_manifest(self.runner, self.target, self.remote)
-        report(SyncProgress(phase="scanning-local"))
-        local_entries = scan_local_manifest(self.local_root, policy)
         state_path = self.local_root / METADATA_DIR / "state.sqlite3"
         with StateStore.open(state_path) as store:
+            # Load the local hash cache up front so the local scan can skip re-hashing files
+            # whose (size, mtime) are unchanged — the main reason a no-op sync was slow.
+            hash_cache = store.load_hash_cache()
+            report(SyncProgress(phase="scanning-remote"))
+            remote_entries = scan_remote_manifest(self.runner, self.target, self.remote)
+            report(SyncProgress(phase="scanning-local"))
+            local_entries = scan_local_manifest(self.local_root, policy, hash_cache=hash_cache)
+            store.save_hash_cache(hash_cache)
             base_entries = store.list_base()
             report(SyncProgress(phase="planning"))
             plan = build_plan(
