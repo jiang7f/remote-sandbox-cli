@@ -24,6 +24,14 @@ class SyncExecutionError(RuntimeError):
     pass
 
 
+class ConcurrentModification(SyncExecutionError):
+    """One file changed between scan and transfer (e.g. git rewriting .git/index).
+
+    Skippable: the offending file is left for the next sync cycle instead of aborting the
+    whole plan, which is why it is distinct from a fatal SyncExecutionError.
+    """
+
+
 def execute_plan(
     plan: SyncPlan,
     *,
@@ -55,14 +63,34 @@ def execute_plan(
                 bytes_done=0,
             )
         )
+    skipped = 0
     for action in _execution_order(plan.actions):
-        _execute_action(
-            action,
-            local_root=local_root,
-            runner=runner,
-            target=target,
-            remote_root=remote_root,
-        )
+        try:
+            _execute_action(
+                action,
+                local_root=local_root,
+                runner=runner,
+                target=target,
+                remote_root=remote_root,
+            )
+        except ConcurrentModification as exc:
+            # One file moved under us (classically git rewriting .git/index or a pack tmp
+            # file mid-sync). Skip just this path and leave its base untouched so the next
+            # cycle reconciles it — do NOT abort the whole plan the way this used to.
+            skipped += 1
+            if on_progress is not None:
+                on_progress(
+                    SyncProgress(
+                        phase="transferring",
+                        files_total=files_total,
+                        files_done=files_done,
+                        bytes_total=bytes_total,
+                        bytes_done=bytes_done,
+                        current_path=f"skipped (changed): {action.path}",
+                    )
+                )
+            del exc
+            continue
         _update_base(state, action)
         if action.type != PlanActionType.UPDATE_BASE:
             files_done += 1
@@ -78,6 +106,17 @@ def execute_plan(
                         current_path=action.path,
                     )
                 )
+    if skipped and on_progress is not None:
+        on_progress(
+            SyncProgress(
+                phase="transferring",
+                files_total=files_total,
+                files_done=files_done,
+                bytes_total=bytes_total,
+                bytes_done=bytes_done,
+                current_path=f"{skipped} file(s) changed mid-sync; will retry next cycle",
+            )
+        )
 
 
 def _action_bytes(action: PlanAction) -> int:
@@ -283,7 +322,7 @@ def _write_local_bytes_atomic(path: Path, content: bytes) -> None:
 def _ensure_local_matches(local_root: Path, path: str, expected: EntryState) -> None:
     actual = _local_entry(local_root, path)
     if not _entry_matches(actual, expected):
-        raise SyncExecutionError(f"local changed during sync: {path}")
+        raise ConcurrentModification(f"local changed during sync: {path}")
 
 
 def _ensure_remote_matches(
@@ -295,7 +334,7 @@ def _ensure_remote_matches(
 ) -> None:
     actual = _remote_entry(runner, target, remote_root, path)
     if not _entry_matches(actual, expected):
-        raise SyncExecutionError(f"remote changed during sync: {path}")
+        raise ConcurrentModification(f"remote changed during sync: {path}")
 
 
 def _ensure_remote_directory_empty_if_needed(
@@ -309,7 +348,7 @@ def _ensure_remote_directory_empty_if_needed(
         return
     remote_path = _remote_path(remote_root, path)
     if runner.listdir(target, remote_path):
-        raise SyncExecutionError(f"remote directory changed during sync: {path}")
+        raise ConcurrentModification(f"remote directory changed during sync: {path}")
 
 
 def _local_entry(local_root: Path, path: str) -> EntryState:

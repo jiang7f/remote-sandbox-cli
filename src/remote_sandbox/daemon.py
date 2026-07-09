@@ -65,6 +65,7 @@ class DaemonStatus:
     phase: DaemonPhase | None = None
     consecutive_failures: int = 0
     last_error: str | None = None
+    sync_count: int = 0
     sync_phase: str | None = None
     files_total: int | None = None
     files_done: int | None = None
@@ -395,6 +396,7 @@ def daemon_status(local_root: Path) -> DaemonStatus:
         phase=_parse_status_phase(reply),
         consecutive_failures=_parse_status_int(reply, "fails", default=0) or 0,
         last_error=_parse_status_last_error(reply),
+        sync_count=_parse_status_int(reply, "syncs", default=0) or 0,
         sync_phase=_parse_status_field(reply, "sync_phase"),
         files_total=_parse_status_int(reply, "files_total", default=None),
         files_done=_parse_status_int(reply, "files_done", default=None),
@@ -406,6 +408,50 @@ def daemon_status(local_root: Path) -> DaemonStatus:
 
 def poke_daemon(local_root: Path, source: str = "cli") -> bool:
     return _request(local_root, f"poke {source}") is not None
+
+
+def poke_and_wait_for_sync(
+    local_root: Path,
+    source: str = "cli",
+    *,
+    timeout: float = 120.0,
+) -> bool:
+    """Ask the daemon to sync now and wait for one *fresh* sync cycle to complete.
+
+    Used after `rsb run` so a caller (e.g. an AI) sees the command's output files land
+    locally before continuing — WITHOUT the CLI opening its own competing SyncSession and
+    fighting the daemon for the workspace lock (the old cause of a spurious traceback).
+
+    Returns True if a new sync completed (sync_count advanced past the value observed when
+    we poked), False if the daemon is not running or the wait timed out. Never raises: a
+    sync hiccup must not change the command's own exit code.
+    """
+    local_root = local_root.expanduser().resolve()
+    try:
+        before = daemon_status(local_root)
+    except Exception:
+        return False
+    if not before.running:
+        return False
+    baseline = before.sync_count
+    if not poke_daemon(local_root, source):
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            status = daemon_status(local_root)
+        except Exception:
+            return False
+        if not status.running:
+            return False
+        # A completed cycle bumps sync_count and returns to ready/degraded (not mid-sync).
+        if status.sync_count > baseline and status.phase in {
+            DaemonPhase.READY,
+            DaemonPhase.DEGRADED,
+        }:
+            return status.phase is DaemonPhase.READY
+        time.sleep(0.1)
+    return False
 
 
 def stop_daemon(local_root: Path) -> bool:

@@ -18,10 +18,12 @@ from remote_sandbox.daemon import (
     StopResult,
     daemon_status,
     ensure_daemon,
+    poke_and_wait_for_sync,
     poke_daemon,
     stop_daemon_result,
 )
 from remote_sandbox.fetch import FetchError, fetch_placeholders
+from remote_sandbox.lock import WorkspaceLockError
 from remote_sandbox.marker import METADATA_DIR, read_local_marker, remove_local_metadata
 from remote_sandbox.peek import PeekError, peek_placeholder
 from remote_sandbox.registry import (
@@ -56,6 +58,7 @@ CLI_ERRORS = (
     SettingsError,
     SshError,
     SyncExecutionError,
+    WorkspaceLockError,
     DaemonError,
     OSError,
     ValueError,
@@ -392,7 +395,28 @@ def run_remote_command(items: list[str]) -> int:
 
 
 def _sync_now(local_root: Path, runner: SubprocessSshRunner, record: BindingRecord) -> None:
-    """Run one foreground sync and report completion; keep the daemon as a fallback."""
+    """Best-effort: land the remote's output files locally after `rsb run`.
+
+    Fully decoupled from the command's exit code — this never raises and never changes
+    what `run` returns. It prefers to let the *daemon* do the sync (poke it and wait for
+    one fresh cycle to finish) so the CLI does not open a competing SyncSession and fight
+    the daemon for the workspace lock, which used to surface as a spurious traceback while
+    the command itself had actually succeeded. Only when no daemon is running does it fall
+    back to a single foreground sync.
+    """
+    if poke_and_wait_for_sync(local_root, "run"):
+        print("[rsb] synced", file=sys.stderr)
+        return
+    status = daemon_status(local_root)
+    if status.running:
+        # Daemon is up but the fresh-sync wait did not confirm success (degraded/timeout).
+        # Do not foreground-sync into its lock; it will retry. Report and move on.
+        print(
+            f"{_error_prefix()} note: sync still settling in the background; "
+            "check `rsb status`",
+            file=sys.stderr,
+        )
+        return
     try:
         SyncSession(
             local_root=local_root,
@@ -402,7 +426,7 @@ def _sync_now(local_root: Path, runner: SubprocessSshRunner, record: BindingReco
         ).sync_once()
         print("[rsb] synced", file=sys.stderr)
     except CLI_ERRORS as exc:
-        # Don't fail the command over a sync hiccup; let the daemon retry and tell the user.
+        # A sync hiccup must never fail the command; surface it and let the daemon retry.
         print(f"{_error_prefix()} sync after run failed: {exc}", file=sys.stderr)
         _poke_or_restart_daemon(local_root, "run")
 
