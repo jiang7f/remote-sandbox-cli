@@ -65,6 +65,7 @@ class DaemonStatus:
     phase: DaemonPhase | None = None
     consecutive_failures: int = 0
     last_error: str | None = None
+    sync_phase: str | None = None
     files_total: int | None = None
     files_done: int | None = None
     bytes_total: int | None = None
@@ -353,6 +354,7 @@ class Daemon:
             f"last_success={last_success_text}",
         ]
         if progress is not None:
+            parts.append(f"sync_phase={progress.phase}")
             parts.extend(
                 [
                     f"files_total={progress.files_total}",
@@ -393,6 +395,7 @@ def daemon_status(local_root: Path) -> DaemonStatus:
         phase=_parse_status_phase(reply),
         consecutive_failures=_parse_status_int(reply, "fails", default=0) or 0,
         last_error=_parse_status_last_error(reply),
+        sync_phase=_parse_status_field(reply, "sync_phase"),
         files_total=_parse_status_int(reply, "files_total", default=None),
         files_done=_parse_status_int(reply, "files_done", default=None),
         bytes_total=_parse_status_int(reply, "bytes_total", default=None),

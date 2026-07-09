@@ -5,6 +5,7 @@ import os
 import secrets
 import shutil
 import sys
+import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -13,6 +14,7 @@ from remote_sandbox.bind import BindError, bind_workspace
 from remote_sandbox.daemon import (
     DaemonError,
     DaemonPhase,
+    DaemonStatus,
     StopResult,
     daemon_status,
     ensure_daemon,
@@ -34,6 +36,7 @@ from remote_sandbox.registry import (
 from remote_sandbox.resources import ProbeResult, probe_target_resources
 from remote_sandbox.settings import (
     SettingsError,
+    format_size,
     format_size_compact,
     load_settings,
     set_placeholder_limit,
@@ -354,7 +357,16 @@ def _poke_or_restart_daemon(local_root: Path, source: str) -> None:
 
 
 def _ensure_daemon_for_record(record: BindingRecord) -> None:
-    _ensure_daemon_quietly(Path(record.local_path))
+    """Start the daemon for a --no-shell bind and show live initial-sync progress.
+
+    The remote is the source of truth, so the binding is usable the moment the daemon is
+    up; we still block here rendering [m:ss] progress until the first sync settles so the
+    user sees the transfer complete (or learns it is continuing in the background) instead
+    of the command returning to a silent prompt mid-transfer.
+    """
+    local_root = Path(record.local_path)
+    _ensure_daemon_quietly(local_root)
+    _await_initial_sync(local_root)
 
 
 def run_remote_command(items: list[str]) -> int:
@@ -431,6 +443,75 @@ def _connected_runner(target: str) -> SubprocessSshRunner:
     runner = SubprocessSshRunner()
     runner.ensure_master(target)
     return runner
+
+
+def _await_initial_sync(local_root: Path, *, timeout: float = 3600.0) -> bool:
+    """Render live [m:ss] progress lines until the daemon settles, then return.
+
+    Prints staged progress — starting -> scanning -> planning -> syncing X/Y — so a large
+    first sync shows what it is doing instead of sitting silent. Returns True once the
+    daemon reaches `ready`, False on `degraded`/timeout. Non-fatal either way: the daemon
+    keeps syncing in the background regardless.
+    """
+    start = time.monotonic()
+    deadline = start + timeout
+    last_line = ""
+    last_emit = -1.0
+    while time.monotonic() < deadline:
+        elapsed = time.monotonic() - start
+        try:
+            status: DaemonStatus | None = daemon_status(local_root)
+        except CLI_ERRORS:
+            status = None
+        if status is not None and status.running and status.phase is DaemonPhase.READY:
+            _print_progress_line(elapsed, "ready")
+            return True
+        if status is not None and status.running and status.phase is DaemonPhase.DEGRADED:
+            detail = _one_line(status.last_error or "sync failed", max_len=80)
+            _print_progress_line(elapsed, f"sync issue: {detail} (daemon will retry)")
+            return False
+        line = _describe_sync(status)
+        now = time.monotonic()
+        if line != last_line or now - last_emit >= 1.0:
+            _print_progress_line(elapsed, line)
+            last_line = line
+            last_emit = now
+        time.sleep(0.15)
+    _print_progress_line(
+        time.monotonic() - start, "still syncing in the background; check `rsb status`"
+    )
+    return False
+
+
+def _describe_sync(status: DaemonStatus | None) -> str:
+    """One human-readable progress line (no timestamp) for the current daemon state."""
+    if status is None or not status.running:
+        return "starting daemon..."
+    sync_phase = status.sync_phase
+    if sync_phase == "scanning-remote":
+        return "scanning remote..."
+    if sync_phase == "scanning-local":
+        return "scanning local..."
+    if sync_phase == "planning":
+        total = status.files_total
+        return f"planning sync... {total} entries" if total else "planning sync..."
+    if sync_phase == "transferring" and status.files_total:
+        done = status.files_done or 0
+        total = status.files_total
+        bytes_part = ""
+        if status.bytes_total:
+            bytes_part = (
+                f", {format_size(status.bytes_done or 0)}/{format_size(status.bytes_total)}"
+            )
+        path = status.current_path
+        path_part = f"  {_one_line(path, max_len=48)}" if path else ""
+        return f"syncing... {done}/{total} files{bytes_part}{path_part}"
+    return "syncing..."
+
+
+def _print_progress_line(elapsed: float, message: str) -> None:
+    minutes, seconds = divmod(int(elapsed), 60)
+    print(f"[{minutes}:{seconds:02d}] {message}", file=sys.stderr)
 
 
 def _require_live_workspace(record: BindingRecord) -> Path:
