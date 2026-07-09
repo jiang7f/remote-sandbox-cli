@@ -8,12 +8,16 @@ import tempfile
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from remote_sandbox.manifest import MISSING, EntryKind, EntryState, FileEntry, is_missing
 from remote_sandbox.reconcile import PlanAction, PlanActionType, SyncPlan
 from remote_sandbox.scan import read_placeholder_entry
 from remote_sandbox.ssh import SshRunner
 from remote_sandbox.state import StateStore
+
+if TYPE_CHECKING:
+    from remote_sandbox.syncsession import ProgressCallback
 
 
 class SyncExecutionError(RuntimeError):
@@ -28,9 +32,29 @@ def execute_plan(
     target: str,
     remote_root: str,
     state: StateStore,
+    on_progress: ProgressCallback | None = None,
 ) -> None:
+    from remote_sandbox.syncsession import SyncProgress
+
     local_root = local_root.expanduser().resolve()
     _refuse_blocking_actions(plan)
+    transfer_actions = [
+        action for action in plan.actions if action.type != PlanActionType.UPDATE_BASE
+    ]
+    files_total = len(transfer_actions)
+    bytes_total = sum(_action_bytes(action) for action in transfer_actions)
+    files_done = 0
+    bytes_done = 0
+    if on_progress is not None and files_total:
+        on_progress(
+            SyncProgress(
+                phase="transferring",
+                files_total=files_total,
+                files_done=0,
+                bytes_total=bytes_total,
+                bytes_done=0,
+            )
+        )
     for action in _execution_order(plan.actions):
         _execute_action(
             action,
@@ -40,6 +64,27 @@ def execute_plan(
             remote_root=remote_root,
         )
         _update_base(state, action)
+        if action.type != PlanActionType.UPDATE_BASE:
+            files_done += 1
+            bytes_done += _action_bytes(action)
+            if on_progress is not None:
+                on_progress(
+                    SyncProgress(
+                        phase="transferring",
+                        files_total=files_total,
+                        files_done=files_done,
+                        bytes_total=bytes_total,
+                        bytes_done=bytes_done,
+                        current_path=action.path,
+                    )
+                )
+
+
+def _action_bytes(action: PlanAction) -> int:
+    for entry in (action.local, action.remote):
+        if isinstance(entry, FileEntry) and entry.size:
+            return entry.size
+    return 0
 
 
 def placeholder_text(*, remote: FileEntry, target: str, remote_root: str) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -14,6 +15,30 @@ from remote_sandbox.settings import load_settings
 from remote_sandbox.ssh import SshRunner
 from remote_sandbox.state import StateStore
 from remote_sandbox.sync import execute_plan
+
+
+@dataclass(frozen=True, slots=True)
+class SyncProgress:
+    """A point-in-time snapshot of an in-flight sync, for status/progress display.
+
+    ``phase`` is a coarse label (``scanning-remote``, ``scanning-local``, ``planning``,
+    ``transferring``, ``done``). File/byte totals are ``0`` until the plan is known; the
+    transfer phase fills them in and increments ``*_done`` as actions complete.
+    """
+
+    phase: str
+    files_total: int = 0
+    files_done: int = 0
+    bytes_total: int = 0
+    bytes_done: int = 0
+    current_path: str | None = None
+
+
+ProgressCallback = Callable[[SyncProgress], None]
+
+
+def _noop_progress(_progress: SyncProgress) -> None:
+    return None
 
 
 @dataclass
@@ -38,24 +63,33 @@ class SyncSession:
     def current_policy(self) -> StaticPolicyEngine:
         return self.policy
 
-    def sync_once(self, *, already_locked: bool = False) -> None:
+    def sync_once(
+        self,
+        *,
+        already_locked: bool = False,
+        on_progress: ProgressCallback | None = None,
+    ) -> None:
+        report = on_progress or _noop_progress
         with self._lock:
             if already_locked:
-                self._sync_locked()
+                self._sync_locked(report)
             else:
                 with workspace_lock(self.local_root):
-                    self._sync_locked()
+                    self._sync_locked(report)
 
-    def _sync_locked(self) -> None:
+    def _sync_locked(self, report: ProgressCallback) -> None:
         self.policy = self._load_policy()
         policy = self.policy
         if not self.runner.exists(self.target, remote_agent_path(self.remote)):
             bootstrap_agent(self.runner, self.target, self.remote)
-        local_entries = scan_local_manifest(self.local_root, policy)
+        report(SyncProgress(phase="scanning-remote"))
         remote_entries = scan_remote_manifest(self.runner, self.target, self.remote)
+        report(SyncProgress(phase="scanning-local"))
+        local_entries = scan_local_manifest(self.local_root, policy)
         state_path = self.local_root / METADATA_DIR / "state.sqlite3"
         with StateStore.open(state_path) as store:
             base_entries = store.list_base()
+            report(SyncProgress(phase="planning"))
             plan = build_plan(
                 base_entries=base_entries,
                 local_entries=local_entries,
@@ -69,7 +103,9 @@ class SyncSession:
                 target=self.target,
                 remote_root=self.remote,
                 state=store,
+                on_progress=report,
             )
+        report(SyncProgress(phase="done"))
 
     def _load_policy(self) -> StaticPolicyEngine:
         return StaticPolicyEngine.from_file(

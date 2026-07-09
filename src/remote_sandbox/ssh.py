@@ -54,6 +54,8 @@ class SshRunner(Protocol):
 
     def run_command(self, target: str, cwd: str, argv: tuple[str, ...]) -> CommandResult: ...
 
+    def clear_master(self, target: str) -> None: ...
+
     def interactive_shell(
         self,
         target: str,
@@ -282,6 +284,9 @@ class FakeSshRunner:
         self.command_calls.append((target, _normalize_remote_path(cwd), argv))
         return self.command_result
 
+    def clear_master(self, target: str) -> None:
+        del target
+
     def interactive_shell(
         self,
         target: str,
@@ -400,6 +405,17 @@ class SubprocessSshRunner:
                 f"could not open an SSH connection to {target}. "
                 "If this host needs a password, run the command from an interactive "
                 "terminal; otherwise configure an SSH key."
+            )
+
+    def clear_master(self, target: str) -> None:
+        """Best-effort drop of a dead/stale ControlMaster so the next call re-dials."""
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["ssh", *ssh_control_opts(), "-O", "exit", target],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_s,
             )
 
     def exists(self, target: str, path: str) -> bool:

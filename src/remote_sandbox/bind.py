@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from remote_sandbox.agent import bootstrap_agent
-from remote_sandbox.lock import WorkspaceLockError
 from remote_sandbox.marker import (
     METADATA_DIR,
     WorkspaceMarker,
@@ -22,7 +21,6 @@ from remote_sandbox.registry import (
     record_binding_from_marker,
 )
 from remote_sandbox.ssh import SshRunner, remote_marker_path, validate_remote_path, validate_target
-from remote_sandbox.syncsession import SyncSession
 
 
 class BindError(RuntimeError):
@@ -166,14 +164,12 @@ def bind_workspace(
         _write_remote_marker(runner, safe_target, safe_remote, marker)
         write_local_marker(local_root, marker)
 
-    session = SyncSession(
-        local_root=local_root,
-        runner=runner,
-        target=safe_target,
-        remote=safe_remote,
-    )
+    # Bootstrap the remote agent now so any connectivity / missing-python3 problem surfaces
+    # here, as a clear connect-time error, rather than silently in the background daemon.
+    # The *initial sync itself* is intentionally NOT run here: the sync daemon (started by
+    # the caller) owns it, so `connect` returns immediately and the sync happens once, in the
+    # background, with live progress — instead of blocking here and then again in the daemon.
     bootstrap_agent(runner, safe_target, safe_remote)
-    _sync_once_as_bind(session)
     connection = record_binding_from_marker(
         workspace_id=marker.workspace_id,
         target=safe_target,
@@ -304,14 +300,6 @@ def _same_identity(left: WorkspaceMarker, right: WorkspaceMarker) -> bool:
 
 def _same_remote_binding(marker: WorkspaceMarker, target: str, remote_path: str) -> bool:
     return marker.binding.target == target and marker.binding.remote_path == remote_path
-
-
-def _sync_once_as_bind(session: SyncSession) -> None:
-    try:
-        session.sync_once()
-    except WorkspaceLockError as exc:
-        raise BindError(str(exc)) from exc
-
 
 
 def _has_control_char(value: str) -> bool:

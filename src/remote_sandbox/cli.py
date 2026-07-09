@@ -12,6 +12,7 @@ from pathlib import Path
 from remote_sandbox.bind import BindError, bind_workspace
 from remote_sandbox.daemon import (
     DaemonError,
+    DaemonPhase,
     StopResult,
     daemon_status,
     ensure_daemon,
@@ -304,7 +305,7 @@ def open_wrapped_shell(name: str | None) -> int:
 def _open_wrapped_shell_for_record(record: BindingRecord) -> int:
     local_root = _require_live_workspace(record)
     runner = _connected_runner(record.target)
-    ensure_daemon(local_root)
+    _ensure_daemon_quietly(local_root)
 
     barrier_seen = False
 
@@ -323,10 +324,28 @@ def _open_wrapped_shell_for_record(record: BindingRecord) -> int:
     return code
 
 
+def _ensure_daemon_quietly(local_root: Path) -> None:
+    """Start the sync daemon without ever letting a startup hiccup crash the caller.
+
+    The daemon is a detached background process: even if the readiness wait times out,
+    the process keeps running and syncing. A foreground command (connect/shell/run) must
+    never abort — nor print a traceback — just because the daemon was slow to publish its
+    socket. Downgrade any DaemonError to a one-line warning and continue.
+    """
+    try:
+        ensure_daemon(local_root)
+    except DaemonError as exc:
+        print(
+            f"{_error_prefix()} note: sync daemon still starting ({exc}); "
+            "check `rsb status`",
+            file=sys.stderr,
+        )
+
+
 def _poke_or_restart_daemon(local_root: Path, source: str) -> None:
     if poke_daemon(local_root, source):
         return
-    ensure_daemon(local_root)
+    _ensure_daemon_quietly(local_root)
     if not poke_daemon(local_root, source):
         print(
             f"{_error_prefix()} warning: daemon did not accept sync notification after {source}",
@@ -335,7 +354,7 @@ def _poke_or_restart_daemon(local_root: Path, source: str) -> None:
 
 
 def _ensure_daemon_for_record(record: BindingRecord) -> None:
-    ensure_daemon(Path(record.local_path))
+    _ensure_daemon_quietly(Path(record.local_path))
 
 
 def run_remote_command(items: list[str]) -> int:
@@ -343,7 +362,7 @@ def run_remote_command(items: list[str]) -> int:
     record = _record_for_execution(record_name)
     local_root = _require_live_workspace(record)
     runner = _connected_runner(record.target)
-    ensure_daemon(local_root)
+    _ensure_daemon_quietly(local_root)
     result = runner.run_command(
         record.target,
         record.remote_path,
@@ -353,8 +372,9 @@ def run_remote_command(items: list[str]) -> int:
         sys.stdout.write(result.stdout)
     if result.stderr:
         sys.stderr.write(result.stderr)
-    # Block until the remote's output files are actually local, so the caller (an AI)
-    # can read real content immediately instead of a mid-transfer "syncing" stub.
+    # The command's exit code is authoritative and returned unconditionally. Syncing the
+    # remote's output back is a best-effort follow-up that must never change the exit code
+    # or raise (Phase 3 hardens the separation further).
     _sync_now(local_root, runner, record)
     return result.returncode
 
@@ -783,10 +803,22 @@ def _display_width(value: str) -> int:
 
 
 def _daemon_column(record: BindingRecord) -> str:
-    status = daemon_status(Path(record.local_path))
+    try:
+        status = daemon_status(Path(record.local_path))
+    except CLI_ERRORS:
+        return "unknown"
     if not status.running:
         return "stopped"
-    return f"running:{status.pid}" if status.pid is not None else "running"
+    label = status.phase.value if status.phase is not None else "running"
+    suffix = f":{status.pid}" if status.pid is not None else ""
+    if (
+        status.phase in {DaemonPhase.INITIAL_SYNCING, DaemonPhase.SYNCING}
+        and status.files_total
+    ):
+        return f"{label}{suffix} {status.files_done}/{status.files_total}"
+    if status.phase is DaemonPhase.DEGRADED and status.last_error:
+        return f"{label}{suffix} (last: {_one_line(status.last_error, max_len=40)})"
+    return f"{label}{suffix}"
 
 
 def _list_resource_columns(result: ProbeResult) -> tuple[str, str, str]:

@@ -11,13 +11,14 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import BinaryIO
+from urllib.parse import quote, unquote
 
 from remote_sandbox.marker import METADATA_DIR, read_local_marker
 from remote_sandbox.ssh import SshRunner, SubprocessSshRunner
-from remote_sandbox.syncsession import SyncSession
+from remote_sandbox.syncsession import SyncProgress, SyncSession
 from remote_sandbox.watch import LocalChangeDetector, create_local_watcher
 
 DAEMON_PID_FILE = "daemon.pid"
@@ -26,7 +27,9 @@ DAEMON_LOG_FILE = "daemon.log"
 
 # AF_UNIX path limit is ~104 bytes on macOS, ~108 on Linux; leave margin.
 _SOCK_PATH_MAX = 100
-_READY_TIMEOUT_S = 60.0
+# The daemon now publishes its pidfile/socket *before* the first sync, so becoming
+# discoverable takes milliseconds — no need to wait a whole sync's worth of time.
+_READY_TIMEOUT_S = 15.0
 _STOP_TIMEOUT_S = 10.0
 _CONTROL_REQUEST_TIMEOUT_S = 2.0
 _CONTROL_MAX_LINE_BYTES = 64 * 1024
@@ -36,10 +39,37 @@ class DaemonError(RuntimeError):
     pass
 
 
+class DaemonPhase(StrEnum):
+    """Lifecycle of a running daemon, reported over the control socket.
+
+    ``starting``        process is up, pidfile/socket published, first sync not begun.
+    ``initial-syncing`` the very first (bootstrap) sync is in flight.
+    ``syncing``         a later sync cycle is in flight.
+    ``ready``           idle and healthy; last sync succeeded.
+    ``degraded``        the last sync failed but the daemon is retrying.
+    ``failed``          startup failed fatally (surfaced in the log; process exits).
+    """
+
+    STARTING = "starting"
+    INITIAL_SYNCING = "initial-syncing"
+    SYNCING = "syncing"
+    READY = "ready"
+    DEGRADED = "degraded"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class DaemonStatus:
     running: bool
     pid: int | None
+    phase: DaemonPhase | None = None
+    consecutive_failures: int = 0
+    last_error: str | None = None
+    files_total: int | None = None
+    files_done: int | None = None
+    bytes_total: int | None = None
+    bytes_done: int | None = None
+    current_path: str | None = None
 
 
 class StopResult(Enum):
@@ -181,12 +211,20 @@ class Daemon:
         self._sync_count = 0
         self._last_error: str | None = None
         self._last_success: float | None = None
+        self._consecutive_failures = 0
+        self._target: str | None = None
+        # Guards the mutable status fields read by the control thread while the worker
+        # thread mutates them. A plain lock is enough — updates are tiny.
+        self._status_lock = threading.Lock()
+        self._phase = DaemonPhase.STARTING
+        self._progress: SyncProgress | None = None
         self._log = logging.getLogger(f"remote_sandbox.daemon.{self._local_root.name}")
 
     def run(self) -> None:
         marker = read_local_marker(self._local_root)
         if marker is None:
             raise DaemonError(f"not a bound workspace: {self._local_root}")
+        self._target = marker.binding.target
         try:
             lock_handle = _acquire_daemon_lock(self._local_root)
         except BlockingIOError as exc:
@@ -207,7 +245,10 @@ class Daemon:
         )
         watcher = None
         try:
-            self._sync_strict(session, "startup")
+            # Publish discoverability FIRST: pidfile, control socket, and watcher come up
+            # in milliseconds so `rsb status` and the connect UX see the daemon (and its
+            # phase) immediately, instead of the process looking "stopped" for the entire
+            # duration of a large first sync.
             watcher = create_local_watcher(
                 detector=LocalChangeDetector(self._local_root, session.current_policy),
                 on_change=lambda: self._sync_requested.set(),
@@ -217,7 +258,11 @@ class Daemon:
             _write_pidfile(self._local_root, os.getpid())
             if self._on_ready is not None:
                 self._on_ready()
-            self._log.info("daemon ready for %s", self._local_root)
+            self._log.info("daemon up for %s; starting initial sync", self._local_root)
+            # The bootstrap sync now runs INSIDE the published daemon, reported as
+            # `initial-syncing`. `bind` no longer performs its own blocking sync, so this
+            # is the single source of the first transfer (no duplicate pass).
+            self._run_sync(session, "startup", initial=True)
             self._worker_loop(session)
         finally:
             if watcher is not None:
@@ -233,38 +278,93 @@ class Daemon:
 
     def _worker_loop(self, session: SyncSession) -> None:
         while not self._stop_event.is_set():
-            self._sync_requested.wait(timeout=30.0)
+            self._sync_requested.wait(timeout=self._next_wait())
             if self._stop_event.is_set():
                 break
             requested = self._sync_requested.is_set()
             self._sync_requested.clear()
-            self._safe_sync(session, "poke" if requested else "poll")
+            self._run_sync(session, "poke" if requested else "poll", initial=False)
 
-    def _sync_strict(self, session: SyncSession, source: str) -> None:
-        session.sync_once()
-        self._record_sync_success(source)
+    def _next_wait(self) -> float:
+        """Poll interval: 30 s when healthy, exponential backoff while failing.
 
-    def _safe_sync(self, session: SyncSession, source: str) -> None:
+        A transient wobble retries in ~2 s instead of waiting the full poll; a longer
+        outage keeps retrying every ≤30 s until the connection comes back.
+        """
+        if self._consecutive_failures == 0:
+            return 30.0
+        return float(min(2.0 * 2 ** (self._consecutive_failures - 1), 30.0))
+
+    def _run_sync(self, session: SyncSession, source: str, *, initial: bool) -> None:
+        """One sync cycle, keeping the daemon alive across transient errors.
+
+        Sets phase to initial-syncing/syncing for the duration, then ready or degraded.
+        Never raises: a failed sync leaves the daemon degraded and retrying.
+        """
+        self._set_phase(DaemonPhase.INITIAL_SYNCING if initial else DaemonPhase.SYNCING)
         try:
-            session.sync_once()
-            self._record_sync_success(source)
+            session.sync_once(on_progress=self._on_progress)
         except Exception as exc:  # keep the daemon alive across transient sync errors
-            self._last_error = str(exc)
-            self._log.warning("sync failed (%s): %s", source, exc)
+            with self._status_lock:
+                self._last_error = str(exc)
+                self._consecutive_failures += 1
+                self._phase = DaemonPhase.DEGRADED
+                self._progress = None
+            self._log.warning(
+                "sync failed (%s, attempt %d): %s", source, self._consecutive_failures, exc
+            )
+            # A dead/stale SSH master (e.g. after the laptop slept) keeps failing; drop it
+            # so the next retry re-dials. Key auth reconnects automatically; password auth
+            # cannot from a background process and stays degraded until a foreground command
+            # re-establishes the shared master.
+            if self._target is not None:
+                self._runner.clear_master(self._target)
+            return
+        with self._status_lock:
+            self._sync_count += 1
+            self._last_success = time.time()
+            self._last_error = None
+            self._consecutive_failures = 0
+            self._phase = DaemonPhase.READY
+            self._progress = None
 
-    def _record_sync_success(self, source: str) -> None:
-        del source
-        self._sync_count += 1
-        self._last_success = time.time()
-        self._last_error = None
+    def _on_progress(self, progress: SyncProgress) -> None:
+        with self._status_lock:
+            self._progress = progress
+
+    def _set_phase(self, phase: DaemonPhase) -> None:
+        with self._status_lock:
+            self._phase = phase
 
     def _status_text(self) -> str:
-        last_success = "none" if self._last_success is None else f"{self._last_success:.0f}"
-        last_error = self._last_error or "none"
-        return (
-            f"pid={os.getpid()} syncs={self._sync_count} "
-            f"last_success={last_success} last_error={last_error}"
-        )
+        with self._status_lock:
+            phase = self._phase
+            sync_count = self._sync_count
+            fails = self._consecutive_failures
+            last_success = self._last_success
+            last_error = self._last_error
+            progress = self._progress
+        last_success_text = "none" if last_success is None else f"{last_success:.0f}"
+        parts = [
+            f"pid={os.getpid()}",
+            f"phase={phase.value}",
+            f"syncs={sync_count}",
+            f"fails={fails}",
+            f"last_success={last_success_text}",
+        ]
+        if progress is not None:
+            parts.extend(
+                [
+                    f"files_total={progress.files_total}",
+                    f"files_done={progress.files_done}",
+                    f"bytes_total={progress.bytes_total}",
+                    f"bytes_done={progress.bytes_done}",
+                ]
+            )
+            if progress.current_path:
+                parts.append(f"current_path={_encode_status_value(progress.current_path)}")
+        parts.append(f"last_error={_encode_status_value(last_error) if last_error else 'none'}")
+        return " ".join(parts)
 
 
 # --------------------------------------------------------------------------- #
@@ -278,13 +378,27 @@ def daemon_status(local_root: Path) -> DaemonStatus:
     if reply is None:
         pid = _read_pidfile(local_root)
         if socket_path(local_root).exists() and pid is not None and _process_exists(pid):
-            return DaemonStatus(running=True, pid=pid)
+            # Pidfile + socket exist but the control thread did not answer in time (a long
+            # sync can momentarily starve it). Treat as running-but-unknown-phase rather
+            # than lying that it is stopped.
+            return DaemonStatus(running=True, pid=pid, phase=DaemonPhase.STARTING)
         _cleanup_stale_runtime_files(local_root)
         return DaemonStatus(running=False, pid=None)
     pid = _parse_status_pid(reply)
     if pid is None:
         return DaemonStatus(running=False, pid=None)
-    return DaemonStatus(running=True, pid=pid)
+    return DaemonStatus(
+        running=True,
+        pid=pid,
+        phase=_parse_status_phase(reply),
+        consecutive_failures=_parse_status_int(reply, "fails", default=0) or 0,
+        last_error=_parse_status_last_error(reply),
+        files_total=_parse_status_int(reply, "files_total", default=None),
+        files_done=_parse_status_int(reply, "files_done", default=None),
+        bytes_total=_parse_status_int(reply, "bytes_total", default=None),
+        bytes_done=_parse_status_int(reply, "bytes_done", default=None),
+        current_path=_parse_status_field(reply, "current_path"),
+    )
 
 
 def poke_daemon(local_root: Path, source: str = "cli") -> bool:
@@ -385,14 +499,60 @@ def _wait_until_stopped(local_root: Path, timeout: float = _STOP_TIMEOUT_S) -> b
 
 
 def _parse_status_pid(reply: str) -> int | None:
-    # reply: "ok pid=123 syncs=..."
+    # reply: "ok pid=123 phase=ready syncs=..."
+    return _parse_status_int(reply, "pid", default=None)
+
+
+def _encode_status_value(value: str) -> str:
+    """Encode a free-form value (path, error) into one whitespace-free status token."""
+    return quote(value, safe="")
+
+
+def _decode_status_value(value: str) -> str:
+    return unquote(value)
+
+
+def _status_fields(reply: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
     for part in reply.split():
-        if part.startswith("pid="):
-            try:
-                return int(part.removeprefix("pid="))
-            except ValueError:
-                return None
-    return None
+        key, sep, value = part.partition("=")
+        if sep:
+            fields[key] = value
+    return fields
+
+
+def _parse_status_field(reply: str, key: str) -> str | None:
+    raw = _status_fields(reply).get(key)
+    if raw is None:
+        return None
+    return _decode_status_value(raw)
+
+
+def _parse_status_int(reply: str, key: str, *, default: int | None) -> int | None:
+    raw = _status_fields(reply).get(key)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _parse_status_phase(reply: str) -> DaemonPhase | None:
+    raw = _status_fields(reply).get("phase")
+    if raw is None:
+        return None
+    try:
+        return DaemonPhase(raw)
+    except ValueError:
+        return None
+
+
+def _parse_status_last_error(reply: str) -> str | None:
+    raw = _status_fields(reply).get("last_error")
+    if raw is None or raw == "none":
+        return None
+    return _decode_status_value(raw)
 
 
 def _cleanup_stale_runtime_files(local_root: Path) -> None:
