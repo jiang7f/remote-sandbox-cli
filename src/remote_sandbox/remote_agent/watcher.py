@@ -52,7 +52,7 @@ class PollingWatcher:
     def __init__(self, root: Path, store: RemoteStore, *, interval: float = 1.0) -> None:
         if interval <= 0:
             raise ValueError("poll interval must be positive")
-        self._root = root.expanduser().resolve(strict=True)
+        self._root = watch_root_path(root)
         self._store = store
         self._interval = interval
         self._stop = threading.Event()
@@ -104,9 +104,17 @@ class PollingWatcher:
 class WatcherService:
     """Select and supervise the best remote filesystem event backend."""
 
-    def __init__(self, root: Path, store: RemoteStore, *, poll_interval: float = 1.0) -> None:
-        self._root = root.expanduser().resolve(strict=True)
+    def __init__(
+        self,
+        root: Path,
+        store: RemoteStore,
+        *,
+        poll_interval: float = 1.0,
+        token: str | None = None,
+    ) -> None:
+        self._root = watch_root_path(root)
         self._store = store
+        self._token = token
         self._backend: WatchBackend
         if platform.system() == "Linux":
             try:
@@ -131,30 +139,42 @@ class WatcherService:
 
     def run(self) -> None:
         pid = os.getpid()
-        self._store.record_watcher(pid, "running", backend=self.backend_name)
+        self._record_state(pid, "running")
         try:
             self._backend.run()
         except BaseException as exc:
-            self._store.record_watcher(
-                None,
-                "failed",
-                backend=self.backend_name,
-                error=str(exc),
-            )
+            self._record_state(None, "failed", error=str(exc))
             raise
         else:
-            self._store.record_watcher(None, "stopped", backend=self.backend_name)
+            self._record_state(None, "stopped")
 
     def stop(self) -> None:
         self._backend.stop()
 
+    def _record_state(self, pid: int | None, status: str, *, error: str | None = None) -> None:
+        if self._token is None:
+            self._store.record_watcher(pid, status, backend=self.backend_name, error=error)
+            return
+        self._store.record_watcher_for_generation(
+            pid,
+            status,
+            backend=self.backend_name,
+            token=self._token,
+            error=error,
+        )
+
 
 def scan_snapshot(root: Path) -> dict[str, RemoteSignature]:
-    canonical_root = root.expanduser().resolve(strict=True)
-    if not canonical_root.is_dir():
-        raise NotADirectoryError(str(canonical_root))
+    canonical_root = watch_root_path(root)
     snapshot: dict[str, RemoteSignature] = {}
-    _scan_directory(canonical_root, canonical_root, snapshot)
+    descriptor = os.open(
+        canonical_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        _scan_directory_descriptor(descriptor, "", snapshot)
+    finally:
+        os.close(descriptor)
     return snapshot
 
 
@@ -171,26 +191,33 @@ def path_is_hard_ignored(path: Path, root: Path) -> bool:
     return any(part in _HARD_IGNORED_NAMES for part in relative.parts)
 
 
-def _scan_directory(
-    root: Path,
-    directory: Path,
+def watch_root_path(root: Path) -> Path:
+    absolute = Path(os.path.abspath(root.expanduser()))
+    metadata = absolute.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise NotADirectoryError(str(absolute))
+    return absolute
+
+
+def _scan_directory_descriptor(
+    descriptor: int,
+    prefix: str,
     snapshot: dict[str, RemoteSignature],
 ) -> None:
-    with os.scandir(directory) as entries:
+    with os.scandir(descriptor) as entries:
         ordered = sorted(entries, key=lambda entry: entry.name)
     for entry in ordered:
-        path = Path(entry.path)
-        if path_is_hard_ignored(path, root):
+        if entry.name in _HARD_IGNORED_NAMES:
             continue
         try:
             metadata = entry.stat(follow_symlinks=False)
         except FileNotFoundError:
             continue
-        relative = path.relative_to(root).as_posix()
+        relative = entry.name if not prefix else f"{prefix}/{entry.name}"
         mode = metadata.st_mode
         if stat.S_ISLNK(mode):
             try:
-                target = os.readlink(path)
+                target = os.readlink(entry.name, dir_fd=descriptor)
             except FileNotFoundError:
                 continue
             snapshot[relative] = RemoteSignature(
@@ -202,7 +229,18 @@ def _scan_directory(
             )
         elif stat.S_ISDIR(mode):
             snapshot[relative] = RemoteSignature("dir", None, metadata.st_mtime_ns, mode)
-            _scan_directory(root, path, snapshot)
+            try:
+                child = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=descriptor,
+                )
+            except (FileNotFoundError, NotADirectoryError, OSError):
+                continue
+            try:
+                _scan_directory_descriptor(child, relative, snapshot)
+            finally:
+                os.close(child)
         elif stat.S_ISREG(mode):
             snapshot[relative] = RemoteSignature(
                 "file",

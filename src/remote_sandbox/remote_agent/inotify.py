@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .store import RemoteStore
-from .watcher import path_is_hard_ignored
+from .watcher import path_is_hard_ignored, watch_root_path
 
 IN_MODIFY = 0x00000002
 IN_ATTRIB = 0x00000004
@@ -25,6 +25,8 @@ IN_DELETE_SELF = 0x00000400
 IN_MOVE_SELF = 0x00000800
 IN_Q_OVERFLOW = 0x00004000
 IN_IGNORED = 0x00008000
+IN_ONLYDIR = 0x01000000
+IN_DONT_FOLLOW = 0x02000000
 IN_ISDIR = 0x40000000
 
 _WATCH_MASK = (
@@ -37,6 +39,7 @@ _WATCH_MASK = (
     | IN_DELETE
     | IN_DELETE_SELF
     | IN_MOVE_SELF
+    | IN_ONLYDIR
 )
 _HEADER = struct.Struct("iIII")
 
@@ -88,7 +91,7 @@ class InotifyBackend:
     def __init__(self, root: Path, store: RemoteStore, *, read_timeout: float = 0.2) -> None:
         if platform.system() != "Linux":
             raise OSError(errno.ENOSYS, "inotify is available only on Linux")
-        self._root = root.expanduser().resolve(strict=True)
+        self._root = watch_root_path(root)
         self._store = store
         self._read_timeout = read_timeout
         self._stop = threading.Event()
@@ -139,31 +142,62 @@ class InotifyBackend:
         self._libc.inotify_rm_watch.restype = ctypes.c_int
 
     def _add_tree(self, root: Path) -> None:
-        if root.is_symlink() or path_is_hard_ignored(root, self._root):
-            return
-        for directory, names, _files in os.walk(root, followlinks=False):
-            path = Path(directory)
-            names[:] = [
-                name
-                for name in names
-                if not (path / name).is_symlink()
-                and not path_is_hard_ignored(path / name, self._root)
-            ]
-            self._add_watch(path)
+        descriptor = os.open(
+            root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        pending = [(root, descriptor)]
+        try:
+            while pending:
+                directory, directory_fd = pending.pop()
+                try:
+                    if path_is_hard_ignored(directory, self._root):
+                        continue
+                    self._add_watch(
+                        directory,
+                        watch_source=Path(f"/proc/self/fd/{directory_fd}"),
+                    )
+                    with os.scandir(directory_fd) as entries:
+                        ordered = sorted(entries, key=lambda entry: entry.name)
+                    children: list[tuple[Path, int]] = []
+                    for entry in ordered:
+                        path = directory / entry.name
+                        if path_is_hard_ignored(path, self._root):
+                            continue
+                        try:
+                            if not entry.is_dir(follow_symlinks=False):
+                                continue
+                            child_fd = os.open(
+                                entry.name,
+                                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                dir_fd=directory_fd,
+                            )
+                        except OSError:
+                            continue
+                        children.append((path, child_fd))
+                    pending.extend(reversed(children))
+                finally:
+                    os.close(directory_fd)
+        except BaseException:
+            for _path, pending_fd in pending:
+                os.close(pending_fd)
+            raise
 
-    def _add_watch(self, path: Path) -> None:
+    def _add_watch(self, path: Path, *, watch_source: Path | None = None) -> None:
         if path in self._path_watches:
             return
+        source = path if watch_source is None else watch_source
+        mask = _WATCH_MASK | (IN_DONT_FOLLOW if watch_source is None else 0)
         descriptor = int(
             self._libc.inotify_add_watch(
                 self._fd,
-                os.fsencode(path),
-                _WATCH_MASK,
+                os.fsencode(source),
+                mask,
             )
         )
         if descriptor < 0:
             error = ctypes.get_errno()
-            if error in {errno.ENOENT, errno.ENOTDIR}:
+            if watch_source is None and error in {errno.ENOENT, errno.ENOTDIR}:
                 return
             raise OSError(error, os.strerror(error), str(path))
         previous = self._watch_paths.get(descriptor)
@@ -177,7 +211,8 @@ class InotifyBackend:
             if event.overflow:
                 self._pending_moves.clear()
                 self._store.append_event("rescan-required", "*", None)
-                continue
+                self._rebuild_watches()
+                return
             base = self._watch_paths.get(event.watch_descriptor)
             if base is None:
                 continue
@@ -249,21 +284,15 @@ class InotifyBackend:
                 self._forget_subtree(pending.path)
 
     def _emit_created_descendants(self, directory: Path) -> None:
-        if not directory.is_dir() or directory.is_symlink():
+        try:
+            from .watcher import scan_snapshot
+
+            descendants = scan_snapshot(directory)
+        except OSError:
             return
-        for current, names, files in os.walk(directory, followlinks=False):
-            parent = Path(current)
-            names[:] = [
-                name
-                for name in names
-                if not (parent / name).is_symlink()
-                and not path_is_hard_ignored(parent / name, self._root)
-            ]
-            for name in sorted([*names, *files]):
-                path = parent / name
-                if path_is_hard_ignored(path, self._root):
-                    continue
-                self._store.append_event("create", self._relative(path), None)
+        prefix = self._relative(directory)
+        for relative in sorted(descendants):
+            self._store.append_event("create", f"{prefix}/{relative}", None)
 
     def _move_watch_paths(self, source: Path, destination: Path) -> None:
         replacements = [
@@ -285,11 +314,21 @@ class InotifyBackend:
             if path == root or root in path.parents
         ]
         for descriptor in descriptors:
-            result = int(self._libc.inotify_rm_watch(self._fd, descriptor))
-            if result < 0 and ctypes.get_errno() not in {errno.EINVAL, errno.EBADF}:
-                error = ctypes.get_errno()
-                raise OSError(error, os.strerror(error))
+            self._remove_kernel_watch(descriptor)
             self._forget_descriptor(descriptor)
+
+    def _rebuild_watches(self) -> None:
+        for descriptor in list(self._watch_paths):
+            self._remove_kernel_watch(descriptor)
+        self._watch_paths.clear()
+        self._path_watches.clear()
+        self._add_tree(self._root)
+
+    def _remove_kernel_watch(self, descriptor: int) -> None:
+        result = int(self._libc.inotify_rm_watch(self._fd, descriptor))
+        if result < 0 and ctypes.get_errno() not in {errno.EINVAL, errno.EBADF}:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
 
     def _forget_descriptor(self, descriptor: int) -> None:
         path = self._watch_paths.pop(descriptor, None)

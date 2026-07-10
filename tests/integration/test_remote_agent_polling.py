@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import platform
+import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -11,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+import remote_sandbox.remote_agent.__main__ as remote_agent_main
 from remote_sandbox.agent import build_agent_zipapp
 from remote_sandbox.remote_agent.store import RemoteStore
 from remote_sandbox.remote_agent.watcher import PollingWatcher, WatcherService, snapshot_entries
@@ -86,6 +89,20 @@ def test_remote_snapshot_uses_manifest_kinds_and_preserves_symlink_text(tmp_path
     assert entries["pkg"]["kind"] == "dir"
     assert entries["current"]["kind"] == "symlink"
     assert entries["current"]["link_target"] == "pkg"
+
+
+def test_remote_snapshot_refuses_a_registered_root_replaced_by_a_symlink(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    moved_root = tmp_path / "moved-root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text("outside", encoding="utf-8")
+    root.rename(moved_root)
+    root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(NotADirectoryError):
+        snapshot_entries(root)
 
 
 @pytest.mark.skipif(platform.system() != "Linux", reason="inotify is Linux-only")
@@ -204,3 +221,284 @@ def test_zipapp_manages_detached_watcher_journal_and_safe_forget(tmp_path: Path)
     assert forgotten.returncode == 0
     assert not (control / "workspaces" / workspace_id).exists()
     assert root.exists()
+
+
+def test_register_conflict_does_not_leave_unreachable_workspace_metadata(tmp_path: Path) -> None:
+    archive = build_agent_zipapp(tmp_path / "agent.pyz")
+    root = tmp_path / "workspace"
+    home = tmp_path / "home"
+    control = tmp_path / "control"
+    root.mkdir()
+    home.mkdir()
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+    }
+    first_id = "00000000-0000-4000-8000-000000000071"
+    conflicting_id = "00000000-0000-4000-8000-000000000072"
+
+    first = _agent_call(
+        archive,
+        AgentRequest("register", {"workspace_id": first_id, "root": str(root)}),
+        env,
+    )
+    assert first.returncode == 0
+
+    conflict = _agent_call(
+        archive,
+        AgentRequest("register", {"workspace_id": conflicting_id, "root": str(root)}),
+        env,
+    )
+
+    assert conflict.returncode == 2
+    assert "already registered" in (decode_response(conflict.stdout).error or "")
+    assert not (control / "workspaces" / conflicting_id).exists()
+
+    forgotten = _agent_call(archive, AgentRequest("forget", {"workspace_id": first_id}), env)
+    assert forgotten.returncode == 0
+
+
+def test_register_rejects_control_home_inside_workspace_before_creating_it(tmp_path: Path) -> None:
+    archive = build_agent_zipapp(tmp_path / "agent.pyz")
+    root = tmp_path / "workspace"
+    home = tmp_path / "home"
+    control = root / ".codex-remote-sandbox"
+    root.mkdir()
+    home.mkdir()
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+    }
+
+    registered = _agent_call(
+        archive,
+        AgentRequest(
+            "register",
+            {
+                "workspace_id": "00000000-0000-4000-8000-000000000077",
+                "root": str(root),
+            },
+        ),
+        env,
+    )
+
+    assert registered.returncode == 2
+    assert "must not overlap" in (decode_response(registered.stdout).error or "")
+    assert not control.exists()
+
+
+def test_stop_never_signals_a_reused_unrelated_pid(tmp_path: Path) -> None:
+    archive = build_agent_zipapp(tmp_path / "agent.pyz")
+    root = tmp_path / "workspace"
+    home = tmp_path / "home"
+    control = tmp_path / "control"
+    root.mkdir()
+    home.mkdir()
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+    }
+    workspace_id = "00000000-0000-4000-8000-000000000073"
+    registered = _agent_call(
+        archive,
+        AgentRequest("register", {"workspace_id": workspace_id, "root": str(root)}),
+        env,
+    )
+    assert registered.returncode == 0
+
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", "not-a-watcher"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        state_path = control / "workspaces" / workspace_id / "state.sqlite3"
+        with RemoteStore(state_path) as store:
+            store.record_watcher(
+                unrelated.pid,
+                "running",
+                backend="polling",
+                token="stale-watcher-token",
+            )
+
+        stopped = _agent_call(archive, AgentRequest("stop", {"workspace_id": workspace_id}), env)
+
+        assert stopped.returncode == 2
+        assert "another process" in (decode_response(stopped.stdout).error or "")
+        assert unrelated.poll() is None
+
+        forgotten = _agent_call(
+            archive,
+            AgentRequest("forget", {"workspace_id": workspace_id}),
+            env,
+        )
+        assert forgotten.returncode == 0
+        assert unrelated.poll() is None
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
+
+
+def test_commands_reject_workspace_state_that_disagrees_with_protected_index(
+    tmp_path: Path,
+) -> None:
+    archive = build_agent_zipapp(tmp_path / "agent.pyz")
+    root = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    home = tmp_path / "home"
+    control = tmp_path / "control"
+    root.mkdir()
+    outside.mkdir()
+    home.mkdir()
+    (outside / "secret.txt").write_text("outside", encoding="utf-8")
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+    }
+    workspace_id = "00000000-0000-4000-8000-000000000074"
+    registered = _agent_call(
+        archive,
+        AgentRequest("register", {"workspace_id": workspace_id, "root": str(root)}),
+        env,
+    )
+    assert registered.returncode == 0
+
+    state_path = control / "workspaces" / workspace_id / "state.sqlite3"
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("UPDATE workspace SET root = ?", (str(outside),))
+
+    snapshot = _agent_call(
+        archive,
+        AgentRequest("snapshot", {"workspace_id": workspace_id}),
+        env,
+    )
+
+    assert snapshot.returncode == 2
+    assert "protected index" in (decode_response(snapshot.stdout).error or "")
+    assert b"secret.txt" not in snapshot.stdout
+
+
+def test_concurrent_start_calls_share_one_watcher_generation(tmp_path: Path) -> None:
+    archive = build_agent_zipapp(tmp_path / "agent.pyz")
+    root = tmp_path / "workspace"
+    home = tmp_path / "home"
+    control = tmp_path / "control"
+    root.mkdir()
+    home.mkdir()
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+    }
+    workspace_id = "00000000-0000-4000-8000-000000000075"
+    assert (
+        _agent_call(
+            archive,
+            AgentRequest("register", {"workspace_id": workspace_id, "root": str(root)}),
+            env,
+        ).returncode
+        == 0
+    )
+    barrier = threading.Barrier(3)
+    results: list[subprocess.CompletedProcess[bytes]] = []
+
+    def start() -> None:
+        barrier.wait()
+        results.append(
+            _agent_call(archive, AgentRequest("start", {"workspace_id": workspace_id}), env)
+        )
+
+    threads = [threading.Thread(target=start) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert [result.returncode for result in results] == [0, 0]
+    assert len({int(decode_response(result.stdout).payload["pid"]) for result in results}) == 1
+
+    stopped = _agent_call(archive, AgentRequest("stop", {"workspace_id": workspace_id}), env)
+    assert stopped.returncode == 0
+    assert (
+        _agent_call(archive, AgentRequest("forget", {"workspace_id": workspace_id}), env).returncode
+        == 0
+    )
+
+
+def test_forget_restores_index_and_metadata_when_deletion_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    home = tmp_path / "home"
+    control = tmp_path / "control"
+    root.mkdir()
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(control))
+    workspace_id = "00000000-0000-4000-8000-000000000076"
+    remote_agent_main._handle_register({"workspace_id": workspace_id, "root": str(root)})
+    metadata = control / "workspaces" / workspace_id
+    original_rmtree = remote_agent_main.shutil.rmtree
+
+    def fail_delete(path: Path) -> None:
+        raise OSError(f"cannot remove {path}")
+
+    monkeypatch.setattr(remote_agent_main.shutil, "rmtree", fail_delete)
+    with pytest.raises(OSError, match="cannot remove"):
+        remote_agent_main._handle_forget({"workspace_id": workspace_id})
+
+    assert metadata.exists()
+    with RemoteStore(control / "index.sqlite3") as index:
+        assert index.index_entry(workspace_id) is not None
+
+    monkeypatch.setattr(remote_agent_main.shutil, "rmtree", original_rmtree)
+    assert remote_agent_main._handle_forget({"workspace_id": workspace_id})["forgotten"] is True
+
+
+def test_non_follow_event_stream_drains_multiple_bounded_batches(tmp_path: Path) -> None:
+    archive = build_agent_zipapp(tmp_path / "agent.pyz")
+    root = tmp_path / "workspace"
+    home = tmp_path / "home"
+    control = tmp_path / "control"
+    root.mkdir()
+    home.mkdir()
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+    }
+    workspace_id = "00000000-0000-4000-8000-000000000078"
+    assert (
+        _agent_call(
+            archive,
+            AgentRequest("register", {"workspace_id": workspace_id, "root": str(root)}),
+            env,
+        ).returncode
+        == 0
+    )
+    with RemoteStore(control / "workspaces" / workspace_id / "state.sqlite3") as store:
+        for index in range(300):
+            store.append_event("create", f"files/{index:03d}.txt", None)
+
+    streamed = _agent_call(
+        archive,
+        AgentRequest(
+            "events",
+            {"workspace_id": workspace_id, "after_sequence": 0, "follow": False},
+        ),
+        env,
+    )
+
+    assert streamed.returncode == 0
+    lines = [json.loads(line) for line in streamed.stdout.splitlines()]
+    assert len(lines) == 300
+    assert lines[0]["path"] == "files/000.txt"
+    assert lines[-1]["path"] == "files/299.txt"

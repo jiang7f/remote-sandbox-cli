@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
+import secrets
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -17,14 +21,17 @@ from . import AGENT_VERSION
 from .store import (
     RemoteIndexEntry,
     RemoteStore,
+    RemoteWorkspace,
     WatcherState,
     process_is_alive,
     validate_workspace_id,
+    validate_workspace_root,
 )
 from .watcher import WatcherService, snapshot_entries
 
 _HOME_ENV = "CODEX_REMOTE_SANDBOX_HOME"
 _HOME_DIRNAME = ".codex-remote-sandbox"
+_EVENT_BATCH_SIZE = 256
 
 
 def _archive_sha256() -> str:
@@ -39,8 +46,8 @@ def main(argv: list[str]) -> int:
     if argv == ["self-check"]:
         print("codex-remote-sandbox-agent " + AGENT_VERSION + " " + _archive_sha256())
         return 0
-    if len(argv) == 3 and argv[0] == "_watch":
-        return _run_watcher(argv[1], Path(argv[2]))
+    if len(argv) == 4 and argv[0] == "_watch":
+        return _run_watcher(argv[1], Path(argv[2]), argv[3])
 
     try:
         request = json.loads(sys.stdin.buffer.readline().decode("utf-8"))
@@ -66,22 +73,43 @@ def main(argv: list[str]) -> int:
 
 def _handle_register(payload: dict[str, Any]) -> dict[str, object]:
     workspace_id = validate_workspace_id(_expect_string(payload, "workspace_id"))
-    root = Path(_expect_string(payload, "root"))
+    root = validate_workspace_root(
+        Path(_expect_string(payload, "root")),
+        home=Path.home(),
+    )
     home = _remote_home()
+    if home == root or home in root.parents or root in home.parents:
+        raise ValueError("workspace root and remote metadata home must not overlap")
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    home.chmod(0o700)
     metadata = _workspace_directory(home, workspace_id)
     state_path = metadata / "state.sqlite3"
-    metadata.mkdir(parents=True, exist_ok=True, mode=0o700)
-    metadata.chmod(0o700)
+    with (
+        _exclusive_lock(home / "index.lock"),
+        RemoteStore(home / "index.sqlite3") as index,
+    ):
+        by_id = index.index_entry(workspace_id)
+        by_root = index.workspace_for_root(root)
+        expected = RemoteIndexEntry(workspace_id, root, state_path)
+        if by_id not in {None, expected} or by_root not in {None, expected}:
+            raise ValueError("remote root or workspace is already registered")
 
-    with RemoteStore(state_path) as state:
-        workspace = state.register_workspace(workspace_id, root, home=Path.home())
-    with RemoteStore(home / "index.sqlite3") as index:
-        entry = index.register_index(
-            workspace_id,
-            workspace.root,
-            state_path,
-            home=Path.home(),
-        )
+        metadata_existed = metadata.exists()
+        try:
+            metadata.mkdir(parents=True, exist_ok=True, mode=0o700)
+            metadata.chmod(0o700)
+            with RemoteStore(state_path) as state:
+                workspace = state.register_workspace(workspace_id, root, home=Path.home())
+            entry = index.register_index(
+                workspace_id,
+                workspace.root,
+                state_path,
+                home=Path.home(),
+            )
+        except BaseException:
+            if not metadata_existed:
+                shutil.rmtree(metadata, ignore_errors=True)
+            raise
     return {
         "workspace_id": entry.workspace_id,
         "root": str(entry.root),
@@ -93,51 +121,86 @@ def _handle_start(payload: dict[str, Any]) -> dict[str, object]:
     workspace_id = validate_workspace_id(_expect_string(payload, "workspace_id"))
     home = _remote_home()
     entry = _lookup_workspace(home, workspace_id)
-    with RemoteStore(entry.state_path) as store:
+    with (
+        _exclusive_lock(entry.state_path.parent / "control.lock"),
+        RemoteStore(entry.state_path) as store,
+    ):
+        _require_workspace(store, entry)
         current = store.watcher_state()
-        if process_is_alive(current.pid):
+        identity = _watcher_identity(current, workspace_id)
+        if identity == "current":
             if current.status in {"starting", "running"}:
                 return _watcher_payload(current)
             raise RuntimeError("watcher process is already running")
+        if identity == "unknown":
+            raise RuntimeError("cannot verify the recorded watcher process")
 
+        token = secrets.token_hex(24)
         log_path = entry.state_path.parent / "watcher.log"
         log_path.touch(mode=0o600, exist_ok=True)
         log_path.chmod(0o600)
         with log_path.open("ab", buffering=0) as log:
             process = subprocess.Popen(
-                _watcher_command(workspace_id, home),
+                _watcher_command(workspace_id, home, token),
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=log,
                 close_fds=True,
                 start_new_session=True,
             )
-        observed = store.watcher_state()
-        if observed.pid != process.pid or observed.status != "running":
+        try:
             observed = store.record_watcher(
                 process.pid,
                 "starting",
-                backend=observed.backend,
+                backend=None,
+                token=token,
             )
+        except BaseException:
+            process.terminate()
+            process.wait(timeout=5)
+            raise
         return _watcher_payload(observed)
 
 
 def _handle_stop(payload: dict[str, Any]) -> dict[str, object]:
     workspace_id = validate_workspace_id(_expect_string(payload, "workspace_id"))
     entry = _lookup_workspace(_remote_home(), workspace_id)
-    with RemoteStore(entry.state_path) as store:
+    with (
+        _exclusive_lock(entry.state_path.parent / "control.lock"),
+        RemoteStore(entry.state_path) as store,
+    ):
+        _require_workspace(store, entry)
         current = store.watcher_state()
-        if not process_is_alive(current.pid):
+        identity = _watcher_identity(current, workspace_id)
+        if identity == "dead":
             stopped = store.record_watcher(None, "stopped", backend=current.backend)
             return _watcher_payload(stopped)
-        assert current.pid is not None
+        if identity == "mismatch":
+            store.record_watcher(
+                None,
+                "failed",
+                backend=current.backend,
+                error="recorded watcher pid belongs to another process",
+            )
+            raise RuntimeError("recorded watcher pid belongs to another process")
+        if identity == "unknown":
+            raise RuntimeError("cannot verify the recorded watcher process")
+
+        assert current.pid is not None and current.token is not None
         os.kill(current.pid, signal.SIGTERM)
         deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and process_is_alive(current.pid):
+        while time.monotonic() < deadline:
+            if _watcher_identity(current, workspace_id) != "current":
+                break
             time.sleep(0.05)
-        if process_is_alive(current.pid):
+        if _watcher_identity(current, workspace_id) == "current":
             raise RuntimeError("watcher did not stop after SIGTERM")
-        stopped = store.record_watcher(None, "stopped", backend=current.backend)
+        stopped = store.record_watcher_for_generation(
+            None,
+            "stopped",
+            backend=current.backend,
+            token=current.token,
+        )
         return _watcher_payload(stopped)
 
 
@@ -145,13 +208,20 @@ def _handle_status(payload: dict[str, Any]) -> dict[str, object]:
     workspace_id = validate_workspace_id(_expect_string(payload, "workspace_id"))
     entry = _lookup_workspace(_remote_home(), workspace_id)
     with RemoteStore(entry.state_path) as store:
+        _require_workspace(store, entry)
         state = store.watcher_state()
-        if state.status in {"starting", "running"} and not process_is_alive(state.pid):
+        identity = _watcher_identity(state, workspace_id)
+        if state.status in {"starting", "running"} and identity != "current":
+            reason = (
+                "watcher process exited"
+                if identity == "dead"
+                else "recorded watcher process identity does not match"
+            )
             state = store.record_watcher(
                 None,
                 "failed",
                 backend=state.backend,
-                error="watcher process exited",
+                error=reason,
             )
         payload_result = _watcher_payload(state)
         payload_result["latest_sequence"] = store.latest_sequence()
@@ -167,8 +237,9 @@ def _handle_events(payload: dict[str, Any]) -> int:
         entry = _lookup_workspace(_remote_home(), workspace_id)
         cursor = after_sequence
         with RemoteStore(entry.state_path) as store:
+            _require_workspace(store, entry)
             while True:
-                events = store.events_after(cursor)
+                events = store.events_after(cursor, limit=_EVENT_BATCH_SIZE)
                 for event in events:
                     line = {
                         "sequence": event.sequence,
@@ -181,6 +252,8 @@ def _handle_events(payload: dict[str, Any]) -> int:
                     )
                     sys.stdout.flush()
                     cursor = event.sequence
+                if events:
+                    continue
                 if not follow:
                     return 0
                 time.sleep(0.1)
@@ -196,6 +269,7 @@ def _handle_ack(payload: dict[str, Any]) -> dict[str, object]:
     sequence = _expect_integer(payload, "sequence")
     entry = _lookup_workspace(_remote_home(), workspace_id)
     with RemoteStore(entry.state_path) as store:
+        _require_workspace(store, entry)
         store.acknowledge(sequence)
         return {"acknowledged_sequence": store.acknowledged_sequence()}
 
@@ -204,7 +278,7 @@ def _handle_snapshot(payload: dict[str, Any]) -> dict[str, object]:
     workspace_id = validate_workspace_id(_expect_string(payload, "workspace_id"))
     entry = _lookup_workspace(_remote_home(), workspace_id)
     with RemoteStore(entry.state_path) as store:
-        workspace = store.workspace()
+        workspace = _require_workspace(store, entry)
         return {
             "entries": snapshot_entries(workspace.root),
             "latest_sequence": store.latest_sequence(),
@@ -215,27 +289,38 @@ def _handle_forget(payload: dict[str, Any]) -> dict[str, object]:
     workspace_id = validate_workspace_id(_expect_string(payload, "workspace_id"))
     home = _remote_home()
     entry = _lookup_workspace(home, workspace_id)
-    with RemoteStore(entry.state_path) as store:
-        watcher = store.watcher_state()
-        if process_is_alive(watcher.pid):
-            raise RuntimeError("cannot forget a workspace while its watcher is running")
-
     metadata = entry.state_path.parent
-    tombstone = metadata.with_name(f".forget-{workspace_id}-{os.getpid()}")
-    if tombstone.exists():
-        raise RuntimeError("stale remote forget transaction exists")
-    os.replace(metadata, tombstone)
-    try:
-        with RemoteStore(home / "index.sqlite3") as index:
-            index.remove_index(workspace_id)
-    except BaseException:
-        os.replace(tombstone, metadata)
-        raise
-    shutil.rmtree(tombstone)
-    return {"workspace_id": workspace_id, "forgotten": True}
+    with _exclusive_lock(metadata / "control.lock"):
+        with RemoteStore(entry.state_path) as store:
+            _require_workspace(store, entry)
+            watcher = store.watcher_state()
+            identity = _watcher_identity(watcher, workspace_id)
+            if identity in {"current", "unknown"}:
+                raise RuntimeError("cannot forget a workspace while its watcher may be running")
+
+        tombstone = metadata.with_name(f".forget-{workspace_id}-{os.getpid()}")
+        if tombstone.exists():
+            raise RuntimeError("stale remote forget transaction exists")
+        os.replace(metadata, tombstone)
+        try:
+            with RemoteStore(home / "index.sqlite3") as index:
+                index.remove_index(workspace_id)
+            shutil.rmtree(tombstone)
+        except BaseException:
+            if tombstone.exists():
+                os.replace(tombstone, metadata)
+            with RemoteStore(home / "index.sqlite3") as index:
+                index.register_index(
+                    entry.workspace_id,
+                    entry.root,
+                    entry.state_path,
+                    home=Path.home(),
+                )
+            raise
+        return {"workspace_id": workspace_id, "forgotten": True}
 
 
-def _run_watcher(workspace_id: str, home: Path) -> int:
+def _run_watcher(workspace_id: str, home: Path, token: str) -> int:
     service: WatcherService | None = None
     stop_requested = threading.Event()
 
@@ -249,9 +334,15 @@ def _run_watcher(workspace_id: str, home: Path) -> int:
     try:
         entry = _lookup_workspace(home, validate_workspace_id(workspace_id))
         with RemoteStore(entry.state_path) as store:
-            store.record_watcher(os.getpid(), "starting", backend=None)
-            root = store.workspace().root
-            service = WatcherService(root, store)
+            workspace = _require_workspace(store, entry)
+            with _exclusive_lock(entry.state_path.parent / "control.lock"):
+                store.record_watcher_for_generation(
+                    os.getpid(),
+                    "starting",
+                    backend=None,
+                    token=token,
+                )
+            service = WatcherService(workspace.root, store, token=token)
             if stop_requested.is_set():
                 service.stop()
             service.run()
@@ -260,7 +351,15 @@ def _run_watcher(workspace_id: str, home: Path) -> int:
         try:
             entry = _lookup_workspace(home, workspace_id)
             with RemoteStore(entry.state_path) as store:
-                store.record_watcher(None, "failed", backend=None, error=str(exc))
+                state = store.watcher_state()
+                if state.token == token and state.status != "failed":
+                    store.record_watcher_for_generation(
+                        None,
+                        "failed",
+                        backend=state.backend,
+                        token=token,
+                        error=str(exc),
+                    )
         except BaseException:
             pass
         return 1
@@ -269,14 +368,24 @@ def _run_watcher(workspace_id: str, home: Path) -> int:
 def _remote_home() -> Path:
     configured = os.environ.get(_HOME_ENV)
     raw = Path(configured).expanduser() if configured else Path.home() / _HOME_DIRNAME
-    home = raw.resolve(strict=False)
-    home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    home.chmod(0o700)
-    return home
+    return raw.resolve(strict=False)
 
 
 def _workspace_directory(home: Path, workspace_id: str) -> Path:
     return home / "workspaces" / validate_workspace_id(workspace_id)
+
+
+@contextmanager
+def _exclusive_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.touch(mode=0o600, exist_ok=True)
+    path.chmod(0o600)
+    with path.open("rb") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _lookup_workspace(home: Path, workspace_id: str) -> RemoteIndexEntry:
@@ -284,15 +393,63 @@ def _lookup_workspace(home: Path, workspace_id: str) -> RemoteIndexEntry:
         entry = index.index_entry(workspace_id)
     if entry is None:
         raise LookupError("remote workspace is not registered")
+    expected_state = _workspace_directory(home, workspace_id) / "state.sqlite3"
+    if entry.state_path != expected_state:
+        raise RuntimeError("protected index contains an invalid workspace state path")
     return entry
 
 
-def _watcher_command(workspace_id: str, home: Path) -> list[str]:
+def _require_workspace(store: RemoteStore, entry: RemoteIndexEntry) -> RemoteWorkspace:
+    workspace = store.workspace()
+    if workspace.workspace_id != entry.workspace_id or workspace.root != entry.root:
+        raise RuntimeError("workspace state disagrees with the protected index")
+    return workspace
+
+
+def _watcher_command(workspace_id: str, home: Path, token: str) -> list[str]:
     executable = Path(sys.argv[0]).resolve(strict=False)
     if executable.suffix == ".pyz":
-        return [sys.executable, str(executable), "_watch", workspace_id, str(home)]
+        return [sys.executable, str(executable), "_watch", workspace_id, str(home), token]
     package = __package__ or "remote_agent"
-    return [sys.executable, "-m", package, "_watch", workspace_id, str(home)]
+    return [sys.executable, "-m", package, "_watch", workspace_id, str(home), token]
+
+
+def _watcher_identity(state: WatcherState, workspace_id: str) -> str:
+    if not process_is_alive(state.pid):
+        return "dead"
+    if state.pid is None or state.token is None:
+        return "unknown"
+    arguments = _process_arguments(state.pid)
+    if arguments is None:
+        return "unknown"
+    required = {"_watch", workspace_id, state.token}
+    return "current" if required <= set(arguments) else "mismatch"
+
+
+def _process_arguments(pid: int) -> list[str] | None:
+    proc_cmdline = Path("/proc") / str(pid) / "cmdline"
+    try:
+        if proc_cmdline.exists():
+            return [
+                part.decode("utf-8", errors="surrogateescape")
+                for part in proc_cmdline.read_bytes().split(b"\0")
+                if part
+            ]
+        result = subprocess.run(
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        return shlex.split(result.stdout.strip())
+    except ValueError:
+        return None
 
 
 def _watcher_payload(state: WatcherState) -> dict[str, object]:

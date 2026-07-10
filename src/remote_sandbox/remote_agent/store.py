@@ -5,6 +5,8 @@ import re
 import sqlite3
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -42,6 +44,7 @@ class WatcherState:
     started_at: float | None
     heartbeat_at: float | None
     error: str | None
+    token: str | None
 
 
 class RemoteStore:
@@ -182,7 +185,15 @@ class RemoteStore:
     ) -> RemoteEvent:
         safe_kind, safe_path, safe_destination = _validate_event(kind, path, destination_path)
         created_at = time.time()
-        with self._lock, self._connection:
+        with self._write_transaction():
+            coalesced = self._coalesce_event(
+                safe_kind,
+                safe_path,
+                safe_destination,
+                created_at,
+            )
+            if coalesced is not None:
+                return coalesced
             cursor = self._connection.execute(
                 "INSERT INTO events(kind, path, destination_path, created_at) VALUES(?, ?, ?, ?)",
                 (safe_kind, safe_path, safe_destination, created_at),
@@ -192,18 +203,34 @@ class RemoteStore:
             sequence = cursor.lastrowid
         return RemoteEvent(sequence, safe_kind, safe_path, safe_destination, created_at)
 
-    def events_after(self, sequence: int) -> list[RemoteEvent]:
+    def events_after(self, sequence: int, *, limit: int | None = None) -> list[RemoteEvent]:
         safe_sequence = _validate_sequence(sequence)
-        with self._lock:
+        if limit is not None and (type(limit) is not int or limit <= 0):
+            raise ValueError("event limit must be a positive integer")
+        limit_clause = "" if limit is None else " LIMIT ?"
+        parameters: tuple[int, ...] = (safe_sequence,) if limit is None else (safe_sequence, limit)
+        with self._write_transaction():
             rows = self._connection.execute(
-                """
+                (
+                    """
                 SELECT sequence, kind, path, destination_path, created_at
                 FROM events
                 WHERE sequence > ?
                 ORDER BY sequence
-                """,
-                (safe_sequence,),
+                """
+                    + limit_clause
+                ),
+                parameters,
             ).fetchall()
+            if rows:
+                self._connection.execute(
+                    """
+                    UPDATE watermark
+                    SET delivered_sequence = MAX(delivered_sequence, ?)
+                    WHERE singleton = 1
+                    """,
+                    (int(rows[-1]["sequence"]),),
+                )
         return [_event(row) for row in rows]
 
     def latest_sequence(self) -> int:
@@ -215,7 +242,7 @@ class RemoteStore:
 
     def acknowledge(self, sequence: int) -> None:
         safe_sequence = _validate_sequence(sequence)
-        with self._lock, self._connection:
+        with self._write_transaction():
             latest_row = self._connection.execute(
                 "SELECT COALESCE(MAX(sequence), 0) AS latest FROM events"
             ).fetchone()
@@ -245,11 +272,14 @@ class RemoteStore:
         *,
         backend: str | None,
         error: str | None = None,
+        token: str | None = None,
     ) -> WatcherState:
         if pid is not None and (type(pid) is not int or pid <= 0):
             raise ValueError("watcher pid must be a positive integer")
         if not status or _has_control_character(status):
             raise ValueError("watcher status must be non-empty")
+        if token is not None and (not token or _has_control_character(token)):
+            raise ValueError("watcher token must be non-empty")
         now = time.time()
         with self._lock, self._connection:
             previous = self._connection.execute(
@@ -268,18 +298,51 @@ class RemoteStore:
             self._connection.execute(
                 """
                 INSERT INTO watcher(
-                    singleton, pid, status, backend, started_at, heartbeat_at, error
-                ) VALUES(1, ?, ?, ?, ?, ?, ?)
+                    singleton, pid, status, backend, started_at, heartbeat_at, error, token
+                ) VALUES(1, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(singleton) DO UPDATE SET
                     pid = excluded.pid,
                     status = excluded.status,
                     backend = excluded.backend,
                     started_at = excluded.started_at,
                     heartbeat_at = excluded.heartbeat_at,
-                    error = excluded.error
+                    error = excluded.error,
+                    token = excluded.token
                 """,
-                (pid, status, backend, started_at, now, error),
+                (pid, status, backend, started_at, now, error, token),
             )
+        return self.watcher_state()
+
+    def record_watcher_for_generation(
+        self,
+        pid: int | None,
+        status: str,
+        *,
+        backend: str | None,
+        token: str,
+        error: str | None = None,
+    ) -> WatcherState:
+        if not token or _has_control_character(token):
+            raise ValueError("watcher token must be non-empty")
+        now = time.time()
+        with self._lock, self._connection:
+            current = self.watcher_state()
+            if current.token != token:
+                raise RuntimeError("watcher generation is no longer current")
+            started_at = current.started_at
+            if status == "starting" or (status == "running" and started_at is None):
+                started_at = now
+            cursor = self._connection.execute(
+                """
+                UPDATE watcher
+                SET pid = ?, status = ?, backend = ?, started_at = ?,
+                    heartbeat_at = ?, error = ?
+                WHERE singleton = 1 AND token = ?
+                """,
+                (pid, status, backend, started_at, now, error, token),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("watcher generation is no longer current")
         return self.watcher_state()
 
     def heartbeat(self) -> None:
@@ -294,12 +357,13 @@ class RemoteStore:
             row = self._connection.execute(
                 """
                 SELECT pid, status, backend, started_at, heartbeat_at, error
+                     , token
                 FROM watcher
                 WHERE singleton = 1
                 """
             ).fetchone()
         if row is None:
-            return WatcherState(None, "stopped", None, None, None, None)
+            return WatcherState(None, "stopped", None, None, None, None, None)
         return WatcherState(
             None if row["pid"] is None else int(row["pid"]),
             str(row["status"]),
@@ -307,6 +371,7 @@ class RemoteStore:
             None if row["started_at"] is None else float(row["started_at"]),
             None if row["heartbeat_at"] is None else float(row["heartbeat_at"]),
             None if row["error"] is None else str(row["error"]),
+            None if row["token"] is None else str(row["token"]),
         )
 
     def _initialize_schema(self) -> None:
@@ -328,7 +393,8 @@ class RemoteStore:
 
             CREATE TABLE IF NOT EXISTS watermark (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                acknowledged_sequence INTEGER NOT NULL DEFAULT 0
+                acknowledged_sequence INTEGER NOT NULL DEFAULT 0,
+                delivered_sequence INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS watcher (
@@ -338,7 +404,8 @@ class RemoteStore:
                 backend TEXT,
                 started_at REAL,
                 heartbeat_at REAL,
-                error TEXT
+                error TEXT,
+                token TEXT
             );
 
             CREATE TABLE IF NOT EXISTS remote_index (
@@ -347,10 +414,100 @@ class RemoteStore:
                 state_path TEXT NOT NULL UNIQUE
             );
 
-            INSERT OR IGNORE INTO watermark(singleton, acknowledged_sequence) VALUES(1, 0);
+            INSERT OR IGNORE INTO watermark(
+                singleton, acknowledged_sequence, delivered_sequence
+            ) VALUES(1, 0, 0);
             INSERT OR IGNORE INTO watcher(singleton, status) VALUES(1, 'stopped');
             """
         )
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(watcher)").fetchall()
+        }
+        if "token" not in columns:
+            self._connection.execute("ALTER TABLE watcher ADD COLUMN token TEXT")
+        watermark_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(watermark)").fetchall()
+        }
+        if "delivered_sequence" not in watermark_columns:
+            self._connection.execute(
+                "ALTER TABLE watermark ADD COLUMN delivered_sequence INTEGER NOT NULL DEFAULT 0"
+            )
+
+    def _coalesce_event(
+        self,
+        kind: str,
+        path: str,
+        destination_path: str | None,
+        created_at: float,
+    ) -> RemoteEvent | None:
+        watermark = self._connection.execute(
+            """
+            SELECT acknowledged_sequence, delivered_sequence
+            FROM watermark
+            WHERE singleton = 1
+            """
+        ).fetchone()
+        protected_sequence = max(
+            int(watermark["acknowledged_sequence"]),
+            int(watermark["delivered_sequence"]),
+        )
+        if kind == "rescan-required":
+            row = self._connection.execute(
+                """
+                SELECT sequence, kind, path, destination_path, created_at
+                FROM events
+                WHERE sequence > ? AND kind = 'rescan-required'
+                ORDER BY sequence DESC
+                LIMIT 1
+                """,
+                (protected_sequence,),
+            ).fetchone()
+            if row is None:
+                return None
+            self._connection.execute(
+                "UPDATE events SET created_at = ? WHERE sequence = ?",
+                (created_at, int(row["sequence"])),
+            )
+            return RemoteEvent(int(row["sequence"]), kind, path, None, created_at)
+        if kind == "move":
+            return None
+
+        row = self._connection.execute(
+            """
+            SELECT sequence, kind, path, destination_path, created_at
+            FROM events
+            WHERE sequence > ? AND (path = ? OR destination_path = ?)
+            ORDER BY sequence DESC
+            LIMIT 1
+            """,
+            (protected_sequence, path, path),
+        ).fetchone()
+        if row is None or row["destination_path"] is not None:
+            return None
+        previous_kind = str(row["kind"])
+        if previous_kind not in {"create", "modify", "delete"}:
+            return None
+        merged_kind = _merge_event_kinds(previous_kind, kind)
+        sequence = int(row["sequence"])
+        self._connection.execute(
+            "UPDATE events SET kind = ?, created_at = ? WHERE sequence = ?",
+            (merged_kind, created_at, sequence),
+        )
+        return RemoteEvent(sequence, merged_kind, path, destination_path, created_at)
+
+    @contextmanager
+    def _write_transaction(self) -> Iterator[None]:
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+            else:
+                self._connection.execute("COMMIT")
 
 
 def validate_workspace_id(value: str) -> str:
@@ -428,6 +585,21 @@ def _validate_sequence(value: int) -> int:
     if type(value) is not int or value < 0:
         raise ValueError("sequence must be a non-negative integer")
     return value
+
+
+def _merge_event_kinds(previous: str, current: str) -> str:
+    transitions = {
+        ("create", "create"): "create",
+        ("create", "modify"): "create",
+        ("create", "delete"): "delete",
+        ("modify", "create"): "modify",
+        ("modify", "modify"): "modify",
+        ("modify", "delete"): "delete",
+        ("delete", "create"): "modify",
+        ("delete", "modify"): "modify",
+        ("delete", "delete"): "delete",
+    }
+    return transitions[(previous, current)]
 
 
 def _event(row: sqlite3.Row) -> RemoteEvent:
