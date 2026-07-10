@@ -9,8 +9,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from remote_sandbox._legacy_reconcile import PlanAction, PlanActionType, SyncPlan
 from remote_sandbox.manifest import MISSING, EntryKind, EntryState, FileEntry, is_missing
-from remote_sandbox.reconcile import PlanAction, PlanActionType, SyncPlan
 from remote_sandbox.scan import read_placeholder_entry
 from remote_sandbox.ssh import SshRunner
 from remote_sandbox.state import StateStore

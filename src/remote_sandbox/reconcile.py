@@ -1,286 +1,331 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TypeAlias, cast
 
 from remote_sandbox.manifest import (
-    MISSING,
+    EntryFingerprint,
     EntryKind,
-    EntryState,
-    FileEntry,
     MissingEntry,
-    is_missing,
+    normalize_relative_path,
 )
-from remote_sandbox.policy import PolicyDecision, PolicyEngine, ReplicaSide
+from remote_sandbox.policy import PolicyEngine
+
+FingerprintState: TypeAlias = EntryFingerprint | MissingEntry
 
 
-class PlanActionType(StrEnum):
-    PULL = "pull"
+class ActionType(StrEnum):
     PUSH = "push"
-    DELETE_LOCAL = "delete_local"
-    DELETE_REMOTE = "delete_remote"
-    PLACEHOLDER = "placeholder"
-    UPDATE_BASE = "update_base"
-    CONFLICT = "conflict"
-    NEEDS_HASH = "needs_hash"
+    PULL = "pull"
+    DELETE_LOCAL = "delete-local"
+    DELETE_REMOTE = "delete-remote"
+    UPDATE_BASE = "update-base"
 
 
 @dataclass(frozen=True, slots=True)
-class PlanAction:
-    type: PlanActionType
+class HashRequest:
+    side: str
     path: str
-    base: EntryState
-    local: EntryState
-    remote: EntryState
-    base_after: EntryState | None = None
-    reason: str = ""
+
+    def __post_init__(self) -> None:
+        if type(self.side) is not str or self.side not in {"local", "remote"}:
+            raise ValueError("hash request side must be local or remote")
+        object.__setattr__(self, "path", _normalized_model_path(self.path, "hash request"))
+
+
+@dataclass(frozen=True, slots=True)
+class ConflictDecision:
+    path: str
+    reason: str
+    local: FingerprintState
+    remote: FingerprintState
+
+    def __post_init__(self) -> None:
+        normalized = _normalized_model_path(self.path, "conflict")
+        object.__setattr__(self, "path", normalized)
+        _validate_reason(self.reason, "conflict")
+        _validate_snapshot(self.local, normalized, "conflict local")
+        _validate_snapshot(self.remote, normalized, "conflict remote")
+
+
+@dataclass(frozen=True, slots=True)
+class PlanWarning:
+    path: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", _normalized_model_path(self.path, "warning"))
+        _validate_reason(self.reason, "warning")
+
+
+@dataclass(frozen=True, slots=True)
+class SyncAction:
+    type: ActionType
+    path: str
+    expected_local: FingerprintState
+    expected_remote: FingerprintState
+    base_after: FingerprintState
+
+    def __post_init__(self) -> None:
+        if type(self.type) is not ActionType:
+            raise ValueError("sync action type must be an ActionType")
+        normalized = _normalized_model_path(self.path, "sync action")
+        object.__setattr__(self, "path", normalized)
+        _validate_snapshot(self.expected_local, normalized, "sync action expected local")
+        _validate_snapshot(self.expected_remote, normalized, "sync action expected remote")
+        _validate_snapshot(self.base_after, normalized, "sync action base after")
 
 
 @dataclass(frozen=True, slots=True)
 class SyncPlan:
-    actions: tuple[PlanAction, ...]
+    hash_requests: tuple[HashRequest, ...] = ()
+    actions: tuple[SyncAction, ...] = ()
+    conflicts: tuple[ConflictDecision, ...] = ()
+    warnings: tuple[PlanWarning, ...] = ()
+
+    def __post_init__(self) -> None:
+        _validate_tuple(self.hash_requests, HashRequest, "hash_requests")
+        _validate_tuple(self.actions, SyncAction, "actions")
+        _validate_tuple(self.conflicts, ConflictDecision, "conflicts")
+        _validate_tuple(self.warnings, PlanWarning, "warnings")
 
 
-def build_plan(
-    base_entries: Mapping[str, FileEntry],
-    local_entries: Mapping[str, FileEntry],
-    remote_entries: Mapping[str, FileEntry],
-    policy_engine: PolicyEngine,
+def build_incremental_plan(
+    base: Mapping[str, FingerprintState],
+    local: Mapping[str, FingerprintState],
+    remote: Mapping[str, FingerprintState],
+    dirty_paths: Iterable[str],
+    policy: PolicyEngine,
 ) -> SyncPlan:
-    paths = sorted(set(base_entries) | set(local_entries) | set(remote_entries))
-    actions: list[PlanAction] = []
+    _validate_mapping(base, "base")
+    _validate_mapping(local, "local")
+    _validate_mapping(remote, "remote")
+    paths = _normalized_dirty_paths(dirty_paths)
+    hash_requests: list[HashRequest] = []
+    actions: list[SyncAction] = []
+    conflicts: list[ConflictDecision] = []
+    warnings: list[PlanWarning] = []
+
     for path in paths:
-        if policy_engine.is_ignored(path):
+        if policy.is_ignored(path):
             continue
-        base = base_entries.get(path, MISSING)
-        local = local_entries.get(path, MISSING)
-        remote = remote_entries.get(path, MISSING)
-        action = _plan_path(path, base, local, remote, policy_engine)
+        base_entry = _fingerprint_at(base, path, "base")
+        local_entry = _fingerprint_at(local, path, "local")
+        remote_entry = _fingerprint_at(remote, path, "remote")
+
+        if _contains_special(base_entry, local_entry, remote_entry):
+            warnings.append(PlanWarning(path, "special-entry-not-transferred"))
+            continue
+        if _placeholder_changed(base_entry, local_entry):
+            conflicts.append(
+                ConflictDecision(path, "placeholder-changed", local_entry, remote_entry)
+            )
+            continue
+        if _kind_diverged(local_entry, remote_entry):
+            conflicts.append(ConflictDecision(path, "kind-divergence", local_entry, remote_entry))
+            continue
+
+        requests = _missing_hash_requests(path, local_entry, remote_entry)
+        if requests:
+            hash_requests.extend(requests)
+            continue
+
+        action, conflict = _plan_incremental_path(
+            path,
+            base_entry,
+            local_entry,
+            remote_entry,
+        )
         if action is not None:
             actions.append(action)
-    return SyncPlan(actions=tuple(actions))
+        if conflict is not None:
+            conflicts.append(conflict)
+
+    return SyncPlan(
+        hash_requests=tuple(hash_requests),
+        actions=tuple(actions),
+        conflicts=tuple(conflicts),
+        warnings=tuple(warnings),
+    )
 
 
-def _plan_path(
+def _plan_incremental_path(
     path: str,
-    base: EntryState,
-    local: EntryState,
-    remote: EntryState,
-    policy_engine: PolicyEngine,
-) -> PlanAction | None:
-    if _has_unsupported(local, remote):
-        return PlanAction(
-            PlanActionType.CONFLICT,
-            path,
-            base,
-            local,
-            remote,
-            reason="unsupported file type",
-        )
-    if _kind_changed_from_base(base, local, remote):
-        return PlanAction(
-            PlanActionType.CONFLICT,
-            path,
-            base,
-            local,
-            remote,
-            reason="entry kind changed",
-        )
-    if _needs_hash(local, remote):
-        return PlanAction(
-            PlanActionType.NEEDS_HASH,
-            path,
-            base,
-            local,
-            remote,
-            reason=_missing_hash_reason(local, remote),
-        )
-    if _needs_hash(local, base):
-        return PlanAction(
-            PlanActionType.NEEDS_HASH,
-            path,
-            base,
-            local,
-            remote,
-            reason=_missing_hash_reason(local, base),
-        )
-    if _needs_hash(remote, base):
-        return PlanAction(
-            PlanActionType.NEEDS_HASH,
-            path,
-            base,
-            local,
-            remote,
-            reason=_missing_hash_reason(remote, base).replace("local", "remote"),
-        )
+    base: FingerprintState,
+    local: FingerprintState,
+    remote: FingerprintState,
+) -> tuple[SyncAction | None, ConflictDecision | None]:
+    if _fingerprint_content_equal(local, remote):
+        if isinstance(local, MissingEntry) and isinstance(base, MissingEntry):
+            return None, None
+        base_after = _matching_base_after(local, remote)
+        return _new_action(ActionType.UPDATE_BASE, path, local, remote, base_after), None
 
-    local_remote_equal = content_equal(local, remote)
-    local_base_equal = content_equal(local, base)
-    remote_base_equal = content_equal(remote, base)
+    if isinstance(base, MissingEntry):
+        if isinstance(local, MissingEntry):
+            return _new_action(ActionType.PULL, path, local, remote, remote), None
+        if isinstance(remote, MissingEntry):
+            return _new_action(ActionType.PUSH, path, local, remote, local), None
+        return None, ConflictDecision(path, "both-modified", local, remote)
 
-    if local_remote_equal:
-        if is_missing(local) and is_missing(base):
-            return None
-        base_after = _base_after_matching_replicas(base, local, remote)
-        return PlanAction(
-            PlanActionType.UPDATE_BASE,
-            path,
-            base,
-            local,
-            remote,
-            base_after=base_after,
-            reason="local and remote match",
-        )
-
-    if local_base_equal and not remote_base_equal:
-        if is_missing(remote):
-            return PlanAction(
-                PlanActionType.DELETE_LOCAL,
+    local_matches_base = _fingerprint_content_equal(local, base)
+    remote_matches_base = _fingerprint_content_equal(remote, base)
+    if local_matches_base and not remote_matches_base:
+        if isinstance(remote, MissingEntry):
+            return _new_action(
+                ActionType.DELETE_LOCAL,
                 path,
-                base,
                 local,
                 remote,
-                base_after=MISSING,
-                reason="remote deleted",
-            )
-        assert isinstance(remote, FileEntry)
-        return PlanAction(
-            _pull_action_type(remote, policy_engine),
-            path,
-            base,
-            local,
-            remote,
-            base_after=remote,
-            reason="remote changed",
-        )
-
-    if remote_base_equal and not local_base_equal:
-        if _local_placeholder_deleted(base, local, remote):
-            return PlanAction(
-                PlanActionType.CONFLICT,
+                MissingEntry(path),
+            ), None
+        return _new_action(ActionType.PULL, path, local, remote, remote), None
+    if remote_matches_base and not local_matches_base:
+        if isinstance(local, MissingEntry):
+            return _new_action(
+                ActionType.DELETE_REMOTE,
                 path,
-                base,
                 local,
                 remote,
-                reason="local placeholder deleted; remote file still exists",
-            )
-        if is_missing(local):
-            return PlanAction(
-                PlanActionType.DELETE_REMOTE,
-                path,
-                base,
-                local,
-                remote,
-                base_after=MISSING,
-                reason="local deleted",
-            )
-        return PlanAction(
-            PlanActionType.PUSH,
-            path,
-            base,
-            local,
-            remote,
-            base_after=local,
-            reason="local changed",
-        )
+                MissingEntry(path),
+            ), None
+        return _new_action(ActionType.PUSH, path, local, remote, local), None
 
-    return PlanAction(
-        PlanActionType.CONFLICT,
-        path,
-        base,
-        local,
-        remote,
-        reason="both sides changed",
+    reason = (
+        "delete-versus-modify"
+        if isinstance(local, MissingEntry) or isinstance(remote, MissingEntry)
+        else "both-modified"
     )
+    return None, ConflictDecision(path, reason, local, remote)
 
 
-def content_equal(left: EntryState, right: EntryState) -> bool:
-    if is_missing(left) or is_missing(right):
-        return left is right
-    assert isinstance(left, FileEntry)
-    assert isinstance(right, FileEntry)
-    if left.kind != right.kind:
-        return False
-    if left.kind == "dir":
-        return True
-    if left.kind == EntryKind.UNSUPPORTED:
-        return False
-    if left.hash is None or right.hash is None:
-        return False
-    return left.hash == right.hash
+def _new_action(
+    action_type: ActionType,
+    path: str,
+    local: FingerprintState,
+    remote: FingerprintState,
+    base_after: FingerprintState,
+) -> SyncAction:
+    return SyncAction(action_type, path, local, remote, base_after)
 
 
-def _pull_action_type(entry: FileEntry, policy_engine: PolicyEngine) -> PlanActionType:
-    if entry.kind != EntryKind.FILE:
-        return PlanActionType.PULL
-    decision = policy_engine.classify(entry, side=ReplicaSide.REMOTE)
-    if decision == PolicyDecision.PLACEHOLDER:
-        return PlanActionType.PLACEHOLDER
-    return PlanActionType.PULL
-
-
-def _needs_hash(left: EntryState, right: EntryState) -> bool:
+def _fingerprint_content_equal(left: FingerprintState, right: FingerprintState) -> bool:
     if isinstance(left, MissingEntry) or isinstance(right, MissingEntry):
+        return isinstance(left, MissingEntry) and isinstance(right, MissingEntry)
+    if left.kind is not right.kind:
         return False
-    assert isinstance(left, FileEntry)
-    assert isinstance(right, FileEntry)
-    if left.kind != right.kind:
-        return False
-    if left.kind == "dir":
-        return False
-    if left.kind == EntryKind.UNSUPPORTED:
-        return False
-    return left.hash is None or right.hash is None
+    if left.kind is EntryKind.FILE:
+        return left.content_hash is not None and left.content_hash == right.content_hash
+    if left.kind is EntryKind.SYMLINK:
+        return left.link_target == right.link_target
+    return left.kind is EntryKind.DIR
 
 
-def _kind_changed_from_base(base: EntryState, local: EntryState, remote: EntryState) -> bool:
-    if is_missing(base):
-        return False
-    assert isinstance(base, FileEntry)
-    return (
-        isinstance(local, FileEntry)
-        and local.kind != base.kind
-        or isinstance(remote, FileEntry)
-        and remote.kind != base.kind
-    )
-
-
-def _base_after_matching_replicas(
-    base: EntryState,
-    local: EntryState,
-    remote: EntryState,
-) -> EntryState:
-    if is_missing(local):
-        return MISSING
-    if isinstance(local, FileEntry) and local.is_placeholder:
+def _matching_base_after(
+    local: FingerprintState,
+    remote: FingerprintState,
+) -> FingerprintState:
+    if isinstance(local, MissingEntry):
         return local
-    if isinstance(base, FileEntry) and base.is_placeholder and not is_missing(remote):
-        assert isinstance(remote, FileEntry)
-        return remote
-    return remote if not is_missing(remote) else local
+    if local.is_placeholder:
+        return local
+    return remote
 
 
-def _local_placeholder_deleted(base: EntryState, local: EntryState, remote: EntryState) -> bool:
+def _missing_hash_requests(
+    path: str,
+    local: FingerprintState,
+    remote: FingerprintState,
+) -> tuple[HashRequest, ...]:
+    requests: list[HashRequest] = []
+    if _file_needs_hash(local):
+        requests.append(HashRequest("local", path))
+    if _file_needs_hash(remote):
+        requests.append(HashRequest("remote", path))
+    return tuple(requests)
+
+
+def _file_needs_hash(entry: FingerprintState) -> bool:
     return (
-        isinstance(base, FileEntry)
-        and base.is_placeholder
-        and is_missing(local)
-        and isinstance(remote, FileEntry)
+        isinstance(entry, EntryFingerprint)
+        and entry.kind is EntryKind.FILE
+        and entry.content_hash is None
     )
 
 
-def _has_unsupported(left: EntryState, right: EntryState) -> bool:
+def _placeholder_changed(base: FingerprintState, local: FingerprintState) -> bool:
+    if not isinstance(base, EntryFingerprint) or not base.is_placeholder:
+        return False
+    return local != base
+
+
+def _kind_diverged(local: FingerprintState, remote: FingerprintState) -> bool:
     return (
-        isinstance(left, FileEntry)
-        and left.kind == EntryKind.UNSUPPORTED
-        or isinstance(right, FileEntry)
-        and right.kind == EntryKind.UNSUPPORTED
+        isinstance(local, EntryFingerprint)
+        and isinstance(remote, EntryFingerprint)
+        and local.kind is not remote.kind
     )
 
 
-def _missing_hash_reason(left: EntryState, right: EntryState) -> str:
-    del right
-    if isinstance(left, FileEntry) and left.hash is None:
-        return "missing local hash"
-    return "missing remote hash"
+def _contains_special(*entries: FingerprintState) -> bool:
+    return any(
+        isinstance(entry, EntryFingerprint) and entry.kind is EntryKind.SPECIAL
+        for entry in entries
+    )
+
+
+def _fingerprint_at(
+    entries: Mapping[str, FingerprintState],
+    path: str,
+    label: str,
+) -> FingerprintState:
+    absent = object()
+    entry = cast(object, entries.get(path, absent))
+    if entry is absent:
+        return MissingEntry(path)
+    _validate_snapshot(entry, path, f"{label} entry")
+    return cast(FingerprintState, entry)
+
+
+def _normalized_dirty_paths(dirty_paths: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(dirty_paths, (str, bytes)):
+        raise ValueError("dirty_paths must be an iterable of relative paths")
+    normalized: set[str] = set()
+    try:
+        iterator = iter(dirty_paths)
+    except TypeError as exc:
+        raise ValueError("dirty_paths must be an iterable of relative paths") from exc
+    for path in iterator:
+        normalized.add(_normalized_model_path(path, "dirty path"))
+    return tuple(sorted(normalized))
+
+
+def _normalized_model_path(path: object, label: str) -> str:
+    if type(path) is not str:
+        raise ValueError(f"{label} path must be a string")
+    return normalize_relative_path(path)
+
+
+def _validate_snapshot(entry: object, path: str, label: str) -> None:
+    if type(entry) not in {EntryFingerprint, MissingEntry}:
+        raise ValueError(f"{label} must be an EntryFingerprint or MissingEntry")
+    entry_path = cast(FingerprintState, entry).path
+    if entry_path is None or entry_path != path:
+        raise ValueError(f"{label} path must match {path}")
+
+
+def _validate_mapping(entries: object, label: str) -> None:
+    if not isinstance(entries, Mapping):
+        raise ValueError(f"{label} must be a mapping")
+
+
+def _validate_reason(reason: object, label: str) -> None:
+    if type(reason) is not str or not reason:
+        raise ValueError(f"{label} reason must be a non-empty string")
+
+
+def _validate_tuple(values: object, item_type: type[object], label: str) -> None:
+    if type(values) is not tuple or any(type(value) is not item_type for value in values):
+        raise ValueError(f"{label} must be a tuple of {item_type.__name__} values")

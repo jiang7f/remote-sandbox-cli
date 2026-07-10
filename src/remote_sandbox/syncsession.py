@@ -4,11 +4,11 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from remote_sandbox._legacy_reconcile import build_plan
 from remote_sandbox.agent import bootstrap_agent, remote_agent_path
 from remote_sandbox.lock import workspace_lock
 from remote_sandbox.marker import METADATA_DIR
 from remote_sandbox.policy import POLICY_FILE_NAME, StaticPolicyEngine
-from remote_sandbox.reconcile import build_plan
 from remote_sandbox.scan import scan_local_manifest, scan_remote_manifest
 from remote_sandbox.settings import load_settings
 from remote_sandbox.ssh import SshRunner
