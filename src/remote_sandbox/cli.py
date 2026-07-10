@@ -26,6 +26,7 @@ from remote_sandbox.fetch import FetchError, fetch_placeholders
 from remote_sandbox.lock import WorkspaceLockError
 from remote_sandbox.marker import METADATA_DIR, read_local_marker, remove_local_metadata
 from remote_sandbox.peek import PeekError, peek_placeholder
+from remote_sandbox.policy import DEFAULT_RSBIGNORE, POLICY_FILE_NAME
 from remote_sandbox.registry import (
     BindingRecord,
     RegistryError,
@@ -72,6 +73,20 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("list", help="List SSH-configured servers")
 
     subparsers.add_parser("status", help="List local workspace bindings")
+
+    init = subparsers.add_parser("init", help="Write a default .rsbignore in a directory")
+    init.add_argument(
+        "-l",
+        "--local",
+        default=".",
+        help="Directory to write .rsbignore into; defaults to cwd",
+    )
+    init.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Overwrite an existing .rsbignore",
+    )
 
     start = subparsers.add_parser("start", help="Start the sync daemon for a binding")
     start.add_argument("name", nargs="?", help="Connection name; defaults to current workspace")
@@ -234,6 +249,25 @@ def list_servers() -> int:
             placeholder_limit=settings.placeholder_limit,
         )
     )
+    return 0
+
+
+def init_workspace(*, local: Path, force: bool) -> int:
+    """Write a default .rsbignore so obvious junk (venv, caches, pyc) never syncs."""
+    target_dir = local.expanduser()
+    if not target_dir.exists():
+        raise ValueError(f"directory does not exist: {target_dir}")
+    if not target_dir.is_dir():
+        raise ValueError(f"not a directory: {target_dir}")
+    dest = target_dir / POLICY_FILE_NAME
+    if dest.exists() and not force:
+        print(
+            f"{_error_prefix()} {dest} already exists; pass --force to overwrite",
+            file=sys.stderr,
+        )
+        return 2
+    dest.write_text(DEFAULT_RSBIGNORE, encoding="utf-8")
+    print(f"Wrote {dest}")
     return 0
 
 
@@ -611,6 +645,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "status":
         try:
             return show_status()
+        except CLI_ERRORS as exc:
+            print(f"{_error_prefix()} {exc}", file=sys.stderr)
+            return 2
+
+    if args.command == "init":
+        try:
+            return init_workspace(local=Path(args.local), force=args.force)
         except CLI_ERRORS as exc:
             print(f"{_error_prefix()} {exc}", file=sys.stderr)
             return 2

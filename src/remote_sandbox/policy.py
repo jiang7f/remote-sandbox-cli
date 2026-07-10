@@ -22,6 +22,35 @@ class PolicyDecision(StrEnum):
 
 POLICY_FILE_NAME = ".rsbignore"
 
+# Written by `rsb init`. Ignores the usual build/venv/cache junk that should never sync
+# (and would otherwise churn the sync loop). `.git/` is left syncing by default — mid-sync
+# git churn is handled by skipping individual changed files — but offered as a commented
+# opt-out. Large files fall back to placeholders via the user-level placeholder-limit.
+DEFAULT_RSBIGNORE = """\
+# remote-sandbox ignore file.
+# Plain rules below are NOT synced. Rules under [placeholder] keep a local stub for large
+# remote files instead of downloading them. The large-file threshold is user-level:
+# `rsb set placeholder-limit 10MB`.
+
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+node_modules/
+.DS_Store
+
+# Uncomment to stop syncing git internals entirely (remote loses git history):
+# .git/
+
+[placeholder]
+"""
+
 # OS / editor cruft that should never sync. Applied as soft defaults (a user `.rsbignore`
 # rule can still re-enable one), so a directory containing only these counts as empty.
 _JUNK_IGNORE_PATTERNS = (
