@@ -45,7 +45,7 @@ from remote_sandbox.settings import (
     set_placeholder_limit,
     settings_path,
 )
-from remote_sandbox.shell import enter_shell_loop
+from remote_sandbox.shell import display_label, enter_shell_loop
 from remote_sandbox.ssh import SshError, SubprocessSshRunner
 from remote_sandbox.ssh_config import SshHost, load_configured_hosts
 from remote_sandbox.sync import SyncExecutionError
@@ -380,14 +380,42 @@ def _open_wrapped_shell_for_record(record: BindingRecord) -> int:
         barrier_seen = True
         _poke_or_restart_daemon(local_root, "shell")
 
+    label = display_label(record.target)
+
+    def status_provider() -> str:
+        return _shell_title(label, local_root)
+
     code = runner.interactive_shell(
         record.target,
         record.remote_path,
         on_barrier=on_barrier,
+        status_provider=status_provider,
     )
     if not barrier_seen:
         _poke_or_restart_daemon(local_root, "shell")
     return code
+
+
+def _shell_title(label: str, local_root: Path) -> str:
+    """Terminal-title text showing live sync state next to the target label.
+
+    Fixed-shape so the title does not jump around: `[label] syncing 421/3626`,
+    `[label] syncing` (before totals are known), or `[label] ready`. Kept in the title bar
+    (not the prompt) so it can refresh in real time without disturbing what you type.
+    """
+    try:
+        status = daemon_status(local_root)
+    except CLI_ERRORS:
+        return f"[{label}]"
+    if not status.running:
+        return f"[{label}]"
+    if status.phase in {DaemonPhase.INITIAL_SYNCING, DaemonPhase.SYNCING}:
+        if status.files_total:
+            return f"[{label}] syncing {status.files_done or 0}/{status.files_total}"
+        return f"[{label}] syncing"
+    if status.phase is DaemonPhase.DEGRADED:
+        return f"[{label}] sync error (retrying)"
+    return f"[{label}] ready"
 
 
 def _ensure_daemon_quietly(local_root: Path) -> None:

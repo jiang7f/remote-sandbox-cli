@@ -351,9 +351,12 @@ def managed_shell_loop(
     nonce: str,
     on_barrier: Callable[[int], None],
     backend: ShellBackend | None = None,
+    status_provider: Callable[[], str] | None = None,
 ) -> int:
     argv = build_managed_remote_shell_command(target, cwd, nonce=nonce)
     shell_backend = backend or _pty_shell_backend
+    if shell_backend is _pty_shell_backend:
+        return _pty_shell_backend(argv, nonce, on_barrier, status_provider=status_provider)
     return shell_backend(argv, nonce, on_barrier)
 
 
@@ -394,16 +397,42 @@ def enter_shell_loop(
     )
 
 
-def _pty_shell_backend(argv: list[str], nonce: str, on_barrier: Callable[[int], None]) -> int:
+def _pty_shell_backend(
+    argv: list[str],
+    nonce: str,
+    on_barrier: Callable[[int], None],
+    status_provider: Callable[[], str] | None = None,
+) -> int:
     pid, master_fd = pty.fork()
     if pid == 0:
         os.execvp(argv[0], argv)
     parser = ShellOutputParser(nonce)
     stdin_fd = sys.stdin.fileno()
+    last_title = ""
+    # Poll interval for refreshing the terminal-title sync indicator. The remote shell can't
+    # see local sync state, so we surface it in the title bar (never in the prompt line, which
+    # would corrupt readline's width math). None means no indicator.
+    poll = 1.0 if status_provider is not None else None
+
+    def refresh_title() -> None:
+        nonlocal last_title
+        if status_provider is None:
+            return
+        try:
+            title = status_provider()
+        except Exception:  # never let a status hiccup disturb the shell
+            return
+        if title and title != last_title:
+            last_title = title
+            with suppress(OSError):
+                os.write(sys.stdout.fileno(), _set_title(title))
+
     with _raw_terminal(stdin_fd), _mirrored_window_size(master_fd):
+        refresh_title()
         try:
             while True:
-                readable, _, _ = select.select([master_fd, stdin_fd], [], [])
+                readable, _, _ = select.select([master_fd, stdin_fd], [], [], poll)
+                refresh_title()
                 if master_fd in readable:
                     try:
                         data = os.read(master_fd, 4096)
@@ -427,6 +456,12 @@ def _pty_shell_backend(argv: list[str], nonce: str, on_barrier: Callable[[int], 
     if os.WIFSIGNALED(status):
         return 128 + os.WTERMSIG(status)
     return 1
+
+
+def _set_title(text: str) -> bytes:
+    # OSC 2 sets the window title; strip control chars so it can't inject escapes.
+    safe = "".join(ch for ch in text if ch.isprintable())
+    return f"\x1b]2;{safe}\x07".encode()
 
 
 def _pty_enter_shell_backend(
