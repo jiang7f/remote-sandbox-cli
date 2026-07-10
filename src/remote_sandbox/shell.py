@@ -56,9 +56,16 @@ def display_label(target: str) -> str:
     return _SAFE_LABEL_CHARS.sub("_", target)
 
 
-def build_managed_remote_shell_command(target: str, cwd: str, *, nonce: str) -> list[str]:
+def build_managed_remote_shell_command(
+    target: str,
+    cwd: str,
+    *,
+    nonce: str,
+    label: str | None = None,
+) -> list[str]:
     validate_target(target)
     validate_remote_path(cwd)
+    display = label or display_label(target)
     script = (
         "p=$1\n"
         "label=$2\n"
@@ -101,7 +108,7 @@ def build_managed_remote_shell_command(target: str, cwd: str, *, nonce: str) -> 
             shlex.quote(script),
             "sh",
             shlex.quote(cwd),
-            shlex.quote(display_label(target)),
+            shlex.quote(display),
             shlex.quote(nonce),
         ]
     )
@@ -352,8 +359,9 @@ def managed_shell_loop(
     on_barrier: Callable[[int], None],
     backend: ShellBackend | None = None,
     status_provider: Callable[[], str] | None = None,
+    label: str | None = None,
 ) -> int:
-    argv = build_managed_remote_shell_command(target, cwd, nonce=nonce)
+    argv = build_managed_remote_shell_command(target, cwd, nonce=nonce, label=label)
     shell_backend = backend or _pty_shell_backend
     if shell_backend is _pty_shell_backend:
         return _pty_shell_backend(argv, nonce, on_barrier, status_provider=status_provider)

@@ -380,7 +380,7 @@ def _open_wrapped_shell_for_record(record: BindingRecord) -> int:
         barrier_seen = True
         _poke_or_restart_daemon(local_root, "shell")
 
-    label = display_label(record.target)
+    label = display_label(f"{record.target}:{record.name}")
 
     def status_provider() -> str:
         return _shell_title(label, local_root)
@@ -390,6 +390,7 @@ def _open_wrapped_shell_for_record(record: BindingRecord) -> int:
         record.remote_path,
         on_barrier=on_barrier,
         status_provider=status_provider,
+        label=label,
     )
     if not barrier_seen:
         _poke_or_restart_daemon(local_root, "shell")
@@ -397,11 +398,12 @@ def _open_wrapped_shell_for_record(record: BindingRecord) -> int:
 
 
 def _shell_title(label: str, local_root: Path) -> str:
-    """Terminal-title text showing live sync state next to the target label.
+    """Terminal-title text showing live sync state next to the target:name label.
 
-    Fixed-shape so the title does not jump around: `[label] syncing 421/3626`,
-    `[label] syncing` (before totals are known), or `[label] ready`. Kept in the title bar
-    (not the prompt) so it can refresh in real time without disturbing what you type.
+    `[ZJU_2:dq sync 40%]` while syncing (percentage only — short and fixed-ish), `[ZJU_2:dq]`
+    when idle/done. Lives in the title bar so it can refresh in real time without disturbing
+    what you type; the shell prompt shows the static `[ZJU_2:dq]` label so you always know
+    which binding you are in.
     """
     try:
         status = daemon_status(local_root)
@@ -411,11 +413,12 @@ def _shell_title(label: str, local_root: Path) -> str:
         return f"[{label}]"
     if status.phase in {DaemonPhase.INITIAL_SYNCING, DaemonPhase.SYNCING}:
         if status.files_total:
-            return f"[{label}] syncing {status.files_done or 0}/{status.files_total}"
-        return f"[{label}] syncing"
+            pct = min(100, round(100 * (status.files_done or 0) / status.files_total))
+            return f"[{label} sync {pct}%]"
+        return f"[{label} sync…]"
     if status.phase is DaemonPhase.DEGRADED:
-        return f"[{label}] sync error (retrying)"
-    return f"[{label}] ready"
+        return f"[{label} sync !]"
+    return f"[{label}]"
 
 
 def _ensure_daemon_quietly(local_root: Path) -> None:

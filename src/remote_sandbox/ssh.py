@@ -87,6 +87,7 @@ class SshRunner(Protocol):
         cwd: str,
         on_barrier: Callable[[int], None] | None = None,
         status_provider: Callable[[], str] | None = None,
+        label: str | None = None,
     ) -> int: ...
 
 
@@ -377,8 +378,9 @@ class FakeSshRunner:
         cwd: str,
         on_barrier: Callable[[int], None] | None = None,
         status_provider: Callable[[], str] | None = None,
+        label: str | None = None,
     ) -> int:
-        del status_provider
+        del status_provider, label
         self.shell_calls.append((target, cwd))
         self.shell_barrier_callbacks.append(on_barrier)
         return 0
@@ -868,6 +870,7 @@ class SubprocessSshRunner:
         cwd: str,
         on_barrier: Callable[[int], None] | None = None,
         status_provider: Callable[[], str] | None = None,
+        label: str | None = None,
     ) -> int:
         if not os.isatty(0) or not os.isatty(1):
             raise SshError(
@@ -881,6 +884,7 @@ class SubprocessSshRunner:
             nonce=secrets.token_hex(8),
             on_barrier=on_barrier or (lambda _status: None),
             status_provider=status_provider,
+            label=label,
         )
 
     def _run_test(self, target: str, path: str, test_op: str) -> subprocess.CompletedProcess[str]:
