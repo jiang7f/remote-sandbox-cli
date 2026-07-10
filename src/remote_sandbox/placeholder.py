@@ -63,10 +63,13 @@ def decode_placeholder(data: bytes, *, expected_path: str) -> PlaceholderMetadat
     schema_version = payload["schema_version"]
     if type(schema_version) is not int or schema_version != PLACEHOLDER_SCHEMA_VERSION:
         raise ValueError("placeholder metadata is invalid: unsupported schema version")
+    metadata_path = payload["path"]
+    if not isinstance(metadata_path, str):
+        raise ValueError("placeholder metadata is invalid: path must be a string")
 
     try:
         metadata = PlaceholderMetadata(
-            path=payload["path"],
+            path=metadata_path,
             size=payload["size"],
             mtime_ns=payload["mtime_ns"],
             content_hash=payload["content_hash"],

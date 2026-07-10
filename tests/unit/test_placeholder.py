@@ -71,6 +71,21 @@ def test_magic_header_with_malformed_metadata_is_rejected(payload: bytes) -> Non
         decode_placeholder(PLACEHOLDER_MAGIC + payload, expected_path="weights.bin")
 
 
+def test_magic_header_with_non_string_path_is_rejected() -> None:
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "path": ["w", "e"],
+            "size": 1,
+            "mtime_ns": 2,
+            "content_hash": "abc123",
+        }
+    ).encode()
+
+    with pytest.raises(ValueError, match="placeholder metadata"):
+        decode_placeholder(PLACEHOLDER_MAGIC + payload, expected_path="weights.bin")
+
+
 def test_placeholder_metadata_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="size"):
         PlaceholderMetadata("weights.bin", -1, 123, "abc123")

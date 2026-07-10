@@ -93,6 +93,23 @@ def test_missing_entry_keeps_its_normalized_path(tmp_path: Path) -> None:
     assert entry == MissingEntry("missing.txt")
 
 
+def test_stale_descendant_below_parent_that_became_file_is_missing(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    descendant = root / "a" / "b" / "c"
+    descendant.parent.mkdir(parents=True)
+    descendant.write_text("old", encoding="utf-8")
+    descendant.unlink()
+    descendant.parent.rmdir()
+    descendant.parent.parent.rmdir()
+    (root / "a").write_text("replacement", encoding="utf-8")
+
+    entry = fingerprint_local(root, "a/b/c", with_hash=True)
+
+    assert entry == MissingEntry("a/b/c")
+
+
 def test_backslash_absolute_path_cannot_escape_workspace() -> None:
     with pytest.raises(ValueError, match="Invalid relative path"):
         normalize_relative_path("\\etc\\passwd")

@@ -123,7 +123,10 @@ def fingerprint_local(
     with_hash: bool,
 ) -> EntryFingerprint | MissingEntry:
     normalized = normalize_relative_path(relative_path)
-    candidate = workspace_path(root, normalized)
+    try:
+        candidate = workspace_path(root, normalized)
+    except NotADirectoryError:
+        return MissingEntry(normalized)
     try:
         entry_stat = candidate.lstat()
     except (FileNotFoundError, NotADirectoryError):
