@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
+import threading
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, BinaryIO, Protocol, cast
@@ -29,6 +31,7 @@ class RemoteSnapshot:
 
 
 class _StreamProcess(Protocol):
+    stdin: BinaryIO | None
     stdout: BinaryIO | None
     stderr: BinaryIO | None
     returncode: int | None
@@ -133,8 +136,12 @@ class RemoteWorkspaceClient:
         return entries
 
     def acknowledge(self, sequence: int) -> int:
+        if type(sequence) is not int or sequence < 0:
+            raise ValueError("sequence must be a non-negative integer")
         payload = self._call("ack", {"sequence": sequence})
-        acknowledged = int(payload["acknowledged_sequence"])
+        acknowledged = payload.get("acknowledged_sequence")
+        if type(acknowledged) is not int or acknowledged < 0:
+            raise RemoteProtocolError("remote acknowledgement payload is malformed")
         for subscription in tuple(self._subscriptions):
             subscription._acknowledged(acknowledged)
         return acknowledged
@@ -203,17 +210,22 @@ class RemoteWorkspaceClient:
 
 
 class RemoteEventSubscription:
+    _INITIAL_REOPEN_DELAY_S = 0.05
+    _MAX_REOPEN_DELAY_S = 1.0
+
     def __init__(self, client: RemoteWorkspaceClient, after_sequence: int) -> None:
         self._client = client
         self._last_acknowledged = after_sequence
         self._process: _StreamProcess | None = None
         self._closed = False
+        self._close_event = threading.Event()
         self._iterating = False
 
     def __iter__(self) -> Iterator[JournalEvent]:
         if self._iterating:
             raise RuntimeError("remote event subscription already has an iterator")
         self._iterating = True
+        reopen_delay = self._INITIAL_REOPEN_DELAY_S
         try:
             while not self._closed:
                 process = self._client._open_event_stream(self._last_acknowledged)
@@ -222,13 +234,25 @@ class RemoteEventSubscription:
                 if stream is None:
                     self._terminate_process(process)
                     raise RemoteProtocolError("remote event process has no stdout pipe")
+                delivered_event = False
                 for line in stream:
                     if self._closed:
                         return
+                    delivered_event = True
                     yield parse_event_line(line)
-                self._wait_process(process)
+                returncode, stderr = self._wait_process(process)
                 if self._process is process:
                     self._process = None
+                if returncode != 0:
+                    raise RemoteProtocolError(_stream_failure_detail(stderr, returncode))
+                if self._closed:
+                    return
+                if delivered_event:
+                    reopen_delay = self._INITIAL_REOPEN_DELAY_S
+                if self._wait_before_reopen(reopen_delay):
+                    return
+                if not delivered_event:
+                    reopen_delay = min(reopen_delay * 2, self._MAX_REOPEN_DELAY_S)
         finally:
             active_process = self._process
             if active_process is not None:
@@ -240,6 +264,7 @@ class RemoteEventSubscription:
         if self._closed:
             return
         self._closed = True
+        self._close_event.set()
         process = self._process
         if process is not None:
             self._terminate_process(process)
@@ -249,27 +274,33 @@ class RemoteEventSubscription:
     def _acknowledged(self, sequence: int) -> None:
         self._last_acknowledged = max(self._last_acknowledged, sequence)
 
+    def _wait_before_reopen(self, delay: float) -> bool:
+        return self._close_event.wait(delay)
+
     @staticmethod
-    def _wait_process(process: _StreamProcess) -> None:
-        process.wait()
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.stderr is not None:
-            process.stderr.close()
+    def _wait_process(process: _StreamProcess) -> tuple[int, bytes]:
+        try:
+            returncode = process.wait()
+            stderr = b"" if process.stderr is None else process.stderr.read()
+            return returncode, stderr
+        finally:
+            _close_process_pipes(process)
 
     @staticmethod
     def _terminate_process(process: _StreamProcess) -> None:
-        if process.returncode is None:
-            process.terminate()
         try:
-            process.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=1.0)
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.stderr is not None:
-            process.stderr.close()
+            if process.stdin is not None:
+                with contextlib.suppress(Exception):
+                    process.stdin.close()
+            if process.returncode is None:
+                process.terminate()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1.0)
+        finally:
+            _close_process_pipes(process)
 
 
 def _parse_fingerprint(raw: object) -> EntryFingerprint | MissingEntry:
@@ -279,9 +310,9 @@ def _parse_fingerprint(raw: object) -> EntryFingerprint | MissingEntry:
     kind = raw.get("kind")
     if not isinstance(path, str) or not isinstance(kind, str):
         raise RemoteProtocolError("remote fingerprint path and kind must be strings")
-    if kind == "missing":
-        return MissingEntry(path)
     try:
+        if kind == "missing":
+            return MissingEntry(path)
         return EntryFingerprint(
             path=path,
             kind=EntryKind(kind),
@@ -294,6 +325,27 @@ def _parse_fingerprint(raw: object) -> EntryFingerprint | MissingEntry:
         )
     except ValueError as exc:
         raise RemoteProtocolError(f"invalid remote fingerprint: {exc}") from exc
+
+
+def _close_process_pipes(process: _StreamProcess) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None and not stream.closed:
+            with contextlib.suppress(Exception):
+                stream.close()
+
+
+def _stream_failure_detail(stderr: bytes, returncode: int) -> str:
+    stripped = stderr.strip()
+    if stripped:
+        try:
+            response = decode_response(stripped)
+        except (json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError, ValueError):
+            detail = stripped.decode("utf-8", errors="replace")
+        else:
+            detail = response.error or stripped.decode("utf-8", errors="replace")
+        if detail:
+            return detail
+    return f"remote event process failed with exit code {returncode}"
 
 
 def _optional_integer(value: object, field: str) -> int | None:

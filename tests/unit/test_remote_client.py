@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import subprocess
+import threading
 from typing import Any
 
 import pytest
@@ -46,17 +47,27 @@ class RecordingRunner:
 
 
 class StreamingProcess:
-    def __init__(self, stdout: bytes) -> None:
+    def __init__(
+        self,
+        stdout: bytes,
+        *,
+        stderr: bytes = b"",
+        exit_code: int = 0,
+    ) -> None:
+        self.stdin = io.BytesIO()
         self.stdout = io.BytesIO(stdout)
-        self.stderr = io.BytesIO()
+        self.stderr = io.BytesIO(stderr)
         self.returncode: int | None = None
+        self.exit_code = exit_code
         self.terminated = False
         self.killed = False
+        self.wait_calls: list[float | None] = []
 
     def wait(self, timeout: float | None = None) -> int:
-        del timeout
-        self.returncode = 0
-        return 0
+        self.wait_calls.append(timeout)
+        if self.returncode is None:
+            self.returncode = self.exit_code
+        return self.returncode
 
     def terminate(self) -> None:
         self.terminated = True
@@ -346,6 +357,108 @@ def test_subscription_restarts_after_last_acknowledged_sequence() -> None:
     assert second_process.terminated
 
 
+def test_subscription_raises_nonzero_stream_error_without_reopening() -> None:
+    process = StreamingProcess(
+        b"",
+        stderr=b'{"ok":false,"payload":{},"error":"watcher stopped"}\n',
+        exit_code=2,
+    )
+    runner = StreamingRunner({}, [process])
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+    )
+
+    with pytest.raises(RemoteProtocolError, match="watcher stopped"):
+        next(iter(client.subscribe(after_sequence=0)))
+
+    assert len(runner.stream_calls) == 1
+    assert process.stdin.closed
+    assert process.stdout.closed
+    assert process.stderr.closed
+    assert process.wait_calls == [None]
+
+
+def test_subscription_backs_off_between_repeated_clean_eof_reopens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    streams = [
+        StreamingProcess(b""),
+        StreamingProcess(b""),
+        StreamingProcess(
+            b'{"sequence":8,"kind":"modify","path":"ready.py",'
+            b'"destination_path":null}\n'
+        ),
+    ]
+    runner = StreamingRunner({}, streams)
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+    )
+    subscription = client.subscribe(after_sequence=0)
+    delays: list[float] = []
+    monkeypatch.setattr(
+        subscription,
+        "_wait_before_reopen",
+        lambda delay: delays.append(delay) or False,
+    )
+
+    assert next(iter(subscription)).sequence == 8
+
+    assert len(runner.stream_calls) == 3
+    assert delays == sorted(delays)
+    assert len(delays) == 2
+    assert delays[0] > 0
+    assert delays[1] > delays[0]
+    subscription.close()
+
+
+def test_close_interrupts_reopen_backoff_without_spawning_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = StreamingProcess(b"")
+    runner = StreamingRunner({}, [process])
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+    )
+    subscription = client.subscribe(after_sequence=0)
+    entered_backoff = threading.Event()
+    original_wait = subscription._wait_before_reopen
+
+    def observed_wait(delay: float) -> bool:
+        del delay
+        entered_backoff.set()
+        return original_wait(10.0)
+
+    monkeypatch.setattr(subscription, "_wait_before_reopen", observed_wait)
+    iterator = iter(subscription)
+    stopped = threading.Event()
+
+    def consume() -> None:
+        with pytest.raises(StopIteration):
+            next(iterator)
+        stopped.set()
+
+    thread = threading.Thread(target=consume)
+    thread.start()
+    assert entered_backoff.wait(timeout=1.0)
+
+    subscription.close()
+    subscription.close()
+    thread.join(timeout=1.0)
+
+    assert stopped.is_set()
+    assert not thread.is_alive()
+    assert len(runner.stream_calls) == 1
+
+
 def test_malformed_foreground_response_raises_protocol_error() -> None:
     runner = RawRunner(subprocess.CompletedProcess(["ssh"], 0, b"not-json\n", b""))
     client = RemoteWorkspaceClient(
@@ -364,3 +477,70 @@ def test_structured_stream_error_raises_protocol_error() -> None:
 
     with pytest.raises(RemoteProtocolError, match="workspace is not registered"):
         parse_event_line(line)
+
+
+@pytest.mark.parametrize("sequence", [True, "3", -1])
+def test_acknowledge_rejects_non_integer_or_negative_sequence(sequence: object) -> None:
+    runner = RecordingRunner({"ack": {"acknowledged_sequence": 0}})
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+    )
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        client.acknowledge(sequence)  # type: ignore[arg-type]
+
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"acknowledged_sequence": "3"},
+        {"acknowledged_sequence": True},
+        {"acknowledged_sequence": -1},
+    ],
+)
+def test_acknowledge_wraps_malformed_remote_sequence(payload: dict[str, object]) -> None:
+    runner = RecordingRunner({"ack": payload})
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+    )
+
+    with pytest.raises(RemoteProtocolError, match="acknowledgement payload is malformed"):
+        client.acknowledge(3)
+
+
+def test_invalid_missing_fingerprint_path_is_a_protocol_error() -> None:
+    runner = RecordingRunner(
+        {
+            "hash-paths": {
+                "entries": [
+                    {
+                        "path": "../escape",
+                        "kind": "missing",
+                        "size": None,
+                        "mtime_ns": None,
+                        "mode": None,
+                        "link_target": None,
+                        "content_hash": None,
+                    }
+                ]
+            }
+        }
+    )
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+    )
+
+    with pytest.raises(RemoteProtocolError, match="invalid remote fingerprint"):
+        client.hash_paths(["requested.txt"])

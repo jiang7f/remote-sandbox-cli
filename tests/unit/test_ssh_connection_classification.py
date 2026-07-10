@@ -64,6 +64,46 @@ class _StreamingProcess:
         self.stderr = io.BytesIO()
 
 
+class _FailingInput(io.BytesIO):
+    def write(self, data: bytes) -> int:
+        del data
+        raise OSError("stdin write failed")
+
+
+class _CleanupProcess:
+    def __init__(
+        self,
+        *,
+        stdin: io.BytesIO | None,
+        stdout: io.BytesIO | None,
+        stderr: io.BytesIO | None,
+        wait_times_out: bool,
+    ) -> None:
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode: int | None = None
+        self.wait_times_out = wait_times_out
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.wait_calls: list[float | None] = []
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        if self.wait_times_out and self.kill_calls == 0:
+            raise subprocess.TimeoutExpired(["ssh"], timeout)
+        if self.returncode is None:
+            self.returncode = -15
+        return self.returncode
+
+
 def test_streaming_python_call_writes_request_and_leaves_stdout_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -92,6 +132,57 @@ def test_streaming_python_call_writes_request_and_leaves_stdout_open(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
     }
+
+
+def test_streaming_python_call_cleans_up_partial_pipes_and_reaps_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _CleanupProcess(
+        stdin=io.BytesIO(),
+        stdout=None,
+        stderr=io.BytesIO(),
+        wait_times_out=True,
+    )
+    monkeypatch.setattr(ssh_module.subprocess, "Popen", lambda *args, **kwargs: process)
+
+    with pytest.raises(ssh_module.SshError, match="did not create pipes"):
+        SubprocessSshRunner().stream_python_file(
+            "example-host",
+            "~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+            b"{}\n",
+        )
+
+    assert process.stdin is not None and process.stdin.closed
+    assert process.stderr is not None and process.stderr.closed
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process.wait_calls == [1.0, 1.0]
+
+
+def test_streaming_python_call_cleans_up_and_reaps_after_stdin_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _CleanupProcess(
+        stdin=_FailingInput(),
+        stdout=io.BytesIO(),
+        stderr=io.BytesIO(),
+        wait_times_out=False,
+    )
+    monkeypatch.setattr(ssh_module.subprocess, "Popen", lambda *args, **kwargs: process)
+
+    with pytest.raises(OSError, match="stdin write failed"):
+        SubprocessSshRunner().stream_python_file(
+            "example-host",
+            "~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+            b"{}\n",
+        )
+
+    assert process.stdin is not None and process.stdin.closed
+    assert process.stdout is not None and process.stdout.closed
+    assert process.stderr is not None and process.stderr.closed
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 0
+    assert process.wait_calls == [1.0]
 
 
 def test_control_path_uses_isolated_codex_runtime_namespace(

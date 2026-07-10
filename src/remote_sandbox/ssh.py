@@ -636,13 +636,14 @@ class SubprocessSshRunner:
             stderr=subprocess.PIPE,
         )
         if process.stdin is None or process.stdout is None or process.stderr is None:
-            process.terminate()
+            _cleanup_stream_process(process)
             raise SshError("remote streaming process did not create pipes")
         try:
             process.stdin.write(input_data)
+            process.stdin.flush()
             process.stdin.close()
         except BaseException:
-            process.terminate()
+            _cleanup_stream_process(process)
             raise
         return process
 
@@ -851,3 +852,26 @@ def _classify_ssh_failure(stderr: str) -> Literal["auth", "network"]:
     if any(marker in lowered for marker in _AUTH_FAILURE_MARKERS):
         return "auth"
     return "network"
+
+
+def _cleanup_stream_process(process: subprocess.Popen[bytes]) -> None:
+    if process.stdin is not None:
+        with contextlib.suppress(Exception):
+            process.stdin.close()
+    if process.returncode is None:
+        with contextlib.suppress(Exception):
+            process.terminate()
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(Exception):
+            process.kill()
+        with contextlib.suppress(Exception):
+            process.wait(timeout=1.0)
+    except Exception:
+        pass
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                with contextlib.suppress(Exception):
+                    stream.close()
