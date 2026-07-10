@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -139,6 +140,73 @@ def _agent_call(
         env=env,
         timeout=10,
     )
+
+
+def test_zipapp_hash_paths_returns_only_requested_strong_fingerprints(tmp_path: Path) -> None:
+    archive = build_agent_zipapp(tmp_path / "agent.pyz")
+    root = tmp_path / "workspace"
+    home = tmp_path / "home"
+    control = tmp_path / "control"
+    runtime = tmp_path / "runtime"
+    root.mkdir()
+    home.mkdir()
+    requested = root / "requested.txt"
+    requested.write_bytes(b"requested content")
+    (root / "unrequested.txt").write_bytes(b"must not be hashed")
+    (root / "link").symlink_to("requested.txt")
+    (root / "directory").mkdir()
+    os.mkfifo(root / "pipe")
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+        "CODEX_REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
+    }
+    workspace_id = "00000000-0000-4000-8000-000000000108"
+    registered = _agent_call(
+        archive,
+        AgentRequest("register", {"workspace_id": workspace_id, "root": str(root)}),
+        env,
+    )
+    assert registered.returncode == 0
+
+    result = _agent_call(
+        archive,
+        AgentRequest(
+            "hash-paths",
+            {
+                "workspace_id": workspace_id,
+                "paths": ["requested.txt", "link", "directory", "pipe", "missing.txt"],
+            },
+        ),
+        env,
+    )
+
+    assert result.returncode == 0
+    entries = {
+        str(entry["path"]): entry for entry in decode_response(result.stdout).payload["entries"]
+    }
+    assert set(entries) == {"requested.txt", "link", "directory", "pipe", "missing.txt"}
+    assert entries["requested.txt"]["kind"] == "file"
+    assert entries["requested.txt"]["content_hash"] == hashlib.sha256(
+        b"requested content"
+    ).hexdigest()
+    assert entries["link"]["kind"] == "symlink"
+    assert entries["link"]["link_target"] == "requested.txt"
+    assert entries["link"]["content_hash"] == hashlib.sha256(b"requested.txt").hexdigest()
+    assert entries["directory"]["kind"] == "dir"
+    assert entries["directory"]["content_hash"] is None
+    assert entries["pipe"]["kind"] == "special"
+    assert entries["pipe"]["content_hash"] is None
+    assert entries["missing.txt"] == {
+        "path": "missing.txt",
+        "kind": "missing",
+        "size": None,
+        "mtime_ns": None,
+        "mode": None,
+        "link_target": None,
+        "content_hash": None,
+    }
 
 
 def test_zipapp_manages_detached_watcher_journal_and_safe_forget(tmp_path: Path) -> None:

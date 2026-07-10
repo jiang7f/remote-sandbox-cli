@@ -302,6 +302,121 @@ def _handle_snapshot(payload: dict[str, Any]) -> dict[str, object]:
             }
 
 
+def _handle_hash_paths(payload: dict[str, Any]) -> dict[str, object]:
+    workspace_id = validate_workspace_id(_expect_string(payload, "workspace_id"))
+    paths = _expect_relative_paths(payload, "paths")
+    home = _remote_home()
+    with _exclusive_lock(_workspace_lock_path(workspace_id)):
+        entry = _lookup_workspace(home, workspace_id)
+        with RemoteStore(entry.state_path) as store:
+            workspace = _require_workspace(store, entry)
+        root_descriptor = os.open(workspace.root, _DIRECTORY_OPEN_FLAGS)
+        try:
+            entries = [_hash_requested_path(root_descriptor, path) for path in paths]
+        finally:
+            os.close(root_descriptor)
+    return {"entries": entries}
+
+
+def _hash_requested_path(root_descriptor: int, path: str) -> dict[str, object]:
+    parts = path.split("/")
+    parent_descriptor = os.dup(root_descriptor)
+    try:
+        for component in parts[:-1]:
+            try:
+                child_descriptor = os.open(
+                    component,
+                    _DIRECTORY_OPEN_FLAGS,
+                    dir_fd=parent_descriptor,
+                )
+            except (FileNotFoundError, NotADirectoryError):
+                return _missing_fingerprint(path)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    return _missing_fingerprint(path)
+                raise
+            os.close(parent_descriptor)
+            parent_descriptor = child_descriptor
+
+        leaf = parts[-1]
+        try:
+            metadata = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
+        except (FileNotFoundError, NotADirectoryError):
+            return _missing_fingerprint(path)
+        mode = metadata.st_mode
+        result: dict[str, object] = {
+            "path": path,
+            "size": metadata.st_size if stat.S_ISREG(mode) or stat.S_ISLNK(mode) else None,
+            "mtime_ns": metadata.st_mtime_ns,
+            "mode": mode,
+            "link_target": None,
+            "content_hash": None,
+        }
+        if stat.S_ISLNK(mode):
+            try:
+                target = os.readlink(leaf, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                return _missing_fingerprint(path)
+            result["kind"] = "symlink"
+            result["link_target"] = target
+            result["content_hash"] = hashlib.sha256(os.fsencode(target)).hexdigest()
+            return result
+        if stat.S_ISDIR(mode):
+            result["kind"] = "dir"
+            return result
+        if not stat.S_ISREG(mode):
+            result["kind"] = "special"
+            return result
+
+        try:
+            descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent_descriptor,
+            )
+        except (FileNotFoundError, NotADirectoryError):
+            return _missing_fingerprint(path)
+        try:
+            opened_metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(opened_metadata.st_mode):
+                raise RuntimeError("requested file changed type while hashing")
+            result.update(
+                {
+                    "kind": "file",
+                    "size": opened_metadata.st_size,
+                    "mtime_ns": opened_metadata.st_mtime_ns,
+                    "mode": opened_metadata.st_mode,
+                    "content_hash": _sha256_descriptor(descriptor),
+                }
+            )
+            return result
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _sha256_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+
+
+def _missing_fingerprint(path: str) -> dict[str, object]:
+    return {
+        "path": path,
+        "kind": "missing",
+        "size": None,
+        "mtime_ns": None,
+        "mode": None,
+        "link_target": None,
+        "content_hash": None,
+    }
+
+
 def _handle_forget(payload: dict[str, Any]) -> dict[str, object]:
     workspace_id = validate_workspace_id(_expect_string(payload, "workspace_id"))
     home = _remote_home()
@@ -753,6 +868,30 @@ def _expect_boolean(payload: dict[str, Any], key: str, *, default: bool) -> bool
     return value
 
 
+def _expect_relative_paths(payload: dict[str, Any], key: str) -> list[str]:
+    value = payload.get(key)
+    if not isinstance(value, list):
+        raise ValueError(f"{key} must be a list")
+    paths: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"{key} entries must be strings")
+        parts = item.split("/")
+        if (
+            not item
+            or item.startswith("/")
+            or "\\" in item
+            or any(part in {"", ".", ".."} for part in parts)
+            or any(part in {".git", ".remote-sandbox", ".codex-remote-sandbox"} for part in parts)
+            or any(ord(character) < 32 or ord(character) == 127 for character in item)
+        ):
+            raise ValueError(f"invalid relative path: {item}")
+        paths.append(item)
+    if len(paths) != len(set(paths)):
+        raise ValueError(f"{key} entries must be unique")
+    return paths
+
+
 _HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, object]]] = {
     "register": _handle_register,
     "start": _handle_start,
@@ -760,6 +899,7 @@ _HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, object]]] = {
     "status": _handle_status,
     "ack": _handle_ack,
     "snapshot": _handle_snapshot,
+    "hash-paths": _handle_hash_paths,
     "forget": _handle_forget,
 }
 

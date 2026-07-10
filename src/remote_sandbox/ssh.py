@@ -10,7 +10,7 @@ import shlex
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Literal, Protocol
 
 from remote_sandbox.marker import (
     METADATA_DIR,
@@ -19,6 +19,7 @@ from remote_sandbox.marker import (
     marker_from_toml,
     marker_to_toml,
 )
+from remote_sandbox.namespace import ssh_control_dir
 
 
 class SshError(RuntimeError):
@@ -52,7 +53,27 @@ class SshRunner(Protocol):
 
     def run_python_file(self, target: str, path: str, args: tuple[str, ...]) -> str: ...
 
+    def run_python_file_bytes(
+        self,
+        target: str,
+        path: str,
+        input_data: bytes,
+        args: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess[bytes]: ...
+
+    def stream_python_file(
+        self,
+        target: str,
+        path: str,
+        input_data: bytes,
+        args: tuple[str, ...] = (),
+    ) -> subprocess.Popen[bytes]: ...
+
     def run_command(self, target: str, cwd: str, argv: tuple[str, ...]) -> CommandResult: ...
+
+    def clear_master(self, target: str) -> None: ...
+
+    def probe_connection(self, target: str) -> Literal["ok", "auth", "network"]: ...
 
     def interactive_shell(
         self,
@@ -101,7 +122,7 @@ def remote_marker_path(remote_root: str) -> str:
 
 def _control_dir() -> str:
     """Directory holding SSH ControlMaster sockets (kept short for the sun_path limit)."""
-    base = os.environ.get("REMOTE_SANDBOX_CONTROL_DIR") or f"/tmp/remote-sandbox-{os.getuid()}/cm"
+    base = str(ssh_control_dir())
     os.makedirs(base, exist_ok=True)
     with contextlib.suppress(OSError):
         os.chmod(base, 0o700)
@@ -162,6 +183,7 @@ class FakeSshRunner:
     command_result: CommandResult = field(default_factory=lambda: CommandResult(0, "", ""))
     fail_on: set[tuple[str, str]] = field(default_factory=set)
     fail_operations: set[str] = field(default_factory=set)
+    probe_result: Literal["ok", "auth", "network"] = "ok"
 
     def exists(self, target: str, path: str) -> bool:
         normalized = _normalize_remote_path(path)
@@ -282,6 +304,13 @@ class FakeSshRunner:
         self.command_calls.append((target, _normalize_remote_path(cwd), argv))
         return self.command_result
 
+    def clear_master(self, target: str) -> None:
+        del target
+
+    def probe_connection(self, target: str) -> Literal["ok", "auth", "network"]:
+        del target
+        return self.probe_result
+
     def interactive_shell(
         self,
         target: str,
@@ -401,6 +430,40 @@ class SubprocessSshRunner:
                 "If this host needs a password, run the command from an interactive "
                 "terminal; otherwise configure an SSH key."
             )
+
+    def clear_master(self, target: str) -> None:
+        """Best-effort drop of a dead/stale ControlMaster so the next call re-dials."""
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["ssh", *ssh_control_opts(), "-O", "exit", target],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_s,
+            )
+
+    def probe_connection(self, target: str) -> Literal["ok", "auth", "network"]:
+        """Classify why the daemon can't reach the host, without ever prompting.
+
+        Returns ``"ok"`` (reachable — a key host also re-establishes the master here),
+        ``"auth"`` (reachable but needs a password/key the background process can't
+        supply — the user must re-authenticate), or ``"network"`` (unreachable /
+        transient — it will self-heal). Never raises.
+        """
+        try:
+            result = subprocess.run(
+                ["ssh", *ssh_control_opts(), "-o", "BatchMode=yes", "-o",
+                 "ConnectTimeout=8", target, "true"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_s,
+            )
+        except Exception:
+            return "network"
+        if result.returncode == 0:
+            return "ok"
+        return _classify_ssh_failure(result.stderr)
 
     def exists(self, target: str, path: str) -> bool:
         result = self._run_test(target, path, "-e")
@@ -543,6 +606,67 @@ class SubprocessSshRunner:
         )
         self._check(result, "remote python failed")
         return result.stdout
+
+    def run_python_file_bytes(
+        self,
+        target: str,
+        path: str,
+        input_data: bytes,
+        args: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            self._python_file_command(target, path, args),
+            check=False,
+            input=input_data,
+            capture_output=True,
+            timeout=self.timeout_s,
+        )
+
+    def stream_python_file(
+        self,
+        target: str,
+        path: str,
+        input_data: bytes,
+        args: tuple[str, ...] = (),
+    ) -> subprocess.Popen[bytes]:
+        process = subprocess.Popen(
+            self._python_file_command(target, path, args),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if process.stdin is None or process.stdout is None or process.stderr is None:
+            process.terminate()
+            raise SshError("remote streaming process did not create pipes")
+        try:
+            process.stdin.write(input_data)
+            process.stdin.close()
+        except BaseException:
+            process.terminate()
+            raise
+        return process
+
+    def _python_file_command(
+        self,
+        target: str,
+        path: str,
+        args: tuple[str, ...],
+    ) -> list[str]:
+        validate_target(target)
+        validate_remote_path(path)
+        if any(_has_control_char(arg) for arg in args):
+            raise ValueError("Invalid remote argument")
+        script = (
+            self._remote_path_function()
+            + 'p=$(remote_sandbox_path "$1") || exit 2\n'
+            + "shift\n"
+            + 'exec python3 "$p" "$@"\n'
+        )
+        remote_command = " ".join(
+            ["sh", "-c", shlex.quote(script), "sh", shlex.quote(path)]
+            + [shlex.quote(arg) for arg in args]
+        )
+        return [*self._ssh_batch_args(), target, remote_command]
 
     def run_command(self, target: str, cwd: str, argv: tuple[str, ...]) -> CommandResult:
         if not argv:
@@ -711,3 +835,19 @@ def _fake_manifest_ignored(path: str) -> bool:
 
 def _has_control_char(value: str) -> bool:
     return any(ord(char) < 32 or ord(char) == 127 for char in value)
+
+
+_AUTH_FAILURE_MARKERS = (
+    "permission denied",
+    "authentication failed",
+    "too many authentication failures",
+    "no more authentication methods",
+)
+
+
+def _classify_ssh_failure(stderr: str) -> Literal["auth", "network"]:
+    """Map a failed BatchMode ssh's stderr to "auth" (needs the user) or "network"."""
+    lowered = stderr.lower()
+    if any(marker in lowered for marker in _AUTH_FAILURE_MARKERS):
+        return "auth"
+    return "network"
