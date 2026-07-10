@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import tempfile
@@ -10,10 +11,34 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from remote_sandbox.settings import remote_sandbox_home
+
+# Legacy in-tree metadata directory. New workspaces keep local metadata OUT of the working
+# tree (see local_meta_dir); this constant is still the *remote* metadata dir name and the
+# source location that migrate_local_metadata() moves away from.
 METADATA_DIR = ".remote-sandbox"
 WORKSPACE_FILE = "workspace.toml"
+STATE_FILE = "state.sqlite3"
 SCHEMA_VERSION = 1
 VALID_SYNC_STATES = {"none"}
+
+
+def local_meta_dir(root: Path) -> Path:
+    """Per-workspace local metadata dir, OUTSIDE the working tree.
+
+    Keyed by a hash of the resolved local path (the same scheme the daemon already uses for
+    its control socket), so it is locatable without first reading the marker — avoiding a
+    chicken-and-egg with the workspace id, which lives *inside* the marker. Keeping the
+    marker, sync state, lock, and daemon files here means the working directory the AI reads
+    and writes stays clean: no `.remote-sandbox` in it.
+    """
+    resolved = root.expanduser().resolve()
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+    return remote_sandbox_home() / "workspaces" / f"L-{digest}"
+
+
+def _legacy_meta_dir(root: Path) -> Path:
+    return root.expanduser() / METADATA_DIR
 
 
 @dataclass(frozen=True)
@@ -66,18 +91,31 @@ class WorkspaceMarker:
 
 
 def marker_path(root: Path) -> Path:
-    return root / METADATA_DIR / WORKSPACE_FILE
+    """Current location of the local marker (out-of-tree home workspace dir)."""
+    return local_meta_dir(root) / WORKSPACE_FILE
+
+
+def legacy_marker_path(root: Path) -> Path:
+    return _legacy_meta_dir(root) / WORKSPACE_FILE
 
 
 def read_local_marker(root: Path) -> WorkspaceMarker | None:
+    """Read the marker, preferring the out-of-tree home dir, falling back to legacy in-tree.
+
+    The legacy fallback keeps pre-relocation bindings working until they are migrated (which
+    happens on the next connect/reconnect/start via migrate_local_metadata).
+    """
     path = marker_path(root)
-    if not path.exists():
-        return None
-    return marker_from_toml(path.read_text(encoding="utf-8"))
+    if path.exists():
+        return marker_from_toml(path.read_text(encoding="utf-8"))
+    legacy = legacy_marker_path(root)
+    if legacy.exists():
+        return marker_from_toml(legacy.read_text(encoding="utf-8"))
+    return None
 
 
 def write_local_marker(root: Path, marker: WorkspaceMarker) -> None:
-    metadata_dir = root / METADATA_DIR
+    metadata_dir = local_meta_dir(root)
     metadata_dir.mkdir(parents=True, exist_ok=True)
     content = marker_to_toml(marker)
     fd, tmp_name = tempfile.mkstemp(
@@ -98,23 +136,48 @@ def write_local_marker(root: Path, marker: WorkspaceMarker) -> None:
             tmp_path.unlink()
 
 
-def remove_local_metadata(root: Path) -> bool:
-    """Delete the local ``.remote-sandbox`` directory (marker + sync state).
+def migrate_local_metadata(root: Path) -> bool:
+    """Move a legacy in-tree ``.remote-sandbox`` into the out-of-tree home workspace dir.
 
-    Returns True if something was removed. Used by ``forget`` so a forgotten
-    connection leaves no local binding metadata behind.
+    Idempotent: returns True only when it actually migrated something. Copies the marker and
+    sync state (the durable files) into the home dir, then removes the whole in-tree dir so
+    the working directory is left clean. A running daemon's transient files (pid/lock/socket)
+    are intentionally NOT carried over — the caller restarts the daemon after migrating.
     """
-    metadata_dir = root.expanduser() / METADATA_DIR
-    if metadata_dir.is_symlink():
-        metadata_dir.unlink()
-        return True
-    if metadata_dir.is_dir():
-        shutil.rmtree(metadata_dir)
-        return True
-    if metadata_dir.exists():
-        metadata_dir.unlink()
-        return True
-    return False
+    legacy_dir = _legacy_meta_dir(root)
+    if not legacy_dir.is_dir() or legacy_dir.is_symlink():
+        return False
+    legacy_marker = legacy_dir / WORKSPACE_FILE
+    if not legacy_marker.exists():
+        return False
+    dest_dir = local_meta_dir(root)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for name in (WORKSPACE_FILE, STATE_FILE):
+        src = legacy_dir / name
+        if src.exists() and not (dest_dir / name).exists():
+            shutil.copy2(src, dest_dir / name)
+    shutil.rmtree(legacy_dir, ignore_errors=True)
+    return True
+
+
+def remove_local_metadata(root: Path) -> bool:
+    """Delete the local metadata (out-of-tree home dir and any legacy in-tree dir).
+
+    Returns True if something was removed. Used by ``forget`` so a forgotten connection
+    leaves no local binding metadata behind, in either location.
+    """
+    removed = False
+    for metadata_dir in (local_meta_dir(root), _legacy_meta_dir(root)):
+        if metadata_dir.is_symlink():
+            metadata_dir.unlink()
+            removed = True
+        elif metadata_dir.is_dir():
+            shutil.rmtree(metadata_dir)
+            removed = True
+        elif metadata_dir.exists():
+            metadata_dir.unlink()
+            removed = True
+    return removed
 
 
 def marker_to_toml(marker: WorkspaceMarker) -> str:

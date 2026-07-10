@@ -9,7 +9,13 @@ from pathlib import Path
 
 from remote_sandbox.lock import WorkspaceLockError, workspace_lock
 from remote_sandbox.manifest import FileEntry, normalize_relative_path
-from remote_sandbox.marker import METADATA_DIR, WorkspaceMarker, read_local_marker
+from remote_sandbox.marker import (
+    METADATA_DIR,
+    STATE_FILE,
+    WorkspaceMarker,
+    local_meta_dir,
+    read_local_marker,
+)
 from remote_sandbox.scan import read_placeholder_entry
 from remote_sandbox.ssh import SshRunner
 from remote_sandbox.state import StateStore
@@ -39,7 +45,7 @@ def fetch_placeholders(
     try:
         with (
             workspace_lock(local_root),
-            StateStore.open(local_root / METADATA_DIR / "state.sqlite3") as state,
+            StateStore.open(local_meta_dir(local_root) / STATE_FILE) as state,
         ):
             for entry in placeholders:
                 _ensure_placeholder_still_matches(local_root, entry)

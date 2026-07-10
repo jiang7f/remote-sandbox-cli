@@ -11,6 +11,7 @@ from remote_sandbox.marker import (
     METADATA_DIR,
     WorkspaceMarker,
     marker_to_toml,
+    migrate_local_metadata,
     read_local_marker,
     write_local_marker,
 )
@@ -72,6 +73,9 @@ def bind_workspace(
             local_path=str(local_root),
         )
     local_root.mkdir(parents=True, exist_ok=True)
+    # Relocate any legacy in-tree metadata into the out-of-tree home dir before reading the
+    # marker, so an existing binding is recognized (and its sync base kept) after upgrade.
+    migrate_local_metadata(local_root)
     if (local_root / METADATA_DIR).is_symlink():
         raise BindError("Local metadata path is a symlink")
     remote_exists = runner.exists(safe_target, safe_remote)

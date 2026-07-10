@@ -7,7 +7,7 @@ from pathlib import Path
 
 from remote_sandbox.agent import bootstrap_agent, remote_agent_path
 from remote_sandbox.lock import workspace_lock
-from remote_sandbox.marker import METADATA_DIR
+from remote_sandbox.marker import STATE_FILE, local_meta_dir
 from remote_sandbox.policy import POLICY_FILE_NAME, StaticPolicyEngine
 from remote_sandbox.reconcile import build_plan
 from remote_sandbox.scan import scan_local_manifest, scan_remote_manifest
@@ -82,7 +82,7 @@ class SyncSession:
         policy = self.policy
         if not self.runner.exists(self.target, remote_agent_path(self.remote)):
             bootstrap_agent(self.runner, self.target, self.remote)
-        state_path = self.local_root / METADATA_DIR / "state.sqlite3"
+        state_path = local_meta_dir(self.local_root) / STATE_FILE
         with StateStore.open(state_path) as store:
             # Load the local hash cache up front so the local scan can skip re-hashing files
             # whose (size, mtime) are unchanged — the main reason a no-op sync was slow.

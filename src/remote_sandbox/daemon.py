@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import quote, unquote
 
-from remote_sandbox.marker import METADATA_DIR, read_local_marker
+from remote_sandbox.marker import local_meta_dir, migrate_local_metadata, read_local_marker
 from remote_sandbox.ssh import SshRunner, SubprocessSshRunner
 from remote_sandbox.syncsession import SyncProgress, SyncSession
 from remote_sandbox.watch import LocalChangeDetector, create_local_watcher
@@ -81,7 +81,7 @@ class StopResult(Enum):
 
 
 def meta_dir(local_root: Path) -> Path:
-    return local_root / METADATA_DIR
+    return local_meta_dir(local_root)
 
 
 def pidfile_path(local_root: Path) -> Path:
@@ -480,6 +480,9 @@ def ensure_daemon(local_root: Path, *, runner: SshRunner | None = None) -> Daemo
 def start_daemon(local_root: Path, *, runner: SshRunner | None = None) -> DaemonStatus:
     """Double-fork a detached daemon process; wait until it is ready."""
     local_root = local_root.expanduser().resolve()
+    # Relocate any legacy in-tree .remote-sandbox into the out-of-tree home dir before the
+    # daemon opens its state/lock there, so an upgraded binding keeps its sync base.
+    migrate_local_metadata(local_root)
     if read_local_marker(local_root) is None:
         raise DaemonError(f"not a bound workspace: {local_root}")
     existing = daemon_status(local_root)

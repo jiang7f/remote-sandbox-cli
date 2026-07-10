@@ -24,7 +24,7 @@ from remote_sandbox.daemon import (
 )
 from remote_sandbox.fetch import FetchError, fetch_placeholders
 from remote_sandbox.lock import WorkspaceLockError
-from remote_sandbox.marker import METADATA_DIR, read_local_marker, remove_local_metadata
+from remote_sandbox.marker import read_local_marker, remove_local_metadata
 from remote_sandbox.peek import PeekError, peek_placeholder
 from remote_sandbox.policy import DEFAULT_RSBIGNORE, POLICY_FILE_NAME
 from remote_sandbox.registry import (
@@ -332,7 +332,7 @@ def forget_connection(name: str) -> int:
             return 2
     delete_binding_record(record.name)
     if remove_local_metadata(local_root):
-        print(f"Forgot connection {record.name}; removed {local_root / METADATA_DIR}")
+        print(f"Forgot connection {record.name}; removed its local metadata")
     else:
         print(f"Forgot connection {record.name}")
     return 0

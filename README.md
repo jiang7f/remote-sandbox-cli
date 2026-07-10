@@ -61,6 +61,7 @@ rsb connect --name train
 ```bash
 rsb list
 rsb status
+rsb init [-l/--local <path>] [-f/--force]
 rsb set placeholder-limit 10MB
 rsb enter <target> [-r/--remote <remote-path>] [-l/--local <local-path>]
 rsb connect [-r/--remote <remote-path>] [-l/--local <local-path>] [--name <name>]     # 在 rsb enter 里面使用
@@ -257,14 +258,22 @@ bash scripts/run.sh
 
 ## 绑定规则
 
-首次绑定时，`rsb` 会在本地和远程创建匹配的工作区标记：
+首次绑定时，`rsb` 会为本地和远程创建匹配的工作区标记（包含相同的 `workspace_id`）。
+
+本地元数据不再放在工作目录里，而是集中放在项目外，按本地路径归档：
 
 ```text
-<local>/.remote-sandbox/workspace.toml
-<remote>/.remote-sandbox/workspace.toml
+~/.remote-sandbox/workspaces/<hash>/workspace.toml   # 标记
+~/.remote-sandbox/workspaces/<hash>/state.sqlite3    # base 快照 + 哈希缓存
+~/.remote-sandbox/workspaces/<hash>/daemon.{pid,lock,log}
+~/.remote-sandbox/workspaces/<hash>/sync.lock
 ```
 
-标记中包含相同的 `workspace_id`。后续连接时，`rsb` 会用它确认本地目录和远程目录是否属于同一个工作区。
+这样工作目录保持干净，AI 只会看到你的项目文件，不会看到 `.remote-sandbox`。如果旧版本曾在工作目录里写过 `<local>/.remote-sandbox`，下次 `rsb connect` / `reconnect` / `start` 会自动把它迁移到上面的位置并删除工作目录里的旧目录。`rsb forget` 会删除本机这份元数据（不动本地或远程文件）。
+
+远程目前仍在远程工作区下保留 `<remote>/.remote-sandbox/`（agent 和标记）。
+
+标记中的 `workspace_id` 用于确认本地目录和远程目录属于同一个工作区。
 
 当前安全规则：
 
@@ -278,13 +287,15 @@ bash scripts/run.sh
 
 当前实现使用 SQLite 保存 base 快照，并基于 `base`、`local`、`remote` 三方 manifest 做判断。文件新旧不依赖 mtime 猜测，而是基于内容哈希。
 
+为了接近 git 的速度，两端都用 `(大小, mtime)` 哈希缓存：文件没变就不重新计算哈希（本地存在 `state.sqlite3`，远程存在 agent 目录的 `hashcache.json`）。批量传输走单条 SSH 连接上的 `tar` 流，而不是每个文件一次往返。
+
 同步策略支持三种模式：
 
 - `sync`：正常双向同步。
 - `placeholder`：远程大文件在本地保留占位文本，需要时再拉取。
 - `ignore`：该路径不由 remote-sandbox 管理。
 
-本地同步 daemon 使用事件驱动 watcher 观察本地变更并上传。包壳 shell 或 `rsb run` 中的远程命令结束后，会通过本地控制 socket 通知 daemon 立即同步一次；daemon 也会低频兜底检查远端变化。
+本地同步 daemon 使用事件驱动 watcher 观察本地变更并上传。包壳 shell 或 `rsb run` 中的远程命令结束后，会通过本地控制 socket 通知 daemon 立即同步一次；daemon 也会低频兜底检查远端变化。`rsb status` 的 `DAEMON` 列会显示当前阶段（`starting` / `initial-syncing` / `syncing` / `ready` / `degraded`），首次同步较大时不会再误报成 `stopped`。
 
 占位文件格式示例：
 
@@ -326,6 +337,16 @@ rsb peek outputs/train.log --tail 80
 ## 忽略与占位
 
 项目根目录可以放置 `.rsbignore` 来控制路径策略。普通规则默认表示 `ignore`；`[placeholder]` 下面的规则表示只在本地保留占位文件。
+
+可以用 `rsb init` 在当前目录生成一份默认 `.rsbignore`（已忽略 `.venv/`、`__pycache__/`、`*.pyc`、`.pytest_cache/`、`.mypy_cache/`、`.ruff_cache/`、`node_modules/` 等常见无用文件；默认仍同步 `.git/`，可自行取消注释关掉）：
+
+```bash
+rsb init            # 写到当前目录，已存在则拒绝覆盖
+rsb init -f         # 强制覆盖
+rsb init -l path    # 写到指定目录
+```
+
+手写示例：
 
 ```gitignore
 # 不同步

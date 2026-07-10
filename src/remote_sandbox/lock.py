@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO
 
-from remote_sandbox.marker import METADATA_DIR
+from remote_sandbox.marker import local_meta_dir
 
 
 class WorkspaceLockError(RuntimeError):
@@ -14,7 +14,7 @@ class WorkspaceLockError(RuntimeError):
 
 
 def _lock_path(local_root: Path) -> Path:
-    metadata_dir = local_root / METADATA_DIR
+    metadata_dir = local_meta_dir(local_root)
     metadata_dir.mkdir(parents=True, exist_ok=True)
     return metadata_dir / "sync.lock"
 
