@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -8,6 +9,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -33,7 +35,12 @@ _HOME_ENV = "CODEX_REMOTE_SANDBOX_HOME"
 _HOME_DIRNAME = ".codex-remote-sandbox"
 _RUNTIME_ENV = "CODEX_REMOTE_SANDBOX_RUNTIME_DIR"
 _RUNTIME_PREFIX = "codex-remote-sandbox"
+_INSTALLED_HOME_ENV = "REMOTE_SANDBOX_HOME"
+_INSTALLED_RUNTIME_ENV = "REMOTE_SANDBOX_RUNTIME_DIR"
+_INSTALLED_CONTROL_ENV = "REMOTE_SANDBOX_CONTROL_DIR"
+_INSTALLED_RUNTIME_PREFIX = "remote-sandbox"
 _EVENT_BATCH_SIZE = 256
+_DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 def _archive_sha256() -> str:
@@ -75,10 +82,7 @@ def main(argv: list[str]) -> int:
 
 def _handle_register(payload: dict[str, Any]) -> dict[str, object]:
     workspace_id = validate_workspace_id(_expect_string(payload, "workspace_id"))
-    root = validate_workspace_root(
-        Path(_expect_string(payload, "root")),
-        home=Path.home(),
-    )
+    root = _validate_registration_root(Path(_expect_string(payload, "root")))
     home = _remote_home()
     if home == root or home in root.parents or root in home.parents:
         raise ValueError("workspace root and remote metadata home must not overlap")
@@ -137,9 +141,11 @@ def _handle_start(payload: dict[str, Any]) -> dict[str, object]:
 
             token = secrets.token_hex(24)
             log_path = _watcher_log_path(workspace_id)
-            log_path.touch(mode=0o600, exist_ok=True)
-            log_path.chmod(0o600)
-            with log_path.open("ab", buffering=0) as log:
+            log_descriptor = _open_runtime_file(
+                log_path,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+            )
+            with os.fdopen(log_descriptor, "ab", buffering=0) as log:
                 process = subprocess.Popen(
                     _watcher_command(workspace_id, home, token),
                     stdin=subprocess.DEVNULL,
@@ -331,7 +337,7 @@ def _handle_forget(payload: dict[str, Any]) -> dict[str, object]:
                     home=Path.home(),
                 )
             raise
-        _watcher_log_path(workspace_id).unlink(missing_ok=True)
+        _unlink_runtime_file(_watcher_log_path(workspace_id))
         return {"workspace_id": workspace_id, "forgotten": True}
 
 
@@ -394,28 +400,62 @@ def _workspace_directory(home: Path, workspace_id: str) -> Path:
     return home / "workspaces" / validate_workspace_id(workspace_id)
 
 
-def _runtime_root() -> Path:
+def _validate_registration_root(root: Path) -> Path:
+    canonical = validate_workspace_root(root, home=Path.home())
+    for state_root in _installed_rsb_state_roots():
+        if canonical == state_root or state_root in canonical.parents:
+            raise ValueError("workspace root cannot use installed rsb state")
+    return canonical
+
+
+def _installed_rsb_state_roots() -> tuple[Path, ...]:
+    default_runtime = Path("/tmp") / f"{_INSTALLED_RUNTIME_PREFIX}-{os.getuid()}"
+    candidates = [Path.home() / ".remote-sandbox", default_runtime]
+    configured_home = os.environ.get(_INSTALLED_HOME_ENV)
+    configured_runtime = os.environ.get(_INSTALLED_RUNTIME_ENV)
+    configured_control = os.environ.get(_INSTALLED_CONTROL_ENV)
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if configured_home:
+        candidates.append(Path(configured_home))
+    if configured_runtime:
+        candidates.append(Path(configured_runtime))
+    if configured_control:
+        candidates.append(Path(configured_control))
+    if xdg_runtime:
+        candidates.append(Path(xdg_runtime) / _INSTALLED_RUNTIME_PREFIX)
+    return tuple(dict.fromkeys(_canonical_state_boundary(path) for path in candidates))
+
+
+def _canonical_state_boundary(path: Path) -> Path:
+    expanded = path.expanduser()
+    absolute = expanded if expanded.is_absolute() else Path(os.path.abspath(expanded))
+    return absolute.resolve(strict=False)
+
+
+def _runtime_root_path() -> Path:
     configured = os.environ.get(_RUNTIME_ENV)
-    root = (
+    raw = (
         Path(configured).expanduser()
         if configured
         else Path("/tmp") / f"{_RUNTIME_PREFIX}-{os.getuid()}"
     )
-    if not root.is_absolute():
+    if not raw.is_absolute():
         raise ValueError("remote runtime directory must be absolute")
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    root.chmod(0o700)
-    return root
+    normalized = Path(os.path.normpath(raw))
+    if raw != normalized or raw == Path(raw.anchor):
+        raise ValueError("remote runtime directory must be canonical")
+    return raw
+
+
+def _runtime_root() -> Path:
+    with _runtime_directory() as (root, _descriptor):
+        return root
 
 
 def _workspace_runtime(workspace_id: str) -> Path:
-    workspaces = _runtime_root() / "workspaces"
-    workspaces.mkdir(parents=True, exist_ok=True, mode=0o700)
-    workspaces.chmod(0o700)
-    workspace = workspaces / validate_workspace_id(workspace_id)
-    workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
-    workspace.chmod(0o700)
-    return workspace
+    safe_workspace_id = validate_workspace_id(workspace_id)
+    with _runtime_directory("workspaces", safe_workspace_id) as (workspace, _descriptor):
+        return workspace
 
 
 def _index_lock_path() -> Path:
@@ -432,16 +472,158 @@ def _watcher_log_path(workspace_id: str) -> Path:
 
 @contextmanager
 def _exclusive_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.parent.chmod(0o700)
-    path.touch(mode=0o600, exist_ok=True)
-    path.chmod(0o600)
-    with path.open("rb") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    descriptor = _open_runtime_file(path, os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _runtime_directory(*components: str) -> Iterator[tuple[Path, int]]:
+    root = _runtime_root_path()
+    path = root
+    descriptor = _open_runtime_root(root)
+    try:
+        for component in components:
+            if component in {"", ".", ".."} or "/" in component or "\0" in component:
+                raise ValueError("invalid remote runtime path component")
+            child = _open_owned_directory_at(descriptor, component)
+            os.close(descriptor)
+            descriptor = child
+            path /= component
+        yield path, descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _open_runtime_root(root: Path) -> int:
+    traversal = _runtime_traversal_path(root)
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        parts = traversal.parts[1:]
+        for index, component in enumerate(parts):
+            is_runtime_root = index == len(parts) - 1
+            child = _open_directory_at(
+                descriptor,
+                component,
+                require_current_owner=is_runtime_root,
+                enforce_mode=is_runtime_root,
+            )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _runtime_traversal_path(root: Path) -> Path:
+    temporary_root = Path("/tmp")
+    try:
+        relative = root.relative_to(temporary_root)
+    except ValueError:
+        return root
+    return temporary_root.resolve(strict=True) / relative
+
+
+def _open_owned_directory_at(parent_descriptor: int, name: str) -> int:
+    return _open_directory_at(
+        parent_descriptor,
+        name,
+        require_current_owner=True,
+        enforce_mode=True,
+    )
+
+
+def _open_directory_at(
+    parent_descriptor: int,
+    name: str,
+    *,
+    require_current_owner: bool,
+    enforce_mode: bool,
+) -> int:
+    created = False
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+        created = True
+    except FileExistsError:
+        pass
+    descriptor = os.open(
+        name,
+        _DIRECTORY_OPEN_FLAGS,
+        dir_fd=parent_descriptor,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise NotADirectoryError(name)
+        current_uid = os.getuid()
+        allowed_owners = {current_uid} if require_current_owner else {0, current_uid}
+        if metadata.st_uid not in allowed_owners:
+            raise PermissionError(errno.EPERM, "remote runtime directory has an unsafe owner", name)
+        if created or enforce_mode:
+            os.fchmod(descriptor, 0o700)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_runtime_file(path: Path, flags: int) -> int:
+    root = _runtime_root_path()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("remote runtime file must be inside the runtime directory") from exc
+    if not relative.parts:
+        raise ValueError("remote runtime file path is invalid")
+    *parents, name = relative.parts
+    with _runtime_directory(*parents) as (_directory, parent_descriptor):
+        descriptor = os.open(
+            name,
+            flags | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError(errno.EINVAL, "remote runtime file must be regular", str(path))
+        if metadata.st_uid != os.getuid():
+            raise PermissionError(errno.EPERM, "remote runtime file has an unsafe owner", str(path))
+        os.fchmod(descriptor, 0o600)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _unlink_runtime_file(path: Path) -> None:
+    root = _runtime_root_path()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("remote runtime file must be inside the runtime directory") from exc
+    if not relative.parts:
+        raise ValueError("remote runtime file path is invalid")
+    *parents, name = relative.parts
+    with _runtime_directory(*parents) as (_directory, parent_descriptor):
+        try:
+            metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(metadata.st_mode):
+            raise OSError(errno.ELOOP, "remote runtime file must not be a symlink", str(path))
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError(errno.EINVAL, "remote runtime file must be regular", str(path))
+        if metadata.st_uid != os.getuid():
+            raise PermissionError(errno.EPERM, "remote runtime file has an unsafe owner", str(path))
+        os.unlink(name, dir_fd=parent_descriptor)
 
 
 def _lookup_workspace(home: Path, workspace_id: str) -> RemoteIndexEntry:

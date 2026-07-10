@@ -9,7 +9,8 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -245,6 +246,222 @@ def test_default_remote_runtime_uses_isolated_codex_tmp_tree(
     assert remote_agent_main._runtime_root() == (
         Path("/tmp") / f"codex-remote-sandbox-{os.getuid()}"
     )
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "default-home",
+        "default-home-child",
+        "home-override",
+        "home-override-child",
+        "runtime-override",
+        "runtime-override-child",
+        "control-override",
+        "xdg-runtime",
+    ],
+)
+def test_register_rejects_installed_rsb_state_before_codex_control_creation(
+    tmp_path: Path,
+    location: str,
+) -> None:
+    archive = build_agent_zipapp(tmp_path / "agent.pyz")
+    home = tmp_path / "home"
+    control = tmp_path / "codex-control"
+    runtime = tmp_path / "codex-runtime"
+    installed_home = tmp_path / "installed-home"
+    installed_runtime = tmp_path / "installed-runtime"
+    installed_control = tmp_path / "installed-control"
+    xdg_runtime = tmp_path / "xdg"
+    home.mkdir()
+    candidates = {
+        "default-home": home / ".remote-sandbox",
+        "default-home-child": home / ".remote-sandbox" / "workspaces",
+        "home-override": installed_home,
+        "home-override-child": installed_home / "workspaces",
+        "runtime-override": installed_runtime,
+        "runtime-override-child": installed_runtime / "workspace",
+        "control-override": installed_control,
+        "xdg-runtime": xdg_runtime / "remote-sandbox",
+    }
+    root = candidates[location]
+    root.mkdir(parents=True)
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+        "CODEX_REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
+        "REMOTE_SANDBOX_HOME": str(installed_home),
+        "REMOTE_SANDBOX_RUNTIME_DIR": str(installed_runtime),
+        "REMOTE_SANDBOX_CONTROL_DIR": str(installed_control),
+        "XDG_RUNTIME_DIR": str(xdg_runtime),
+    }
+
+    result = _agent_call(
+        archive,
+        AgentRequest(
+            "register",
+            {
+                "workspace_id": "00000000-0000-4000-8000-000000000082",
+                "root": str(root),
+            },
+        ),
+        env,
+    )
+
+    assert result.returncode == 2
+    assert "installed rsb state" in (decode_response(result.stdout).error or "")
+    assert not control.exists()
+    assert not runtime.exists()
+
+
+def test_register_rejects_default_installed_runtime_before_codex_control_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actual_uid = os.getuid()
+    fake_uid = actual_uid + 1_000_000 + os.getpid()
+    installed_runtime = Path("/tmp").resolve() / f"remote-sandbox-{fake_uid}"
+    root = installed_runtime / "workspace"
+    assert not installed_runtime.exists()
+    root.mkdir(parents=True)
+    home = tmp_path / "home"
+    control = tmp_path / "codex-control"
+    runtime = tmp_path / "codex-runtime"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(control))
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    monkeypatch.delenv("REMOTE_SANDBOX_HOME", raising=False)
+    monkeypatch.delenv("REMOTE_SANDBOX_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("REMOTE_SANDBOX_CONTROL_DIR", raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(remote_agent_main.os, "getuid", lambda: fake_uid)
+    try:
+        with pytest.raises(ValueError, match="installed rsb state"):
+            remote_agent_main._handle_register(
+                {
+                    "workspace_id": "00000000-0000-4000-8000-000000000083",
+                    "root": str(root),
+                }
+            )
+        assert not control.exists()
+        assert not runtime.exists()
+    finally:
+        root.rmdir()
+        installed_runtime.rmdir()
+
+
+def test_runtime_root_rejects_symlink_without_modifying_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "outside"
+    target.mkdir(mode=0o755)
+    target.chmod(0o755)
+    runtime = tmp_path / "runtime"
+    runtime.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+
+    with pytest.raises(OSError):
+        remote_agent_main._runtime_root()
+
+    assert target.stat().st_mode & 0o777 == 0o755
+    assert list(target.iterdir()) == []
+
+
+def test_runtime_component_rejects_symlink_without_modifying_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = tmp_path / "runtime"
+    outside = tmp_path / "outside"
+    runtime.mkdir(mode=0o700)
+    outside.mkdir(mode=0o755)
+    outside.chmod(0o755)
+    (runtime / "workspaces").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+
+    with pytest.raises(OSError):
+        remote_agent_main._workspace_runtime("00000000-0000-4000-8000-000000000084")
+
+    assert outside.stat().st_mode & 0o777 == 0o755
+    assert list(outside.iterdir()) == []
+
+
+def test_runtime_lock_rejects_symlink_without_modifying_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_id = "00000000-0000-4000-8000-000000000085"
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    workspace = remote_agent_main._workspace_runtime(workspace_id)
+    target = tmp_path / "outside.lock"
+    target.write_text("do not change", encoding="utf-8")
+    target.chmod(0o644)
+    lock_path = workspace / "control.lock"
+    lock_path.symlink_to(target)
+
+    with pytest.raises(OSError), remote_agent_main._exclusive_lock(lock_path):
+        pass
+
+    assert target.read_text(encoding="utf-8") == "do not change"
+    assert target.stat().st_mode & 0o777 == 0o644
+
+
+def test_watcher_log_rejects_symlink_before_spawning_or_modifying_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    home = tmp_path / "home"
+    control = tmp_path / "control"
+    runtime = tmp_path / "runtime"
+    root.mkdir()
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(control))
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    workspace_id = "00000000-0000-4000-8000-000000000086"
+    remote_agent_main._handle_register({"workspace_id": workspace_id, "root": str(root)})
+    log_path = remote_agent_main._workspace_runtime(workspace_id) / "watcher.log"
+    target = tmp_path / "outside.log"
+    target.write_text("do not change", encoding="utf-8")
+    target.chmod(0o644)
+    log_path.symlink_to(target)
+    popen_called = False
+
+    def unexpected_popen(*_args: object, **_kwargs: object) -> subprocess.Popen[bytes]:
+        nonlocal popen_called
+        popen_called = True
+        raise AssertionError("watcher process must not start")
+
+    monkeypatch.setattr(remote_agent_main.subprocess, "Popen", unexpected_popen)
+
+    with pytest.raises(OSError):
+        remote_agent_main._handle_start({"workspace_id": workspace_id})
+
+    assert not popen_called
+    assert target.read_text(encoding="utf-8") == "do not change"
+    assert target.stat().st_mode & 0o777 == 0o644
+
+
+def test_runtime_root_rejects_directory_owned_by_another_uid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o755)
+    runtime.chmod(0o755)
+    actual_uid = os.getuid()
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    monkeypatch.setattr(remote_agent_main.os, "getuid", lambda: actual_uid + 1)
+
+    with pytest.raises(PermissionError):
+        remote_agent_main._runtime_root()
+
+    assert runtime.stat().st_mode & 0o777 == 0o755
 
 
 def test_register_conflict_does_not_leave_unreachable_workspace_metadata(tmp_path: Path) -> None:
@@ -524,6 +741,97 @@ def test_concurrent_start_and_forget_never_recreate_persistent_metadata(tmp_path
         assert index.index_entry(workspace_id) is None
     assert not (persistent_workspace / "control.lock").exists()
     assert not (persistent_workspace / "watcher.log").exists()
+
+
+def test_start_lookup_cannot_outlive_forget_and_recreate_persistent_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    home = tmp_path / "home"
+    control = tmp_path / "control"
+    runtime = tmp_path / "runtime"
+    root.mkdir()
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(control))
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    workspace_id = "00000000-0000-4000-8000-000000000087"
+    remote_agent_main._handle_register({"workspace_id": workspace_id, "root": str(root)})
+    stable_lock = runtime / "workspaces" / workspace_id / "control.lock"
+    metadata = control / "workspaces" / workspace_id
+    original_lock = remote_agent_main._exclusive_lock
+    original_lookup = remote_agent_main._lookup_workspace
+    original_identity = remote_agent_main._watcher_identity
+    start_holds_stable_lock = threading.Event()
+    lookup_cached = threading.Event()
+    forget_lock_requested = threading.Event()
+    forget_complete = threading.Event()
+    start_errors: list[BaseException] = []
+    forget_errors: list[BaseException] = []
+
+    @contextmanager
+    def observed_lock(path: Path) -> Iterator[None]:
+        thread_name = threading.current_thread().name
+        if thread_name == "forget-thread" and path == stable_lock:
+            forget_lock_requested.set()
+        with original_lock(path):
+            tracks_start = thread_name == "start-thread" and path == stable_lock
+            if tracks_start:
+                start_holds_stable_lock.set()
+            try:
+                yield
+            finally:
+                if tracks_start:
+                    start_holds_stable_lock.clear()
+
+    def controlled_lookup(current_home: Path, current_id: str) -> object:
+        entry = original_lookup(current_home, current_id)
+        if threading.current_thread().name == "start-thread":
+            lookup_cached.set()
+            if start_holds_stable_lock.is_set():
+                assert forget_lock_requested.wait(timeout=2)
+            else:
+                assert forget_complete.wait(timeout=2)
+        return entry
+
+    def stop_start_after_lookup(state: WatcherState, current_id: str) -> str:
+        if threading.current_thread().name == "start-thread":
+            raise RuntimeError("stop start after controlled lookup")
+        return original_identity(state, current_id)
+
+    def run_start() -> None:
+        try:
+            remote_agent_main._handle_start({"workspace_id": workspace_id})
+        except BaseException as exc:
+            start_errors.append(exc)
+
+    def run_forget() -> None:
+        assert lookup_cached.wait(timeout=2)
+        try:
+            remote_agent_main._handle_forget({"workspace_id": workspace_id})
+        except BaseException as exc:
+            forget_errors.append(exc)
+        finally:
+            forget_complete.set()
+
+    monkeypatch.setattr(remote_agent_main, "_exclusive_lock", observed_lock)
+    monkeypatch.setattr(remote_agent_main, "_lookup_workspace", controlled_lookup)
+    monkeypatch.setattr(remote_agent_main, "_watcher_identity", stop_start_after_lookup)
+    start_thread = threading.Thread(target=run_start, name="start-thread")
+    forget_thread = threading.Thread(target=run_forget, name="forget-thread")
+    start_thread.start()
+    forget_thread.start()
+    start_thread.join(timeout=5)
+    forget_thread.join(timeout=5)
+
+    assert not start_thread.is_alive()
+    assert not forget_thread.is_alive()
+    assert len(start_errors) == 1
+    assert forget_errors == []
+    assert not metadata.exists()
+    with RemoteStore(control / "index.sqlite3") as index:
+        assert index.index_entry(workspace_id) is None
 
 
 def test_status_leaves_running_state_unchanged_when_identity_is_unknown(
