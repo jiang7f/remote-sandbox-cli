@@ -4,8 +4,9 @@ import hashlib
 import os
 import posixpath
 import shutil
+import stat
 import tempfile
-import zipapp
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,7 +18,8 @@ from remote_sandbox.ssh import SshRunner
 LEGACY_AGENT_VERSION = "0.1.0"
 AGENT_FILE = "agent.py"
 
-_ARCHIVE_MTIME = 315532800
+_ARCHIVE_DATE_TIME = (1980, 1, 1, 0, 0, 0)
+_ARCHIVE_SHEBANG = b"#!/usr/bin/env python3\n"
 _ARCHIVE_MAIN = """from remote_agent.__main__ import main
 import sys
 
@@ -119,6 +121,32 @@ class AgentInstall:
     sha256: str
 
 
+def _write_deterministic_zipapp(staging: Path, destination: Path) -> None:
+    # ZipFile.write derives timestamps through local time, so write fixed metadata explicitly.
+    with destination.open("wb") as raw_archive:
+        raw_archive.write(_ARCHIVE_SHEBANG)
+        with zipfile.ZipFile(raw_archive, "w", compression=zipfile.ZIP_STORED) as archive:
+            paths = sorted(
+                staging.rglob("*"),
+                key=lambda path: path.relative_to(staging).as_posix(),
+            )
+            for path in paths:
+                is_directory = path.is_dir()
+                archive_name = path.relative_to(staging).as_posix()
+                if is_directory:
+                    archive_name += "/"
+
+                entry = zipfile.ZipInfo(archive_name, date_time=_ARCHIVE_DATE_TIME)
+                entry.create_system = 3
+                entry.compress_type = zipfile.ZIP_STORED
+                permissions = 0o755 if is_directory else 0o644
+                file_type = stat.S_IFDIR if is_directory else stat.S_IFREG
+                entry.external_attr = ((file_type | permissions) << 16) | (
+                    0x10 if is_directory else 0
+                )
+                archive.writestr(entry, b"" if is_directory else path.read_bytes())
+
+
 def build_agent_zipapp(destination: Path) -> Path:
     destination = destination.resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -133,17 +161,10 @@ def build_agent_zipapp(destination: Path) -> Path:
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
         (staging / "__main__.py").write_text(_ARCHIVE_MAIN, encoding="utf-8")
-        for path in sorted(staging.rglob("*")):
-            path.chmod(0o755 if path.is_dir() else 0o644)
-            os.utime(path, (_ARCHIVE_MTIME, _ARCHIVE_MTIME))
 
         temporary_archive = Path(temporary) / "agent.pyz"
-        zipapp.create_archive(
-            staging,
-            target=temporary_archive,
-            interpreter="/usr/bin/env python3",
-            compressed=True,
-        )
+        _write_deterministic_zipapp(staging, temporary_archive)
+        temporary_archive.chmod(0o755)
         os.replace(temporary_archive, destination)
     return destination
 

@@ -1,5 +1,8 @@
 import hashlib
+import os
+import stat
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -71,13 +74,62 @@ def test_agent_zipapp_has_stable_bytes_and_self_contained_layout(tmp_path: Path)
     second = build_agent_zipapp(tmp_path / "second.pyz")
 
     assert first.read_bytes() == second.read_bytes()
+    assert first.read_bytes().startswith(b"#!/usr/bin/env python3\n")
+    assert stat.S_IMODE(first.stat().st_mode) == 0o755
     with zipfile.ZipFile(first) as archive:
-        assert set(archive.namelist()) == {
+        entries = archive.infolist()
+        assert [entry.filename for entry in entries] == [
             "__main__.py",
             "remote_agent/",
             "remote_agent/__init__.py",
             "remote_agent/__main__.py",
-        }
+        ]
+        assert [entry.date_time for entry in entries] == [(1980, 1, 1, 0, 0, 0)] * 4
+        assert [entry.compress_type for entry in entries] == [zipfile.ZIP_STORED] * 4
+        assert [stat.S_IMODE(entry.external_attr >> 16) for entry in entries] == [
+            0o644,
+            0o755,
+            0o644,
+            0o644,
+        ]
+
+
+def test_agent_zipapp_is_identical_across_builder_timezones(tmp_path: Path) -> None:
+    timezones = ("UTC", "Asia/Shanghai", "America/New_York")
+    script = """\
+import hashlib
+import sys
+from pathlib import Path
+
+from remote_sandbox.agent import build_agent_zipapp
+
+archive = build_agent_zipapp(Path(sys.argv[1]))
+print(hashlib.sha256(archive.read_bytes()).hexdigest())
+"""
+    builds: list[tuple[str, Path, subprocess.CompletedProcess[str]]] = []
+    for index, timezone in enumerate(timezones):
+        archive = tmp_path / f"agent-{index}.pyz"
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(archive)],
+            capture_output=True,
+            env={**os.environ, "TZ": timezone},
+            text=True,
+            check=False,
+        )
+        builds.append((timezone, archive, result))
+
+    failures = {
+        timezone: result.stderr
+        for timezone, _archive, result in builds
+        if result.returncode != 0
+    }
+    assert not failures
+
+    contents = [archive.read_bytes() for _timezone, archive, _result in builds]
+    reported_hashes = [result.stdout.strip() for _timezone, _archive, result in builds]
+    calculated_hashes = [hashlib.sha256(content).hexdigest() for content in contents]
+    assert contents == [contents[0]] * len(timezones)
+    assert reported_hashes == calculated_hashes == [calculated_hashes[0]] * len(timezones)
 
 
 def test_remote_agent_manager_uploads_atomically_outside_workspace(tmp_path: Path) -> None:
