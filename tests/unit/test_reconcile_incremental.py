@@ -18,6 +18,17 @@ def file(path: str, digest: str | None) -> EntryFingerprint:
     return EntryFingerprint(path, EntryKind.FILE, 4, 1, 0o100644, content_hash=digest)
 
 
+def quick_file(
+    path: str,
+    *,
+    size: int = 4,
+    mtime_ns: int = 1,
+    mode: int = 0o100644,
+    digest: str | None = None,
+) -> EntryFingerprint:
+    return EntryFingerprint(path, EntryKind.FILE, size, mtime_ns, mode, content_hash=digest)
+
+
 def symlink(path: str, target: str, digest: str | None = None) -> EntryFingerprint:
     return EntryFingerprint(
         path,
@@ -44,12 +55,87 @@ def test_only_local_change_pushes_remote() -> None:
 def test_ambiguous_changed_file_requests_hash_before_decision() -> None:
     plan = build_incremental_plan(
         base={"a.py": file("a.py", "old")},
-        local={"a.py": file("a.py", None)},
+        local={"a.py": quick_file("a.py", mtime_ns=2)},
         remote={"a.py": file("a.py", "old")},
         dirty_paths={"a.py"},
         policy=StaticPolicyEngine(),
     )
     assert [(item.side, item.path) for item in plan.hash_requests] == [("local", "a.py")]
+
+
+def test_local_quick_change_requests_only_local_hash_when_remote_quick_matches_base() -> None:
+    plan = build_incremental_plan(
+        base={"a.py": quick_file("a.py", digest="base")},
+        local={"a.py": quick_file("a.py", mtime_ns=2)},
+        remote={"a.py": quick_file("a.py")},
+        dirty_paths={"a.py"},
+        policy=StaticPolicyEngine(),
+    )
+
+    assert [(request.side, request.path) for request in plan.hash_requests] == [
+        ("local", "a.py")
+    ]
+    assert plan.actions == ()
+    assert plan.conflicts == ()
+
+
+def test_remote_quick_change_requests_only_remote_hash_when_local_quick_matches_base() -> None:
+    plan = build_incremental_plan(
+        base={"a.py": quick_file("a.py", digest="base")},
+        local={"a.py": quick_file("a.py")},
+        remote={"a.py": quick_file("a.py", mtime_ns=2)},
+        dirty_paths={"a.py"},
+        policy=StaticPolicyEngine(),
+    )
+
+    assert [(request.side, request.path) for request in plan.hash_requests] == [
+        ("remote", "a.py")
+    ]
+    assert plan.actions == ()
+    assert plan.conflicts == ()
+
+
+def test_both_quick_fingerprints_matching_base_need_no_hash_or_plan_output() -> None:
+    plan = build_incremental_plan(
+        base={"a.py": quick_file("a.py", digest="base")},
+        local={"a.py": quick_file("a.py")},
+        remote={"a.py": quick_file("a.py")},
+        dirty_paths={"a.py"},
+        policy=StaticPolicyEngine(),
+    )
+
+    assert plan == SyncPlan()
+
+
+def test_both_quick_changes_request_both_hashes_in_side_order() -> None:
+    plan = build_incremental_plan(
+        base={"a.py": quick_file("a.py", digest="base")},
+        local={"a.py": quick_file("a.py", mtime_ns=2)},
+        remote={"a.py": quick_file("a.py", size=5)},
+        dirty_paths={"a.py"},
+        policy=StaticPolicyEngine(),
+    )
+
+    assert [(request.side, request.path) for request in plan.hash_requests] == [
+        ("local", "a.py"),
+        ("remote", "a.py"),
+    ]
+    assert plan.actions == ()
+    assert plan.conflicts == ()
+
+
+def test_strong_local_change_does_not_request_unchanged_remote_quick_hash() -> None:
+    plan = build_incremental_plan(
+        base={"a.py": quick_file("a.py", digest="base")},
+        local={"a.py": quick_file("a.py", mtime_ns=2, digest="local")},
+        remote={"a.py": quick_file("a.py")},
+        dirty_paths={"a.py"},
+        policy=StaticPolicyEngine(),
+    )
+
+    assert plan.hash_requests == ()
+    assert [action.type for action in plan.actions] == [ActionType.PUSH]
+    assert plan.conflicts == ()
 
 
 def test_both_sides_reaching_the_same_content_updates_only_the_base() -> None:
@@ -164,14 +250,14 @@ def test_hash_requests_are_minimal_and_deterministic_per_side() -> None:
     plan = build_incremental_plan(
         base={path: file(path, "old") for path in ("a.py", "b.py", "c.py")},
         local={
-            "a.py": file("a.py", None),
+            "a.py": quick_file("a.py", mtime_ns=2),
             "b.py": file("b.py", "new"),
-            "c.py": file("c.py", None),
+            "c.py": quick_file("c.py", mtime_ns=2),
         },
         remote={
             "a.py": file("a.py", "old"),
-            "b.py": file("b.py", None),
-            "c.py": file("c.py", None),
+            "b.py": quick_file("b.py", mtime_ns=2),
+            "c.py": quick_file("c.py", size=5),
         },
         dirty_paths=["c.py", "b.py", "a.py", "c.py"],
         policy=StaticPolicyEngine(),

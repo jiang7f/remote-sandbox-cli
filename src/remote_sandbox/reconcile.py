@@ -127,7 +127,7 @@ def build_incremental_plan(
             conflicts.append(ConflictDecision(path, "kind-divergence", local_entry, remote_entry))
             continue
 
-        requests = _missing_hash_requests(path, local_entry, remote_entry)
+        requests = _missing_hash_requests(path, base_entry, local_entry, remote_entry)
         if requests:
             hash_requests.extend(requests)
             continue
@@ -170,8 +170,10 @@ def _plan_incremental_path(
             return _new_action(ActionType.PUSH, path, local, remote, local), None
         return None, ConflictDecision(path, "both-modified", local, remote)
 
-    local_matches_base = _fingerprint_content_equal(local, base)
-    remote_matches_base = _fingerprint_content_equal(remote, base)
+    local_matches_base = _fingerprint_matches_base(local, base)
+    remote_matches_base = _fingerprint_matches_base(remote, base)
+    if local_matches_base and remote_matches_base:
+        return None, None
     if local_matches_base and not remote_matches_base:
         if isinstance(remote, MissingEntry):
             return _new_action(
@@ -236,13 +238,14 @@ def _matching_base_after(
 
 def _missing_hash_requests(
     path: str,
+    base: FingerprintState,
     local: FingerprintState,
     remote: FingerprintState,
 ) -> tuple[HashRequest, ...]:
     requests: list[HashRequest] = []
-    if _file_needs_hash(local):
+    if _file_needs_hash(local) and not _quick_file_equal(local, base):
         requests.append(HashRequest("local", path))
-    if _file_needs_hash(remote):
+    if _file_needs_hash(remote) and not _quick_file_equal(remote, base):
         requests.append(HashRequest("remote", path))
     return tuple(requests)
 
@@ -252,6 +255,30 @@ def _file_needs_hash(entry: FingerprintState) -> bool:
         isinstance(entry, EntryFingerprint)
         and entry.kind is EntryKind.FILE
         and entry.content_hash is None
+    )
+
+
+def _fingerprint_matches_base(current: FingerprintState, base: FingerprintState) -> bool:
+    if (
+        isinstance(current, EntryFingerprint)
+        and isinstance(base, EntryFingerprint)
+        and current.kind is EntryKind.FILE
+        and base.kind is EntryKind.FILE
+        and current.content_hash is None
+    ):
+        return _quick_file_equal(current, base)
+    return _fingerprint_content_equal(current, base)
+
+
+def _quick_file_equal(left: FingerprintState, right: FingerprintState) -> bool:
+    return (
+        isinstance(left, EntryFingerprint)
+        and isinstance(right, EntryFingerprint)
+        and left.kind is EntryKind.FILE
+        and right.kind is EntryKind.FILE
+        and left.size == right.size
+        and left.mtime_ns == right.mtime_ns
+        and left.mode == right.mode
     )
 
 
