@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import quote, unquote
 
+from remote_sandbox.agent import remote_agent_path
 from remote_sandbox.marker import local_meta_dir, migrate_local_metadata, read_local_marker
 from remote_sandbox.ssh import SshRunner, SubprocessSshRunner
 from remote_sandbox.syncsession import SyncProgress, SyncSession
@@ -195,6 +196,86 @@ class _ControlServer:
             self._path.unlink()
 
 
+class _RemoteWatcher:
+    """Runs the resident remote agent `watch` and pokes the daemon on each remote change.
+
+    A background thread spawns `ssh … agent.py watch` and reads its stdout; every line is a
+    changed remote path, which triggers a sync. On disconnect it re-dials with backoff. This
+    is what makes a file deleted on the server sync within ~1 s instead of up to 30 s, and it
+    replaces per-timer full-tree remote scans as the primary change signal.
+    """
+
+    def __init__(
+        self,
+        *,
+        runner: SshRunner,
+        target: str,
+        remote: str,
+        on_change: Callable[[], None],
+        stop_event: threading.Event,
+        log: logging.Logger,
+    ) -> None:
+        self._runner = runner
+        self._target = target
+        self._remote = remote
+        self._on_change = on_change
+        self._stop_event = stop_event
+        self._log = log
+        self._thread: threading.Thread | None = None
+        self._proc: object | None = None
+
+    def start(self) -> None:
+        spawn = getattr(self._runner, "spawn_remote_watch", None)
+        if spawn is None:  # e.g. a fake runner without streaming support
+            self._log.info("remote watcher unavailable for this runner; relying on poll")
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="rsb-remote-watch", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        agent_path = remote_agent_path(self._remote)
+        failures = 0
+        while not self._stop_event.is_set():
+            proc = None
+            try:
+                proc = self._runner.spawn_remote_watch(  # type: ignore[attr-defined]
+                    self._target, agent_path, 1.0
+                )
+                self._proc = proc
+                failures = 0
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    if self._stop_event.is_set():
+                        break
+                    line = line.strip()
+                    if not line or line == "__rsb_watch_ready__":
+                        continue
+                    # Any remote change → ask the worker to sync now.
+                    self._on_change()
+            except Exception as exc:  # keep trying across transient ssh/agent errors
+                self._log.warning("remote watcher error: %s", exc)
+            finally:
+                if proc is not None:
+                    with contextlib.suppress(Exception):
+                        proc.terminate()
+            if self._stop_event.is_set():
+                break
+            failures += 1
+            # Back off on repeated failures (dead host, missing python3) up to ~30 s.
+            self._stop_event.wait(min(2.0 * failures, 30.0))
+
+    def stop(self) -> None:
+        proc = self._proc
+        if proc is not None:
+            with contextlib.suppress(Exception):
+                proc.terminate()  # type: ignore[attr-defined]
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+
+
+
 class Daemon:
     """Per-workspace sync daemon core. `run()` blocks until stopped."""
 
@@ -246,6 +327,7 @@ class Daemon:
             log=self._log,
         )
         watcher = None
+        remote_watcher = None
         try:
             # Publish discoverability FIRST: pidfile, control socket, and watcher come up
             # in milliseconds so `rsb status` and the connect UX see the daemon (and its
@@ -265,8 +347,23 @@ class Daemon:
             # `initial-syncing`. `bind` no longer performs its own blocking sync, so this
             # is the single source of the first transfer (no duplicate pass).
             self._run_sync(session, "startup", initial=True)
+            # Start the remote-side watcher only after the first sync (the agent is
+            # bootstrapped by then). It pokes _sync_requested when the remote tree changes,
+            # so a file deleted/edited on the server syncs in ~1 s instead of waiting for the
+            # 30 s poll. The poll stays as a safety net if the watcher can't run.
+            remote_watcher = _RemoteWatcher(
+                runner=self._runner,
+                target=marker.binding.target,
+                remote=marker.binding.remote_path,
+                on_change=lambda: self._sync_requested.set(),
+                stop_event=self._stop_event,
+                log=self._log,
+            )
+            remote_watcher.start()
             self._worker_loop(session)
         finally:
+            if remote_watcher is not None:
+                remote_watcher.stop()
             if watcher is not None:
                 watcher.stop()
             _remove_pidfile(self._local_root)

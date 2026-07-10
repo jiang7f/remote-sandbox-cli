@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from remote_sandbox.marker import METADATA_DIR
 from remote_sandbox.ssh import SshRunner
 
-AGENT_VERSION = "0.2.0"
+AGENT_VERSION = "0.3.0"
 AGENT_FILE = "agent.py"
 
 AGENT_SOURCE = f'''# remote-sandbox remote agent
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 import sys
 
@@ -117,6 +118,53 @@ def manifest() -> dict:
     return {{"entries": entries}}
 
 
+def snapshot() -> dict:
+    """Cheap stat-only signature of every tracked file/dir: path -> (mtime_ns, size).
+
+    No hashing — this is the fast poll used by watch mode to detect adds/edits/deletes.
+    """
+    root = workspace_root()
+    snap = {{}}
+    for path in root.rglob("*"):
+        rel = path.relative_to(root).as_posix()
+        if should_ignore(rel):
+            continue
+        try:
+            if path.is_symlink():
+                snap[rel] = (0, -1)
+            elif path.is_dir():
+                snap[rel] = (0, -2)
+            elif path.is_file():
+                st = path.stat()
+                snap[rel] = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            continue
+    return snap
+
+
+def watch(interval: float) -> int:
+    """Emit one line per detected change until stdin closes or we are killed.
+
+    Pure stdlib, stat-only polling (no hashing) so it is cheap even on a big tree. Each
+    changed/added/removed path is printed as a single line and flushed immediately; the
+    local daemon reads these and syncs just what moved, instead of scanning the whole remote
+    tree on a timer. The exact line content is only a hint — the daemon reconciles by
+    manifest — so we simply print the path.
+    """
+    prev = snapshot()
+    # Announce readiness so the local side knows the watcher is live.
+    print("__rsb_watch_ready__", flush=True)
+    while True:
+        time.sleep(interval)
+        cur = snapshot()
+        if cur != prev:
+            changed = set(cur) ^ set(prev)
+            changed |= {{k for k in (set(cur) & set(prev)) if cur[k] != prev[k]}}
+            for rel in sorted(changed):
+                print(rel, flush=True)
+            prev = cur
+
+
 def main(argv: list) -> int:
     if argv == ["self-check"]:
         print("remote-sandbox-agent " + VERSION)
@@ -124,6 +172,17 @@ def main(argv: list) -> int:
     if argv == ["manifest"]:
         print(json.dumps(manifest(), separators=(",", ":")))
         return 0
+    if argv and argv[0] == "watch":
+        interval = 1.0
+        if len(argv) == 3 and argv[1] == "--interval":
+            try:
+                interval = max(0.2, float(argv[2]))
+            except ValueError:
+                interval = 1.0
+        try:
+            return watch(interval)
+        except KeyboardInterrupt:
+            return 0
     print("unknown command", file=sys.stderr)
     return 2
 

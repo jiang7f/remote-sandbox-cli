@@ -712,6 +712,41 @@ class SubprocessSshRunner:
         self._check(result, "remote python failed")
         return result.stdout
 
+    def spawn_remote_watch(
+        self, target: str, agent_path: str, interval: float
+    ) -> subprocess.Popen[str]:
+        """Start the resident remote watcher and return the live process (text stdout).
+
+        Runs `python3 <agent> watch --interval N` over the shared master; each line on
+        stdout is one changed path. The caller reads it in a thread and closes/kills the
+        process to stop. Uses -T (no PTY) so EOF/kill cleanly ends the remote python.
+        """
+        validate_target(target)
+        validate_remote_path(agent_path)
+        script = (
+            'p=$(remote_sandbox_path "$1") || exit 2\n'
+            'exec python3 -u "$p" watch --interval "$2"\n'
+        )
+        full_script = self._remote_path_function() + script
+        remote_command = " ".join(
+            [
+                "sh",
+                "-c",
+                shlex.quote(full_script),
+                "sh",
+                shlex.quote(agent_path),
+                shlex.quote(str(interval)),
+            ]
+        )
+        return subprocess.Popen(
+            [*self._ssh_batch_args(), "-T", target, remote_command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+
     def run_command(self, target: str, cwd: str, argv: tuple[str, ...]) -> CommandResult:
         if not argv:
             raise SshError("remote command is empty")
