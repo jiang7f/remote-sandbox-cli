@@ -167,6 +167,40 @@ def test_expected_echo_can_represent_a_synchronized_deletion(tmp_path: Path) -> 
         assert store.consume_expected_echo("remote", missing)
 
 
+def test_remote_events_are_imported_with_their_original_sequences(tmp_path: Path) -> None:
+    events = [
+        JournalEvent("remote", 4, EventKind.MODIFY, "a.py"),
+        JournalEvent("remote", 7, EventKind.MOVE, "old.py", "new.py"),
+    ]
+    with WorkspaceStore.open(tmp_path / "state.sqlite3") as store:
+        store.record_events(events)
+        store.record_events(events)
+
+        assert store.pending_events("remote", 0) == events
+        store.acknowledge("remote", 7)
+        assert store.acknowledged_sequence("remote") == 7
+
+
+def test_requeued_paths_are_durable_until_explicitly_cleared(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    with WorkspaceStore.open(database) as store:
+        store.requeue_paths(["b.py", "a.py"], "changed-during-transfer")
+
+    with WorkspaceStore.open(database) as store:
+        assert store.list_requeued_paths() == ("a.py", "b.py")
+        store.clear_requeued_paths(["a.py"])
+        assert store.list_requeued_paths() == ("b.py",)
+
+
+def test_expected_echo_can_be_inspected_without_consuming_it(tmp_path: Path) -> None:
+    expected = _fingerprint("a.py")
+    with WorkspaceStore.open(tmp_path / "state.sqlite3") as store:
+        store.set_expected_echo("remote", expected)
+
+        assert store.get_expected_echo("remote", "a.py") == expected
+        assert store.consume_expected_echo("remote", expected)
+
+
 def test_reconciliation_transaction_rolls_back_all_state(tmp_path: Path) -> None:
     with WorkspaceStore.open(tmp_path / "state.sqlite3") as store:
         event = store.append_event("local", EventKind.MODIFY, "a.py")

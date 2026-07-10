@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -7,10 +8,11 @@ import pytest
 
 import remote_sandbox.transport as transport_module
 from remote_sandbox._transport_remote import (
+    REMOTE_DELETE_EXPECTED_CODE,
     REMOTE_FINALIZE_RSYNC_CODE,
     REMOTE_STAGE_RSYNC_CODE,
 )
-from remote_sandbox.manifest import fingerprint_local
+from remote_sandbox.manifest import EntryFingerprint, fingerprint_local
 from remote_sandbox.transport import (
     LocalPairTransport,
     TransferBatch,
@@ -271,6 +273,88 @@ def test_delete_rejects_nonempty_directory_and_parent_symlink(tmp_path: Path) ->
     (local / "escape").symlink_to(outside, target_is_directory=True)
     with pytest.raises((ValueError, OSError, TransferError)):
         transport.delete_local(("escape/keep.txt",))
+
+
+def test_verified_local_delete_restores_replacement_racing_with_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    local.mkdir()
+    remote.mkdir()
+    path = "value.txt"
+    (local / path).write_bytes(b"expected")
+    expected = fingerprint_local(local, path, with_hash=True)
+    assert isinstance(expected, EntryFingerprint)
+    original_rename = os.rename
+    replaced = False
+
+    def replace_before_quarantine(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal replaced
+        if source == path and not replaced:
+            replaced = True
+            (local / path).write_bytes(b"concurrent")
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(
+        "remote_sandbox._transport_fingerprint.os.rename",
+        replace_before_quarantine,
+    )
+
+    result = LocalPairTransport(local, remote).delete_local({path: expected})
+
+    assert result.completed == ()
+    assert result.changed_during_transfer == (path,)
+    assert (local / path).read_bytes() == b"concurrent"
+
+
+def test_remote_verified_delete_program_preserves_fingerprint_mismatch(tmp_path: Path) -> None:
+    root = tmp_path / "remote"
+    root.mkdir()
+    path = "value.txt"
+    (root / path).write_bytes(b"expected")
+    expected = fingerprint_local(root, path, with_hash=True)
+    assert isinstance(expected, EntryFingerprint)
+    (root / path).write_bytes(b"concurrent")
+    payload = json.dumps(
+        {
+            "entries": [
+                {
+                    "path": expected.path,
+                    "missing": False,
+                    "kind": expected.kind.value,
+                    "size": expected.size,
+                    "mtime_ns": expected.mtime_ns,
+                    "mode": expected.mode,
+                    "link_target": expected.link_target,
+                    "content_hash": expected.content_hash,
+                }
+            ]
+        }
+    ).encode()
+
+    result = subprocess.run(
+        [sys.executable, "-c", REMOTE_DELETE_EXPECTED_CODE, str(root)],
+        input=payload,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr.decode()
+    assert json.loads(result.stdout) == {"completed": [], "changed": [path]}
+    assert (root / path).read_bytes() == b"concurrent"
 
 
 def test_remote_rsync_stage_and_finalize_programs_use_workspace_descriptors(

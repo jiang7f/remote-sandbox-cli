@@ -11,6 +11,210 @@ REMOTE_PREPARE_RSYNC_CODE = textwrap.dedent(
     """
 ).strip()
 
+REMOTE_DELETE_EXPECTED_CODE = textwrap.dedent(
+    r"""
+    import hashlib
+    import json
+    import os
+    import secrets
+    import stat
+    import sys
+
+    def open_dir(path, parent_fd=None):
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        return os.open(path, flags, dir_fd=parent_fd)
+
+    def valid(name):
+        parts = name.split("/")
+        if (
+            not name
+            or name.startswith("/")
+            or "\\" in name
+            or any(ord(char) < 32 or ord(char) == 127 for char in name)
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ValueError("invalid delete path")
+        return parts
+
+    def open_parent(root_fd, parts):
+        descriptor = os.dup(root_fd)
+        try:
+            for part in parts:
+                child = open_dir(part, descriptor)
+                os.close(descriptor)
+                descriptor = child
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def fingerprint(parent_fd, leaf, path):
+        try:
+            entry = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return {"path": path, "missing": True}
+        if stat.S_ISLNK(entry.st_mode):
+            target = os.readlink(leaf, dir_fd=parent_fd)
+            return {
+                "path": path,
+                "missing": False,
+                "kind": "symlink",
+                "size": None,
+                "mtime_ns": entry.st_mtime_ns,
+                "mode": entry.st_mode,
+                "link_target": target,
+                "content_hash": hashlib.sha256(os.fsencode(target)).hexdigest(),
+            }
+        if stat.S_ISDIR(entry.st_mode):
+            return {
+                "path": path,
+                "missing": False,
+                "kind": "dir",
+                "size": None,
+                "mtime_ns": entry.st_mtime_ns,
+                "mode": entry.st_mode,
+                "link_target": None,
+                "content_hash": None,
+            }
+        if not stat.S_ISREG(entry.st_mode):
+            return {
+                "path": path,
+                "missing": False,
+                "kind": "special",
+                "size": None,
+                "mtime_ns": entry.st_mtime_ns,
+                "mode": entry.st_mode,
+                "link_target": None,
+                "content_hash": None,
+            }
+        descriptor = os.open(
+            leaf,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        digest = hashlib.sha256()
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino):
+                raise RuntimeError("delete candidate changed while opening")
+            with os.fdopen(descriptor, "rb", closefd=False) as source:
+                while True:
+                    block = source.read(1024 * 1024)
+                    if not block:
+                        break
+                    digest.update(block)
+            after = os.fstat(descriptor)
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_size,
+                after.st_mtime_ns,
+            ) != (
+                entry.st_dev,
+                entry.st_ino,
+                entry.st_mode,
+                entry.st_size,
+                entry.st_mtime_ns,
+            ):
+                raise RuntimeError("delete candidate changed while hashing")
+        finally:
+            os.close(descriptor)
+        return {
+            "path": path,
+            "missing": False,
+            "kind": "file",
+            "size": entry.st_size,
+            "mtime_ns": entry.st_mtime_ns,
+            "mode": entry.st_mode,
+            "link_target": None,
+            "content_hash": digest.hexdigest(),
+        }
+
+    def matches(expected, observed):
+        if expected == observed:
+            return True
+        return (
+            not expected.get("missing", False)
+            and not observed.get("missing", False)
+            and expected.get("kind") == "dir"
+            and observed.get("kind") == "dir"
+            and expected.get("mode") == observed.get("mode")
+        )
+
+    def restore(parent_fd, quarantine, leaf):
+        try:
+            os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        try:
+            os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            os.rename(quarantine, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            return
+        recovery = ".remote-sandbox-recovered-" + secrets.token_hex(8)
+        os.rename(quarantine, recovery, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        raise RuntimeError("concurrent replacement preserved as " + recovery)
+
+    request = json.load(sys.stdin)
+    entries = request.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("delete entries must be a list")
+    root_fd = open_dir(sys.argv[1])
+    completed = []
+    changed = []
+    try:
+        for expected in entries:
+            if not isinstance(expected, dict) or not isinstance(expected.get("path"), str):
+                raise ValueError("invalid expected delete entry")
+            path = expected["path"]
+            parts = valid(path)
+            try:
+                parent_fd = open_parent(root_fd, parts[:-1])
+            except FileNotFoundError:
+                if expected.get("missing") is True:
+                    completed.append(path)
+                else:
+                    changed.append(path)
+                continue
+            quarantine = ".remote-sandbox-delete-" + secrets.token_hex(8)
+            try:
+                try:
+                    os.rename(
+                        parts[-1],
+                        quarantine,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                    )
+                except FileNotFoundError:
+                    if expected.get("missing") is True:
+                        completed.append(path)
+                    else:
+                        changed.append(path)
+                    continue
+                try:
+                    observed = fingerprint(parent_fd, quarantine, path)
+                    if not matches(expected, observed):
+                        restore(parent_fd, quarantine, parts[-1])
+                        changed.append(path)
+                        continue
+                    entry = os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
+                    if stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
+                        os.rmdir(quarantine, dir_fd=parent_fd)
+                    else:
+                        os.unlink(quarantine, dir_fd=parent_fd)
+                    completed.append(path)
+                except BaseException:
+                    restore(parent_fd, quarantine, parts[-1])
+                    raise
+            finally:
+                os.close(parent_fd)
+    finally:
+        os.close(root_fd)
+    print(json.dumps({"completed": completed, "changed": changed}, separators=(",", ":")))
+    """
+).strip()
+
 REMOTE_STAGE_RSYNC_CODE = textwrap.dedent(
     r"""
     import os

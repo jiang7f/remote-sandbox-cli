@@ -55,16 +55,37 @@ class LocalPairTransport:
                 self._transfer_tar(batch, source, destination)
             return self._verify(batch, source, destination, before, on_progress)
 
-    def delete_local(self, paths: tuple[str, ...]) -> None:
-        self._delete(self._local_root, paths)
+    def delete_local(
+        self,
+        paths: tuple[str, ...] | Mapping[str, FingerprintState],
+    ) -> TransferResult:
+        return self._delete_verified(self._local_root, paths)
 
-    def delete_remote(self, paths: tuple[str, ...]) -> None:
-        self._delete(self._remote_root, paths)
+    def delete_remote(
+        self,
+        paths: tuple[str, ...] | Mapping[str, FingerprintState],
+    ) -> TransferResult:
+        return self._delete_verified(self._remote_root, paths)
 
     def _roots(self, direction: TransferDirection) -> tuple[Path, Path]:
         if direction is TransferDirection.PUSH:
             return self._local_root, self._remote_root
         return self._remote_root, self._local_root
+
+    @staticmethod
+    def _delete_verified(
+        root: Path,
+        paths: tuple[str, ...] | Mapping[str, FingerprintState],
+    ) -> TransferResult:
+        if not isinstance(paths, Mapping):
+            normalized = _normalized_delete_paths(paths)
+            LocalPairTransport._delete(root, normalized)
+            return TransferResult(normalized, ())
+        normalized_paths = _normalized_delete_paths(paths)
+        expected = {path: paths[path] for path in normalized_paths}
+        with ProtectedLocalRoot(root) as protected:
+            completed, changed = protected.delete_expected(expected, error_type=TransferError)
+        return TransferResult(completed, changed)
 
     def _preflight(
         self,

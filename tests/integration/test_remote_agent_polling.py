@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -207,6 +208,34 @@ def test_zipapp_hash_paths_returns_only_requested_strong_fingerprints(tmp_path: 
         "link_target": None,
         "content_hash": None,
     }
+
+    metadata_result = _agent_call(
+        archive,
+        AgentRequest(
+            "metadata-paths",
+            {"workspace_id": workspace_id, "paths": ["requested.txt", "missing.txt"]},
+        ),
+        env,
+    )
+    assert metadata_result.returncode == 0
+    metadata_entries = {
+        str(entry["path"]): entry
+        for entry in decode_response(metadata_result.stdout).payload["entries"]
+    }
+    assert metadata_entries["requested.txt"]["content_hash"] is None
+    assert metadata_entries["missing.txt"]["kind"] == "missing"
+
+    content_result = _agent_call(
+        archive,
+        AgentRequest(
+            "read-path",
+            {"workspace_id": workspace_id, "path": "requested.txt"},
+        ),
+        env,
+    )
+    assert content_result.returncode == 0
+    content_payload = decode_response(content_result.stdout).payload
+    assert base64.b64decode(str(content_payload["data"])) == b"requested content"
 
 
 def test_zipapp_manages_detached_watcher_journal_and_safe_forget(tmp_path: Path) -> None:

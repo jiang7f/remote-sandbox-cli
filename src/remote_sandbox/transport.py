@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import posixpath
 import re
@@ -21,6 +22,7 @@ from remote_sandbox._transport_fingerprint import (
 from remote_sandbox._transport_remote import (
     REMOTE_CLEANUP_RSYNC_CODE,
     REMOTE_CREATE_CODE,
+    REMOTE_DELETE_EXPECTED_CODE,
     REMOTE_EXTRACT_CODE,
     REMOTE_FINALIZE_RSYNC_CODE,
     REMOTE_PREPARE_RSYNC_CODE,
@@ -51,6 +53,10 @@ _SAFE_RSYNC_REMOTE = re.compile(r"\A[A-Za-z0-9_./@+-]+\Z")
 
 
 class TransferError(RuntimeError):
+    pass
+
+
+class TransferPreflightError(TransferError):
     pass
 
 
@@ -294,12 +300,52 @@ class BatchTransport:
                 on_progress,
             )
 
-    def delete_local(self, paths: Iterable[str]) -> None:
-        LocalPairTransport._delete(self._local_root, tuple(paths))
+    def delete_local(
+        self,
+        paths: Iterable[str] | Mapping[str, FingerprintState],
+    ) -> TransferResult:
+        if not isinstance(paths, Mapping):
+            normalized = _normalized_delete_paths(paths)
+            LocalPairTransport._delete(self._local_root, normalized)
+            return TransferResult(normalized, ())
+        expected = _normalized_delete_expectations(paths)
+        with ProtectedLocalRoot(self._local_root) as local:
+            completed, changed = local.delete_expected(expected, error_type=TransferError)
+        return TransferResult(completed, changed)
 
-    def delete_remote(self, paths: Iterable[str]) -> None:
-        for path in _normalized_delete_paths(paths):
-            self._runner.delete_workspace_path(self._target, self._remote_root, path)
+    def delete_remote(
+        self,
+        paths: Iterable[str] | Mapping[str, FingerprintState],
+    ) -> TransferResult:
+        if not isinstance(paths, Mapping):
+            normalized = _normalized_delete_paths(paths)
+            for path in normalized:
+                self._runner.delete_workspace_path(self._target, self._remote_root, path)
+            return TransferResult(normalized, ())
+        expected = _normalized_delete_expectations(paths)
+        payload = json.dumps(
+            {"entries": [_encode_delete_entry(entry) for entry in expected.values()]},
+            separators=(",", ":"),
+        ).encode()
+        result = self._runner.run_workspace_python_bytes(
+            self._target,
+            self._remote_root,
+            REMOTE_DELETE_EXPECTED_CODE,
+            payload,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            raise TransferError(detail or "verified remote delete failed")
+        try:
+            decoded = json.loads(result.stdout)
+            completed = tuple(decoded["completed"])
+            changed = tuple(decoded["changed"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise TransferError("verified remote delete returned malformed output") from exc
+        response = TransferResult(completed, changed)
+        if set(response.completed) | set(response.changed_during_transfer) != set(expected):
+            raise TransferError("verified remote delete returned incomplete paths")
+        return response
 
     def _remote_snapshot(self, paths: tuple[str, ...]) -> dict[str, FingerprintState]:
         observed = self._remote.hash_paths(paths)
@@ -589,14 +635,59 @@ def _validated_result_paths(paths: tuple[str, ...], label: str) -> tuple[str, ..
     return normalized
 
 
+def _normalized_delete_expectations(
+    expected: Mapping[str, FingerprintState],
+) -> dict[str, FingerprintState]:
+    if not expected:
+        return {}
+    paths = _normalized_delete_paths(expected)
+    normalized: dict[str, FingerprintState] = {}
+    for path in paths:
+        entry = expected[path]
+        if type(entry) not in {EntryFingerprint, MissingEntry} or entry.path != path:
+            raise ValueError(f"invalid expected deletion fingerprint: {path}")
+        normalized[path] = entry
+    return normalized
+
+
+def _encode_delete_entry(entry: FingerprintState) -> dict[str, object]:
+    if isinstance(entry, MissingEntry):
+        return {"path": entry.path, "missing": True}
+    return {
+        "path": entry.path,
+        "missing": False,
+        "kind": entry.kind.value,
+        "size": entry.size,
+        "mtime_ns": entry.mtime_ns,
+        "mode": entry.mode,
+        "link_target": entry.link_target,
+        "content_hash": entry.content_hash,
+    }
+
+
 def _require_expected(
     path: str,
     side: str,
     expected: FingerprintState | None,
     observed: FingerprintState,
 ) -> None:
-    if expected is not None and expected != observed:
-        raise TransferError(f"preflight {side} fingerprint mismatch: {path}")
+    if expected is not None and not _matches_expected(expected, observed):
+        raise TransferPreflightError(f"preflight {side} fingerprint mismatch: {path}")
+
+
+def _matches_expected(expected: FingerprintState, observed: FingerprintState) -> bool:
+    if expected == observed:
+        return True
+    return (
+        isinstance(expected, EntryFingerprint)
+        and isinstance(observed, EntryFingerprint)
+        and expected.kind is EntryKind.FILE
+        and observed.kind is EntryKind.FILE
+        and expected.content_hash is None
+        and expected.size == observed.size
+        and expected.mtime_ns == observed.mtime_ns
+        and expected.mode == observed.mode
+    )
 
 
 def _same_content(source: FingerprintState, destination: FingerprintState) -> bool:

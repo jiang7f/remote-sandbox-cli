@@ -3,7 +3,9 @@ from __future__ import annotations
 import errno
 import hashlib
 import os
+import secrets
 import stat
+from collections.abc import Mapping
 from pathlib import Path
 
 from remote_sandbox._transport_paths import (
@@ -108,6 +110,100 @@ class ProtectedLocalRoot:
     ) -> None:
         delete_entries_from_fd(self._descriptor, paths, error_type=error_type)
 
+    def delete_expected(
+        self,
+        expected: Mapping[str, EntryFingerprint | MissingEntry],
+        *,
+        error_type: type[Exception],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        completed: list[str] = []
+        changed: list[str] = []
+        for path, expected_entry in expected.items():
+            if self._quarantine_delete(path, expected_entry, error_type=error_type):
+                completed.append(path)
+            else:
+                changed.append(path)
+        return tuple(completed), tuple(changed)
+
+    def read_entry(
+        self,
+        relative_path: str,
+    ) -> tuple[EntryFingerprint | MissingEntry, bytes | None]:
+        normalized = normalize_relative_path(relative_path)
+        parts = normalized.split("/")
+        try:
+            parent_fd, chain = _open_verified_parent(self._descriptor, parts[:-1])
+        except FileNotFoundError:
+            return MissingEntry(normalized), None
+        try:
+            try:
+                entry = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return MissingEntry(normalized), None
+            fingerprint, content = _read_leaf(parent_fd, parts[-1], normalized, entry)
+            _verify_leaf(parent_fd, parts[-1], entry, normalized)
+            _verify_parent_chain(chain, normalized)
+            return fingerprint, content
+        finally:
+            os.close(parent_fd)
+            for descriptor, _name, _identity in chain:
+                os.close(descriptor)
+
+    def _quarantine_delete(
+        self,
+        relative_path: str,
+        expected: EntryFingerprint | MissingEntry,
+        *,
+        error_type: type[Exception],
+    ) -> bool:
+        normalized = normalize_relative_path(relative_path)
+        if expected.path != normalized:
+            raise ValueError("expected deletion fingerprint path does not match")
+        parts = normalized.split("/")
+        try:
+            parent_fd, chain = _open_verified_parent(self._descriptor, parts[:-1])
+        except FileNotFoundError:
+            return isinstance(expected, MissingEntry)
+        quarantine = f".remote-sandbox-delete-{secrets.token_hex(8)}"
+        try:
+            try:
+                os.rename(
+                    parts[-1],
+                    quarantine,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                return isinstance(expected, MissingEntry)
+            try:
+                entry = os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
+                observed = _fingerprint_leaf(
+                    parent_fd,
+                    quarantine,
+                    normalized,
+                    entry,
+                    with_hash=True,
+                )
+                _verify_leaf(parent_fd, quarantine, entry, normalized)
+                _verify_parent_chain(chain, normalized)
+                if not _matches_expected(expected, observed):
+                    _restore_quarantine(parent_fd, quarantine, parts[-1], error_type)
+                    return False
+                if stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
+                    os.rmdir(quarantine, dir_fd=parent_fd)
+                else:
+                    os.unlink(quarantine, dir_fd=parent_fd)
+                return True
+            except BaseException:
+                _restore_quarantine(parent_fd, quarantine, parts[-1], error_type)
+                raise
+        except OSError as exc:
+            raise error_type(f"verified workspace delete failed: {normalized}: {exc}") from exc
+        finally:
+            os.close(parent_fd)
+            for descriptor, _name, _identity in chain:
+                os.close(descriptor)
+
 
 ParentIdentity = tuple[int, int]
 ParentChain = list[tuple[int, str, ParentIdentity]]
@@ -201,6 +297,138 @@ def _fingerprint_leaf(
         entry.st_mtime_ns,
         entry.st_mode,
     )
+
+
+def _read_leaf(
+    parent_fd: int,
+    leaf: str,
+    path: str,
+    entry: os.stat_result,
+) -> tuple[EntryFingerprint, bytes]:
+    if stat.S_ISLNK(entry.st_mode):
+        target = os.readlink(leaf, dir_fd=parent_fd)
+        content = os.fsencode(target)
+        return (
+            EntryFingerprint(
+                path,
+                EntryKind.SYMLINK,
+                None,
+                entry.st_mtime_ns,
+                entry.st_mode,
+                target,
+                hashlib.sha256(content).hexdigest(),
+            ),
+            content,
+        )
+    if stat.S_ISDIR(entry.st_mode):
+        return (
+            EntryFingerprint(
+                path,
+                EntryKind.DIR,
+                None,
+                entry.st_mtime_ns,
+                entry.st_mode,
+            ),
+            b"",
+        )
+    if not stat.S_ISREG(entry.st_mode):
+        return (
+            EntryFingerprint(
+                path,
+                EntryKind.SPECIAL,
+                None,
+                entry.st_mtime_ns,
+                entry.st_mode,
+            ),
+            b"",
+        )
+    descriptor = os.open(
+        leaf,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino):
+            raise LocalPathChanged(f"read leaf changed: {path}")
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            content = source.read()
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+        ) != (
+            entry.st_dev,
+            entry.st_ino,
+            entry.st_mode,
+            entry.st_size,
+            entry.st_mtime_ns,
+        ):
+            raise LocalPathChanged(f"read leaf changed: {path}")
+    finally:
+        os.close(descriptor)
+    return (
+        EntryFingerprint(
+            path,
+            EntryKind.FILE,
+            entry.st_size,
+            entry.st_mtime_ns,
+            entry.st_mode,
+            content_hash=hashlib.sha256(content).hexdigest(),
+        ),
+        content,
+    )
+
+
+def _matches_expected(
+    expected: EntryFingerprint | MissingEntry,
+    observed: EntryFingerprint | MissingEntry,
+) -> bool:
+    if expected == observed:
+        return True
+    if (
+        isinstance(expected, EntryFingerprint)
+        and isinstance(observed, EntryFingerprint)
+        and expected.kind is EntryKind.DIR
+        and observed.kind is EntryKind.DIR
+        and expected.mode == observed.mode
+    ):
+        return True
+    return (
+        isinstance(expected, EntryFingerprint)
+        and isinstance(observed, EntryFingerprint)
+        and expected.kind is EntryKind.FILE
+        and observed.kind is EntryKind.FILE
+        and expected.content_hash is None
+        and expected.size == observed.size
+        and expected.mtime_ns == observed.mtime_ns
+        and expected.mode == observed.mode
+    )
+
+
+def _restore_quarantine(
+    parent_fd: int,
+    quarantine: str,
+    leaf: str,
+    error_type: type[Exception],
+) -> None:
+    try:
+        os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    try:
+        os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        os.rename(quarantine, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    else:
+        recovery = f".remote-sandbox-recovered-{secrets.token_hex(8)}"
+        os.rename(quarantine, recovery, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        raise error_type(
+            f"concurrent replacement preserved as {recovery} while restoring {leaf}"
+        )
 
 
 def _verify_leaf(

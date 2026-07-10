@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,7 +24,7 @@ from remote_sandbox.manifest import (
 )
 from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _JSON_SCHEMA_VERSION = 1
 _SIDES = frozenset({"local", "remote"})
 
@@ -192,6 +192,42 @@ class WorkspaceStore:
             )
         return event
 
+    def record_events(self, events: Iterable[JournalEvent]) -> None:
+        if isinstance(events, (str, bytes)):
+            raise ValueError("events must be an iterable of JournalEvent values")
+        recorded = tuple(events)
+        if any(type(event) is not JournalEvent for event in recorded):
+            raise ValueError("events must contain JournalEvent values")
+        with self.transaction():
+            for event in recorded:
+                existing = self._connection.execute(
+                    """
+                    SELECT side, sequence, kind, path, destination_path
+                    FROM events WHERE side = ? AND sequence = ?
+                    """,
+                    (event.side, event.sequence),
+                ).fetchone()
+                if existing is not None:
+                    if _journal_event_from_row(existing) != event:
+                        raise RuntimeError(
+                            f"journal sequence {event.sequence} for {event.side} changed"
+                        )
+                    continue
+                self._connection.execute(
+                    """
+                    INSERT INTO events(side, sequence, kind, path, destination_path, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.side,
+                        event.sequence,
+                        event.kind.value,
+                        event.path,
+                        event.destination_path,
+                        time.time(),
+                    ),
+                )
+
     def pending_events(self, side: str, after_sequence: int) -> list[JournalEvent]:
         _validate_side(side)
         _validate_non_negative_int(after_sequence, "after_sequence")
@@ -325,6 +361,25 @@ class WorkspaceStore:
                 (side, fingerprint.path, _encode_expected_echo(fingerprint), time.time()),
             )
 
+    def get_expected_echo(
+        self,
+        side: str,
+        path: str,
+    ) -> EntryFingerprint | MissingEntry | None:
+        _validate_side(side)
+        normalized = normalize_relative_path(path)
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT fingerprint_json FROM expected_echoes
+                WHERE side = ? AND path = ?
+                """,
+                (side, normalized),
+            ).fetchone()
+        if row is None:
+            return None
+        return _decode_expected_echo(row["fingerprint_json"], expected_path=normalized)
+
     def consume_expected_echo(
         self,
         side: str,
@@ -354,6 +409,40 @@ class WorkspaceStore:
                 (side, fingerprint.path),
             )
             return True
+
+    def requeue_paths(self, paths: Iterable[str], reason: str) -> None:
+        if isinstance(paths, (str, bytes)):
+            raise ValueError("requeue paths must be an iterable of relative paths")
+        if type(reason) is not str or not reason:
+            raise ValueError("requeue reason must not be empty")
+        normalized = tuple(sorted({normalize_relative_path(path) for path in paths}))
+        with self.transaction():
+            self._connection.executemany(
+                """
+                INSERT INTO requeued_paths(path, reason, created_at) VALUES (?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    reason = excluded.reason,
+                    created_at = excluded.created_at
+                """,
+                ((path, reason, time.time()) for path in normalized),
+            )
+
+    def list_requeued_paths(self) -> tuple[str, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT path FROM requeued_paths ORDER BY path"
+            ).fetchall()
+        return tuple(_expect_str(row["path"], "requeued path") for row in rows)
+
+    def clear_requeued_paths(self, paths: Iterable[str]) -> None:
+        if isinstance(paths, (str, bytes)):
+            raise ValueError("requeue paths must be an iterable of relative paths")
+        normalized = tuple(sorted({normalize_relative_path(path) for path in paths}))
+        with self.transaction():
+            self._connection.executemany(
+                "DELETE FROM requeued_paths WHERE path = ?",
+                ((path,) for path in normalized),
+            )
 
     def create_conflict(
         self,
@@ -457,6 +546,8 @@ class WorkspaceStore:
                 self._create_current_schema()
             elif version == 1:
                 self._migrate_legacy_base_entries()
+                self._create_current_schema()
+            elif version == 2:
                 self._create_current_schema()
             self._connection.execute(
                 """
@@ -593,6 +684,13 @@ class WorkspaceStore:
             """
             CREATE INDEX IF NOT EXISTS conflicts_path_unresolved
             ON conflicts(path, resolved_at)
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS requeued_paths (
+                path TEXT PRIMARY KEY,
+                reason TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
             """,
         )
         for statement in statements:

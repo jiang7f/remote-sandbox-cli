@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import subprocess
@@ -147,22 +148,94 @@ class RemoteWorkspaceClient:
         self,
         paths: Iterable[str],
     ) -> dict[str, EntryFingerprint | MissingEntry]:
+        return self._fingerprint_paths("hash-paths", paths)
+
+    def metadata_paths(
+        self,
+        paths: Iterable[str],
+    ) -> dict[str, EntryFingerprint | MissingEntry]:
+        entries = self._fingerprint_paths("metadata-paths", paths)
+        if any(
+            isinstance(entry, EntryFingerprint)
+            and entry.kind is EntryKind.FILE
+            and entry.content_hash is not None
+            for entry in entries.values()
+        ):
+            raise RemoteProtocolError("remote metadata payload contains a regular file hash")
+        return entries
+
+    def events_after(self, after_sequence: int) -> list[JournalEvent]:
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise ValueError("after_sequence must be a non-negative integer")
+        if self._closed:
+            raise RuntimeError("remote workspace client is closed")
+        request = AgentRequest(
+            "events",
+            {
+                "workspace_id": self._workspace_id,
+                "after_sequence": after_sequence,
+                "follow": False,
+            },
+        )
+        result = self._runner.run_python_file_bytes(
+            self._target,
+            self._agent_path,
+            encode_request(request),
+            ("events",),
+        )
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            if result.stdout.strip():
+                try:
+                    response = decode_response(result.stdout.strip())
+                except (json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError, ValueError):
+                    pass
+                else:
+                    detail = response.error or detail
+            raise RemoteProtocolError(detail or "remote event read failed")
+        events = [parse_event_line(line) for line in result.stdout.splitlines() if line]
+        previous = after_sequence
+        for event in events:
+            if event.sequence <= previous:
+                raise RemoteProtocolError("remote event sequence is not strictly increasing")
+            previous = event.sequence
+        return events
+
+    def read_path(self, path: str) -> bytes | None:
+        normalized = normalize_relative_path(path)
+        payload = self._call("read-path", {"path": normalized})
+        missing = payload.get("missing")
+        data = payload.get("data")
+        if missing is True and data is None:
+            return None
+        if missing is not False or not isinstance(data, str):
+            raise RemoteProtocolError("remote path content payload is malformed")
+        try:
+            return base64.b64decode(data, validate=True)
+        except ValueError as exc:
+            raise RemoteProtocolError("remote path content payload is malformed") from exc
+
+    def _fingerprint_paths(
+        self,
+        command: str,
+        paths: Iterable[str],
+    ) -> dict[str, EntryFingerprint | MissingEntry]:
         requested = [normalize_relative_path(path) for path in paths]
         if len(requested) != len(set(requested)):
-            raise ValueError("hash paths must be unique")
-        payload = self._call("hash-paths", {"paths": requested})
+            raise ValueError("fingerprint paths must be unique")
+        payload = self._call(command, {"paths": requested})
         raw_entries = payload.get("entries")
         if not isinstance(raw_entries, list):
-            raise RemoteProtocolError("remote hash payload is malformed")
+            raise RemoteProtocolError("remote fingerprint payload is malformed")
         entries: dict[str, EntryFingerprint | MissingEntry] = {}
         for raw_entry in raw_entries:
             entry = _parse_fingerprint(raw_entry)
             path = entry.path
             if path is None or path in entries:
-                raise RemoteProtocolError("remote hash payload contains an invalid entry")
+                raise RemoteProtocolError("remote fingerprint payload contains an invalid entry")
             entries[path] = entry
         if set(entries) != set(requested):
-            raise RemoteProtocolError("remote hash payload does not match requested paths")
+            raise RemoteProtocolError("remote fingerprint payload does not match requested paths")
         return entries
 
     def acknowledge(self, sequence: int) -> int:

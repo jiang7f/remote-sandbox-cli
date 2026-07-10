@@ -169,6 +169,24 @@ class RawRunner:
         return self.result
 
 
+class ForegroundEventsRunner(RecordingRunner):
+    def run_python_file_bytes(
+        self,
+        target: str,
+        path: str,
+        input_data: bytes,
+        args: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess[bytes]:
+        self.calls.append((target, path, input_data, args))
+        return subprocess.CompletedProcess(
+            ["ssh"],
+            0,
+            b'{"sequence":4,"kind":"move","path":"old.py",'
+            b'"destination_path":"new.py"}\n',
+            b"",
+        )
+
+
 class RecordingAgentManager:
     def __init__(self, install: AgentInstall) -> None:
         self.install = install
@@ -375,6 +393,80 @@ def test_remote_hash_paths_requests_and_returns_only_selected_paths() -> None:
             },
         )
     ]
+
+
+def test_remote_metadata_paths_never_returns_regular_file_hashes() -> None:
+    runner = RecordingRunner(
+        {
+            "metadata-paths": {
+                "entries": [
+                    {
+                        "path": "requested.txt",
+                        "kind": "file",
+                        "size": 7,
+                        "mtime_ns": 21,
+                        "mode": 33188,
+                        "link_target": None,
+                        "content_hash": None,
+                    }
+                ]
+            }
+        }
+    )
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="agent.pyz",
+    )
+
+    entries = client.metadata_paths(["requested.txt"])
+
+    assert entries["requested.txt"].content_hash is None
+    request = decode_request(runner.calls[0][2])
+    assert request.command == "metadata-paths"
+    assert request.payload["paths"] == ["requested.txt"]
+
+
+def test_remote_events_after_uses_finite_structured_event_command() -> None:
+    runner = ForegroundEventsRunner({})
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="agent.pyz",
+    )
+
+    events = client.events_after(3)
+
+    assert [(event.sequence, event.path, event.destination_path) for event in events] == [
+        (4, "old.py", "new.py")
+    ]
+    request = decode_request(runner.calls[0][2])
+    assert request.command == "events"
+    assert request.payload == {
+        "workspace_id": "w1",
+        "after_sequence": 3,
+        "follow": False,
+    }
+    assert runner.calls[0][3] == ("events",)
+
+
+def test_remote_read_path_returns_structured_binary_content() -> None:
+    runner = RecordingRunner(
+        {"read-path": {"missing": False, "data": "YmluYXJ5AGRhdGE="}}
+    )
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="agent.pyz",
+    )
+
+    assert client.read_path("data.bin") == b"binary\0data"
+    request = decode_request(runner.calls[0][2])
+    assert request.command == "read-path"
+    assert request.payload == {"workspace_id": "w1", "path": "data.bin"}
 
 
 def test_subscription_restarts_after_last_acknowledged_sequence() -> None:
