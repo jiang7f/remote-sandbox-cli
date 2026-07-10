@@ -818,6 +818,7 @@ git commit -m "feat: add safe entry fingerprints"
 - Produces: `WorkspaceStore.pending_events(side, after_sequence) -> list[JournalEvent]`
 - Produces: `WorkspaceStore.acknowledge(side, through_sequence) -> None`
 - Produces: `WorkspaceStore.set_status(status) -> None`
+- Produces: `WorkspaceStore.replace_base(entries: Mapping[str, EntryFingerprint]) -> None`
 - Produces: `WorkspaceStore.create_conflict(...) -> ConflictRecord`
 
 - [ ] **Step 1: Write failing status, journal, and conflict tests**
@@ -2103,7 +2104,6 @@ git commit -m "feat: add verified batch transport"
 - Produces: `SyncEngine`
 - Produces: `SyncEngine.run_once(reason: str) -> EngineResult`
 - Produces: `SyncEngine.audit() -> EngineResult`
-- Produces: `SyncEngine.seed_base_from_current_replicas() -> None` for initial-sync and integration setup
 - Produces: `SyncEngine.seed_base_from_transfer(batch, completed_paths) -> None`
 - Produces: `SyncEngine.requeue_paths(paths, reason) -> None`
 - Produces: `SyncEngine.apply_initial_placeholders(placeholders) -> None`
@@ -2153,6 +2153,10 @@ class SyncPair:
     remote_client: LocalReplicaClient
     transport: ControllableLocalPairTransport
     engine: SyncEngine
+
+    def seed_current_base(self) -> None:
+        entries = snapshot_matching_replicas(self.local, self.remote, with_hash=True)
+        self.store.replace_base(entries)
 
     def append_local_modify(self, path: str, content: bytes) -> None:
         destination = self.local / path
@@ -2275,7 +2279,7 @@ def test_local_modify_and_remote_delete_are_reconciled_incrementally(sync_pair: 
     (sync_pair.remote / "local.txt").write_text("old", encoding="utf-8")
     (sync_pair.local / "remote.txt").write_text("delete", encoding="utf-8")
     (sync_pair.remote / "remote.txt").write_text("delete", encoding="utf-8")
-    sync_pair.engine.seed_base_from_current_replicas()
+    sync_pair.seed_current_base()
 
     sync_pair.append_local_modify("local.txt", b"new")
     sync_pair.append_remote_delete("remote.txt")
@@ -2798,6 +2802,7 @@ class DaemonPairHarness:
     supervisor: WorkspaceSupervisor
     client: SupervisorClient
     remote_client: LocalReplicaClient
+    process: Popen[bytes]
 
     def append_remote_change(self, path: str, content: bytes) -> None:
         destination = self.remote / path
@@ -2806,7 +2811,8 @@ class DaemonPairHarness:
         self.remote_client.append_event(EventKind.MODIFY, path)
 
     def kill_local_daemon(self) -> None:
-        self.client.kill_for_test()
+        self.process.kill()
+        self.process.wait(timeout=2.0)
 
     def start_local_daemon(self) -> None:
         self.client.start()
@@ -3036,7 +3042,8 @@ class FakeManagedPtySession:
 @dataclass(slots=True)
 class FakePtyBackendHarness:
     def open_enter_shell(self) -> FakeManagedPtySession:
-        session = ManagedShellSession.for_test(remote_shell_pid=4242)
+        backend = FakePtyBackend(remote_shell_pid=4242)
+        session = ManagedShellSession(backend=backend, nonce="test-nonce")
         return FakeManagedPtySession(4242, "", "enter", session)
 ```
 
