@@ -486,6 +486,7 @@ class SubprocessSshRunner:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=_tar_env(),
         )
         ssh = subprocess.Popen(
             self._ssh_exec(target, remote_cmd),
@@ -525,6 +526,7 @@ class SubprocessSshRunner:
             stdin=ssh.stdout,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=_tar_env(),
         )
         self._drive_tar_pipeline(ssh, tar, name_blob, direction="pull")
 
@@ -910,6 +912,16 @@ def _workspace_root_from_agent_path(agent_path: str) -> str:
         raise SshError(f"Invalid agent path: {agent_path}")
     root = agent_path[: -len(suffix)]
     return root or "/"
+
+
+def _tar_env() -> dict[str, str]:
+    """Env for the local tar so macOS bsdtar does not emit AppleDouble `._*` sidecars.
+
+    Without COPYFILE_DISABLE, bsdtar packs a `._name` companion (xattrs/resource fork) for
+    every file; extracted on the Linux remote those become stray `._*` files that clutter
+    the tree. GNU tar ignores the variable, so it is safe to set unconditionally.
+    """
+    return {**os.environ, "COPYFILE_DISABLE": "1"}
 
 
 def _fake_agent_selfcheck(source: str) -> str:
