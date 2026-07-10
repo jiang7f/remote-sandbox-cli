@@ -19,7 +19,7 @@ from remote_sandbox.manifest import (
 )
 
 
-class LocalPathChanged(RuntimeError):
+class LocalPathChanged(ValueError):
     pass
 
 
@@ -120,7 +120,7 @@ def _open_verified_parent(root_fd: int, parts: list[str]) -> tuple[int, ParentCh
         for part in parts:
             before = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
             if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
-                raise ValueError(f"symlink parent escapes workspace: {part}")
+                raise LocalPathChanged(f"symlink parent changed: {part}")
             parent_copy = os.dup(descriptor)
             try:
                 child = _open_directory(part, dir_fd=descriptor)

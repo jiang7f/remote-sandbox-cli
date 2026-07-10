@@ -1,19 +1,50 @@
 from __future__ import annotations
 
 import os
+import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
 
 import remote_sandbox._transport_fingerprint as fingerprint_module
 from remote_sandbox._transport_fingerprint import LocalPathChanged, ProtectedLocalRoot
+from remote_sandbox.manifest import EntryFingerprint, MissingEntry, fingerprint_local
 from remote_sandbox.transport import (
+    BatchTransport,
     LocalPairTransport,
+    RsyncCapabilities,
     TransferBatch,
     TransferDirection,
     TransferItem,
     TransferResult,
 )
+
+
+class _RemoteFingerprinter:
+    def __init__(self, responses: Iterable[dict[str, EntryFingerprint | MissingEntry]]) -> None:
+        self._responses = iter(responses)
+
+    def hash_paths(
+        self,
+        _paths: Iterable[str],
+    ) -> dict[str, EntryFingerprint | MissingEntry]:
+        return next(self._responses)
+
+
+class _Runner:
+    def run_workspace_python_bytes(
+        self,
+        _target: str,
+        _root: str,
+        _code: str,
+        _input_data: bytes,
+        _args: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(["ssh"], 0, b"", b"")
+
+    def delete_workspace_path(self, _target: str, _root: str, _path: str) -> None:
+        raise AssertionError("delete is not expected")
 
 
 def _recording_hash(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
@@ -143,3 +174,96 @@ def test_transport_postflight_reports_parent_swap_as_changed(
     assert result.changed_during_transfer == ("safe/value.txt",)
     assert progress == []
     assert observed == [b"inside", b"inside"]
+
+
+def test_local_pair_postflight_initial_symlink_parent_is_reported_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    outside = tmp_path / "outside"
+    source.mkdir()
+    destination.mkdir()
+    outside.mkdir()
+    (source / "safe").mkdir()
+    (source / "safe" / "value.txt").write_text("inside", encoding="utf-8")
+    (outside / "value.txt").write_text("outside", encoding="utf-8")
+    observed = _recording_hash(monkeypatch)
+    transport = LocalPairTransport(source, destination, engine="tar")
+    original = transport._transfer_tar
+
+    def transfer_then_swap(*args: object) -> None:
+        original(*args)
+        (source / "safe").rename(source / "original-safe")
+        (source / "safe").symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(transport, "_transfer_tar", transfer_then_swap)
+    progress: list[TransferResult] = []
+    result = transport.transfer(
+        TransferBatch(
+            TransferDirection.PUSH,
+            (TransferItem("safe/value.txt", None, None),),
+        ),
+        progress.append,
+    )
+    assert result.completed == ()
+    assert result.changed_during_transfer == ("safe/value.txt",)
+    assert progress == []
+    assert observed == [b"inside"]
+
+
+def test_batch_transport_postflight_initial_symlink_parent_is_reported_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    outside = tmp_path / "outside"
+    source_root.mkdir()
+    outside.mkdir()
+    (source_root / "safe").mkdir()
+    (source_root / "safe" / "value.txt").write_text("inside", encoding="utf-8")
+    (outside / "value.txt").write_text("outside", encoding="utf-8")
+    source = fingerprint_local(source_root, "safe/value.txt", with_hash=True)
+    assert isinstance(source, EntryFingerprint)
+    remote = _RemoteFingerprinter(
+        [
+            {"safe/value.txt": MissingEntry("safe/value.txt")},
+            {"safe/value.txt": source},
+        ]
+    )
+    observed = _recording_hash(monkeypatch)
+    transport = BatchTransport(
+        source_root,
+        "host",
+        "/remote with space",
+        remote,
+        runner=_Runner(),
+        capabilities=RsyncCapabilities(False, False),
+    )
+    original = transport._transfer_tar
+
+    def transfer_then_swap(*args: object) -> None:
+        original(*args)
+        (source_root / "safe").rename(source_root / "original-safe")
+        (source_root / "safe").symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(transport, "_transfer_tar", transfer_then_swap)
+    progress: list[TransferResult] = []
+    result = transport.transfer(
+        TransferBatch(
+            TransferDirection.PUSH,
+            (
+                TransferItem(
+                    "safe/value.txt",
+                    source,
+                    MissingEntry("safe/value.txt"),
+                ),
+            ),
+        ),
+        progress.append,
+    )
+    assert result.completed == ()
+    assert result.changed_during_transfer == ("safe/value.txt",)
+    assert progress == []
+    assert observed == [b"inside"]
