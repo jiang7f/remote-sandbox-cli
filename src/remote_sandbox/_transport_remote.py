@@ -321,13 +321,14 @@ REMOTE_CREATE_CODE = textwrap.dedent(
 
 REMOTE_EXTRACT_CODE = textwrap.dedent(
     r"""
+    import errno
     import os
+    import secrets
     import shutil
     import stat
     import sys
     import tarfile
     import tempfile
-    import uuid
 
     def valid(name):
         if not name or name in {".", ".."} or name.startswith("/") or "\\" in name:
@@ -381,11 +382,40 @@ REMOTE_EXTRACT_CODE = textwrap.dedent(
         else:
             os.unlink(leaf, dir_fd=parent_fd)
 
+    def copy_to_parent(source, parent_fd, name):
+        entry = os.lstat(source)
+        if stat.S_ISLNK(entry.st_mode):
+            os.symlink(os.readlink(source), name, dir_fd=parent_fd)
+            return
+        if stat.S_ISREG(entry.st_mode):
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(name, flags, stat.S_IMODE(entry.st_mode), dir_fd=parent_fd)
+            try:
+                with open(source, "rb") as input_file:
+                    with os.fdopen(descriptor, "wb", closefd=False) as output:
+                        shutil.copyfileobj(input_file, output, length=1024 * 1024)
+            finally:
+                os.close(descriptor)
+            return
+        if not stat.S_ISDIR(entry.st_mode):
+            raise ValueError("unsupported staged entry")
+        os.mkdir(name, stat.S_IMODE(entry.st_mode), dir_fd=parent_fd)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            for child in os.listdir(source):
+                copy_to_parent(os.path.join(source, child), descriptor, child)
+        finally:
+            os.close(descriptor)
+
     root = sys.argv[1]
     requested = sys.argv[2:]
     requested_parts = {name: valid(name) for name in requested}
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
-    staging = tempfile.mkdtemp(prefix=".remote-sandbox-transfer-", dir=root)
+    staging = tempfile.mkdtemp(prefix="remote-sandbox-transfer-")
     archive_file = tempfile.TemporaryFile()
     shutil.copyfileobj(sys.stdin.buffer, archive_file)
     archive_file.seek(0)
@@ -437,9 +467,16 @@ REMOTE_EXTRACT_CODE = textwrap.dedent(
             parts = requested_parts[relative]
             parent_fd = open_parent(root_fd, parts[:-1], True)
             source = os.path.join(staging, *parts)
-            backup = ".remote-sandbox-backup-" + uuid.uuid4().hex
+            temporary = ".remote-sandbox-new-" + secrets.token_hex(8)
+            backup = ".remote-sandbox-old-" + secrets.token_hex(8)
             had_destination = False
             try:
+                try:
+                    os.rename(source, temporary, dst_dir_fd=parent_fd)
+                except OSError as exc:
+                    if exc.errno != errno.EXDEV:
+                        raise
+                    copy_to_parent(source, parent_fd, temporary)
                 try:
                     os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
                     had_destination = True
@@ -447,7 +484,9 @@ REMOTE_EXTRACT_CODE = textwrap.dedent(
                 except FileNotFoundError:
                     pass
                 try:
-                    os.replace(source, parts[-1], dst_dir_fd=parent_fd)
+                    os.rename(
+                        temporary, parts[-1], src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+                    )
                 except BaseException:
                     if had_destination:
                         os.rename(backup, parts[-1], src_dir_fd=parent_fd, dst_dir_fd=parent_fd)

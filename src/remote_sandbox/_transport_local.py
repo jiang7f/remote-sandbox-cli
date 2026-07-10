@@ -6,11 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
 
-from remote_sandbox._transport_paths import delete_entries, finalize_entries, stage_entries
-from remote_sandbox.manifest import (
-    fingerprint_local,
-    workspace_path,
-)
+from remote_sandbox._transport_fingerprint import LocalPathChanged, ProtectedLocalRoot
 from remote_sandbox.transport import (
     FingerprintState,
     ProgressCallback,
@@ -47,13 +43,17 @@ class LocalPairTransport:
             raise ValueError("batch must be a TransferBatch")
         if not callable(on_progress):
             raise ValueError("on_progress must be callable")
-        source, destination = self._roots(batch.direction)
-        before = self._preflight(batch, source, destination)
-        if self._engine == "rsync":
-            self._transfer_rsync(batch, source, destination, before)
-        else:
-            self._transfer_tar(batch, source, destination)
-        return self._verify(batch, source, destination, before, on_progress)
+        source_path, destination_path = self._roots(batch.direction)
+        with (
+            ProtectedLocalRoot(source_path) as source,
+            ProtectedLocalRoot(destination_path) as destination,
+        ):
+            before = self._preflight(batch, source, destination)
+            if self._engine == "rsync":
+                self._transfer_rsync(batch, source, destination, before)
+            else:
+                self._transfer_tar(batch, source, destination)
+            return self._verify(batch, source, destination, before, on_progress)
 
     def delete_local(self, paths: tuple[str, ...]) -> None:
         self._delete(self._local_root, paths)
@@ -69,15 +69,13 @@ class LocalPairTransport:
     def _preflight(
         self,
         batch: TransferBatch,
-        source: Path,
-        destination: Path,
+        source: ProtectedLocalRoot,
+        destination: ProtectedLocalRoot,
     ) -> dict[str, FingerprintState]:
         observed: dict[str, FingerprintState] = {}
         for item in batch.items:
-            workspace_path(source, item.path)
-            workspace_path(destination, item.path)
-            source_entry = fingerprint_local(source, item.path, with_hash=True)
-            destination_entry = fingerprint_local(destination, item.path, with_hash=True)
+            source_entry = source.fingerprint(item.path, with_hash=True)
+            destination_entry = destination.fingerprint(item.path, with_hash=True)
             _require_expected(item.path, "source", item.expected_source, source_entry)
             _require_expected(
                 item.path,
@@ -91,8 +89,8 @@ class LocalPairTransport:
     def _transfer_rsync(
         self,
         batch: TransferBatch,
-        source: Path,
-        destination: Path,
+        source: ProtectedLocalRoot,
+        destination: ProtectedLocalRoot,
         source_before: Mapping[str, FingerprintState],
     ) -> None:
         paths = tuple(item.path for item in batch.items)
@@ -100,7 +98,7 @@ class LocalPairTransport:
             temporary = Path(raw)
             safe_source = temporary / "source"
             safe_destination = temporary / "destination"
-            stage_entries(source, paths, safe_source, error_type=TransferError)
+            source.stage(paths, safe_source, error_type=TransferError)
             safe_destination.mkdir()
             argv = [
                 "rsync",
@@ -125,25 +123,27 @@ class LocalPairTransport:
                 raise TransferError(
                     f"rsync transfer failed: {detail}" if detail else "rsync transfer failed"
                 )
-            finalize_entries(
+            destination.finalize(
                 safe_destination,
-                destination,
                 paths,
                 error_type=TransferError,
             )
 
-    def _transfer_tar(self, batch: TransferBatch, source: Path, destination: Path) -> None:
-        destination.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=".remote-sandbox-tar-", dir=destination) as raw:
+    def _transfer_tar(
+        self,
+        batch: TransferBatch,
+        source: ProtectedLocalRoot,
+        destination: ProtectedLocalRoot,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="remote-sandbox-tar-") as raw:
             temporary = Path(raw)
             archive = temporary / "batch.tar"
             staging = temporary / "staging"
             _create_tar_archive(source, tuple(item.path for item in batch.items), archive)
             _extract_tar_archive(archive, staging)
             paths = tuple(item.path for item in batch.items)
-            finalize_entries(
+            destination.finalize(
                 staging,
-                destination,
                 paths,
                 error_type=TransferError,
             )
@@ -151,19 +151,28 @@ class LocalPairTransport:
     def _verify(
         self,
         batch: TransferBatch,
-        source: Path,
-        destination: Path,
+        source: ProtectedLocalRoot,
+        destination: ProtectedLocalRoot,
         before: dict[str, FingerprintState],
         on_progress: ProgressCallback,
     ) -> TransferResult:
         completed: list[str] = []
         changed: list[str] = []
         for item in batch.items:
-            source_after = fingerprint_local(source, item.path, with_hash=True)
+            try:
+                source_after = source.fingerprint(item.path, with_hash=True)
+            except LocalPathChanged:
+                changed.append(item.path)
+                continue
             if source_after != before[item.path]:
                 changed.append(item.path)
                 continue
-            destination_after = fingerprint_local(destination, item.path, with_hash=True)
+            try:
+                destination_after = destination.fingerprint(item.path, with_hash=True)
+            except LocalPathChanged as exc:
+                raise TransferError(
+                    f"post-transfer destination changed: {item.path}"
+                ) from exc
             if not _same_content(source_after, destination_after):
                 raise TransferError(f"post-transfer verification failed: {item.path}")
             completed.append(item.path)
@@ -172,8 +181,8 @@ class LocalPairTransport:
 
     @staticmethod
     def _delete(root: Path, paths: tuple[str, ...]) -> None:
-        delete_entries(
-            root,
-            _normalized_delete_paths(paths),
-            error_type=TransferError,
-        )
+        with ProtectedLocalRoot(root) as protected:
+            protected.delete(
+                _normalized_delete_paths(paths),
+                error_type=TransferError,
+            )

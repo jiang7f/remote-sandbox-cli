@@ -9,86 +9,74 @@ import stat
 from pathlib import Path
 
 
-def stage_entries(
-    root: Path,
+def stage_entries_from_fd(
+    root_fd: int,
     paths: tuple[str, ...],
     staging: Path,
     *,
     error_type: type[Exception],
 ) -> None:
     staging.mkdir(mode=0o700, parents=True, exist_ok=False)
-    root_fd = _open_directory(os.fspath(root))
-    try:
-        for relative in paths:
-            parts = relative.split("/")
-            parent_fd = _walk_parent(root_fd, parts[:-1], create=False)
-            try:
-                _copy_from_descriptor(
-                    parent_fd,
-                    parts[-1],
-                    staging / relative,
-                    error_type=error_type,
-                )
-            finally:
-                os.close(parent_fd)
-    finally:
-        os.close(root_fd)
+    for relative in paths:
+        parts = relative.split("/")
+        parent_fd = _walk_parent(root_fd, parts[:-1], create=False)
+        try:
+            _copy_from_descriptor(
+                parent_fd,
+                parts[-1],
+                staging / relative,
+                error_type=error_type,
+            )
+        finally:
+            os.close(parent_fd)
 
 
-def finalize_entries(
+def finalize_entries_from_fd(
+    root_fd: int,
     staging: Path,
-    root: Path,
     paths: tuple[str, ...],
     *,
     error_type: type[Exception],
 ) -> None:
-    root_fd = _open_directory(os.fspath(root))
-    try:
-        for relative in _top_level_paths(paths):
-            parts = relative.split("/")
-            parent_fd = _walk_parent(root_fd, parts[:-1], create=True)
-            try:
-                _install_at(
-                    staging / relative,
-                    parent_fd,
-                    parts[-1],
-                    error_type=error_type,
-                )
-            finally:
-                os.close(parent_fd)
-    finally:
-        os.close(root_fd)
+    for relative in _top_level_paths(paths):
+        parts = relative.split("/")
+        parent_fd = _walk_parent(root_fd, parts[:-1], create=True)
+        try:
+            _install_at(
+                staging / relative,
+                parent_fd,
+                parts[-1],
+                error_type=error_type,
+            )
+        finally:
+            os.close(parent_fd)
 
 
-def delete_entries(
-    root: Path,
+def delete_entries_from_fd(
+    root_fd: int,
     paths: tuple[str, ...],
     *,
     error_type: type[Exception],
 ) -> None:
-    root_fd = _open_directory(os.fspath(root))
-    try:
-        for relative in paths:
-            parts = relative.split("/")
+    for relative in paths:
+        parts = relative.split("/")
+        try:
+            parent_fd = _walk_parent(root_fd, parts[:-1], create=False)
+        except FileNotFoundError:
+            continue
+        try:
             try:
-                parent_fd = _walk_parent(root_fd, parts[:-1], create=False)
+                entry = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError:
                 continue
-            try:
-                try:
-                    entry = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
-                except FileNotFoundError:
-                    continue
-                if stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
-                    os.rmdir(parts[-1], dir_fd=parent_fd)
-                else:
-                    os.unlink(parts[-1], dir_fd=parent_fd)
-            except OSError as exc:
-                raise error_type(f"local workspace delete failed: {relative}: {exc}") from exc
-            finally:
-                os.close(parent_fd)
-    finally:
-        os.close(root_fd)
+            if stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
+                os.rmdir(parts[-1], dir_fd=parent_fd)
+            else:
+                os.unlink(parts[-1], dir_fd=parent_fd)
+        except OSError as exc:
+            raise error_type(f"local workspace delete failed: {relative}: {exc}") from exc
+        finally:
+            os.close(parent_fd)
 
 
 def _copy_from_descriptor(

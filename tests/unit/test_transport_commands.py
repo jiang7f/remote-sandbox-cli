@@ -1,4 +1,5 @@
 import dataclasses
+import errno
 import shlex
 import subprocess
 from collections.abc import Iterable
@@ -11,7 +12,7 @@ from remote_sandbox._transport_remote import (
     REMOTE_PREPARE_RSYNC_CODE,
     REMOTE_STAGE_RSYNC_CODE,
 )
-from remote_sandbox.manifest import EntryFingerprint, MissingEntry, fingerprint_local
+from remote_sandbox.manifest import EntryFingerprint, EntryKind, MissingEntry, fingerprint_local
 from remote_sandbox.reconcile import ActionType, SyncAction
 from remote_sandbox.ssh import SubprocessSshRunner, ssh_control_opts
 from remote_sandbox.transport import (
@@ -20,6 +21,7 @@ from remote_sandbox.transport import (
     RsyncPathUnsupported,
     TransferBatch,
     TransferDirection,
+    TransferError,
     TransferItem,
     TransferResult,
     build_rsync_argv,
@@ -386,6 +388,95 @@ def test_batch_transport_uses_tar_when_local_or_remote_rsync_is_unavailable(
     assert len(runner.transport_calls) == 1
 
 
+@pytest.mark.parametrize(
+    "launch_error",
+    [
+        FileNotFoundError(errno.ENOENT, "rsync disappeared"),
+        PermissionError(errno.EACCES, "rsync is not executable"),
+        OSError(errno.ENOEXEC, "invalid rsync executable"),
+    ],
+)
+def test_batch_transport_falls_back_when_rsync_launch_becomes_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    launch_error: OSError,
+) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    (local_root / "a.txt").write_text("a", encoding="utf-8")
+    source = cast(EntryFingerprint, fingerprint_local(local_root, "a.txt", with_hash=True))
+    remote = _RemoteFingerprinter(
+        [{"a.txt": MissingEntry("a.txt")}, {"a.txt": source}]
+    )
+    transport = BatchTransport(
+        local_root,
+        "host",
+        "/remote",
+        remote,
+        runner=_TransportRunner(),
+        capabilities=RsyncCapabilities(False, False),
+        remote_rsync_available=True,
+    )
+    used_tar = False
+
+    def fake_tar(_batch: TransferBatch, _local: object) -> None:
+        nonlocal used_tar
+        used_tar = True
+
+    monkeypatch.setattr("remote_sandbox.transport.shutil.which", lambda _name: "/usr/bin/rsync")
+    monkeypatch.setattr(
+        "remote_sandbox.transport.subprocess.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(launch_error),
+    )
+    monkeypatch.setattr(transport, "_transfer_tar", fake_tar)
+    result = transport.transfer(
+        TransferBatch(
+            TransferDirection.PUSH,
+            (TransferItem("a.txt", source, MissingEntry("a.txt")),),
+        ),
+        lambda _progress: None,
+    )
+    assert used_tar
+    assert result.completed == ("a.txt",)
+
+
+def test_batch_transport_does_not_hide_unrelated_rsync_launch_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    (local_root / "a.txt").write_text("a", encoding="utf-8")
+    source = cast(EntryFingerprint, fingerprint_local(local_root, "a.txt", with_hash=True))
+    remote = _RemoteFingerprinter([{"a.txt": MissingEntry("a.txt")}])
+    transport = BatchTransport(
+        local_root,
+        "host",
+        "/remote",
+        remote,
+        runner=_TransportRunner(),
+        capabilities=RsyncCapabilities(False, False),
+        remote_rsync_available=True,
+    )
+    monkeypatch.setattr("remote_sandbox.transport.shutil.which", lambda _name: "/usr/bin/rsync")
+    monkeypatch.setattr(
+        "remote_sandbox.transport.subprocess.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError(errno.EIO, "I/O failure")),
+    )
+    monkeypatch.setattr(
+        transport,
+        "_transfer_tar",
+        lambda *args: pytest.fail("unrelated rsync errors must not fall back"),
+    )
+    with pytest.raises(TransferError, match="I/O failure"):
+        transport.transfer(
+            TransferBatch(
+                TransferDirection.PUSH,
+                (TransferItem("a.txt", source, MissingEntry("a.txt")),),
+            ),
+            lambda _progress: None,
+        )
+
 def test_batch_transport_uses_tar_when_symlink_target_is_not_staged(tmp_path: Path) -> None:
     local_root = tmp_path / "local"
     outside = tmp_path / "outside"
@@ -413,6 +504,57 @@ def test_batch_transport_uses_tar_when_symlink_target_is_not_staged(tmp_path: Pa
         lambda _progress: None,
     )
     assert len(runner.transport_calls) == 1
+
+
+@pytest.mark.parametrize("target", ["missing.txt", "other.txt"])
+def test_batch_pull_uses_tar_when_remote_symlink_target_is_not_staged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    target: str,
+) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    source = EntryFingerprint(
+        "link",
+        EntryKind.SYMLINK,
+        None,
+        1,
+        0o120777,
+        target,
+        "link-hash",
+    )
+    remote = _RemoteFingerprinter([{"link": source}, {"link": source}])
+    transport = BatchTransport(
+        local_root,
+        "host",
+        "/remote",
+        remote,
+        runner=_TransportRunner(),
+        capabilities=RsyncCapabilities(False, False),
+        remote_rsync_available=True,
+    )
+    used_tar = False
+
+    def fake_tar(batch: TransferBatch, _local: object) -> None:
+        nonlocal used_tar
+        used_tar = True
+        (local_root / batch.items[0].path).symlink_to(target)
+
+    monkeypatch.setattr(transport, "_transfer_tar", fake_tar)
+    monkeypatch.setattr(
+        transport,
+        "_transfer_rsync",
+        lambda *args: pytest.fail("pull symlink must not use rsync"),
+    )
+    result = transport.transfer(
+        TransferBatch(
+            TransferDirection.PULL,
+            (TransferItem("link", source, MissingEntry("link")),),
+        ),
+        lambda _progress: None,
+    )
+    assert used_tar
+    assert result.completed == ("link",)
 
 
 def test_batch_transport_remote_delete_is_child_first_and_normalized(tmp_path: Path) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import posixpath
 import re
@@ -13,7 +14,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, TypeAlias, cast
 
-from remote_sandbox._transport_paths import finalize_entries, stage_entries
+from remote_sandbox._transport_fingerprint import (
+    LocalPathChanged,
+    ProtectedLocalRoot,
+)
 from remote_sandbox._transport_remote import (
     REMOTE_CLEANUP_RSYNC_CODE,
     REMOTE_CREATE_CODE,
@@ -29,7 +33,6 @@ from remote_sandbox.manifest import (
     EntryKind,
     MissingEntry,
     content_identity,
-    fingerprint_local,
     normalize_relative_path,
 )
 from remote_sandbox.reconcile import ActionType, SyncAction
@@ -41,6 +44,7 @@ from remote_sandbox.ssh import (
 )
 
 FingerprintState: TypeAlias = EntryFingerprint | MissingEntry
+LocalFingerprintState: TypeAlias = FingerprintState | LocalPathChanged
 ProgressCallback: TypeAlias = Callable[["TransferResult"], None]
 
 _SAFE_RSYNC_REMOTE = re.compile(r"\A[A-Za-z0-9_./@+-]+\Z")
@@ -51,6 +55,10 @@ class TransferError(RuntimeError):
 
 
 class RsyncPathUnsupported(TransferError):
+    pass
+
+
+class _RsyncUnavailable(TransferError):
     pass
 
 
@@ -260,29 +268,31 @@ class BatchTransport:
         if not callable(on_progress):
             raise ValueError("on_progress must be callable")
         paths = tuple(item.path for item in batch.items)
-        local_before = {
-            path: fingerprint_local(self._local_root, path, with_hash=True) for path in paths
-        }
-        remote_before = self._remote_snapshot(paths)
-        source_before = self._preflight(batch, local_before, remote_before)
+        with ProtectedLocalRoot(self._local_root) as local:
+            local_before = {
+                path: local.fingerprint(path, with_hash=True) for path in paths
+            }
+            remote_before = self._remote_snapshot(paths)
+            source_before = self._preflight(batch, local_before, remote_before)
 
-        use_tar = self._needs_tar(batch, local_before)
-        if use_tar:
-            self._transfer_tar(batch)
-        else:
-            self._transfer_rsync(batch, source_before)
+            use_tar = self._needs_tar(batch, source_before)
+            if use_tar:
+                self._transfer_tar(batch, local)
+            else:
+                try:
+                    self._transfer_rsync(batch, source_before, local)
+                except _RsyncUnavailable:
+                    self._transfer_tar(batch, local)
 
-        local_after = {
-            path: fingerprint_local(self._local_root, path, with_hash=True) for path in paths
-        }
-        remote_after = self._remote_snapshot(paths)
-        return self._verified_result(
-            batch,
-            source_before,
-            local_after,
-            remote_after,
-            on_progress,
-        )
+            local_after = self._local_postflight(local, paths)
+            remote_after = self._remote_snapshot(paths)
+            return self._verified_result(
+                batch,
+                source_before,
+                local_after,
+                remote_after,
+                on_progress,
+            )
 
     def delete_local(self, paths: Iterable[str]) -> None:
         LocalPairTransport._delete(self._local_root, tuple(paths))
@@ -323,7 +333,7 @@ class BatchTransport:
     def _needs_tar(
         self,
         batch: TransferBatch,
-        local_before: Mapping[str, FingerprintState],
+        source_before: Mapping[str, FingerprintState],
     ) -> bool:
         if shutil.which("rsync") is None:
             return True
@@ -339,21 +349,20 @@ class BatchTransport:
             return True
         if not self._remote_has_rsync():
             return True
-        if batch.direction is TransferDirection.PUSH:
-            for path, entry in local_before.items():
-                if isinstance(entry, EntryFingerprint) and entry.kind is EntryKind.SYMLINK:
-                    target = entry.link_target
-                    if target is None or target.startswith("/"):
-                        return True
-                    staged_target = posixpath.normpath(
-                        posixpath.join(posixpath.dirname(path), target)
-                    )
-                    if (
-                        staged_target in {".", ".."}
-                        or staged_target.startswith("../")
-                        or not _target_present_in_stage(staged_target, local_before)
-                    ):
-                        return True
+        for path, entry in source_before.items():
+            if isinstance(entry, EntryFingerprint) and entry.kind is EntryKind.SYMLINK:
+                target = entry.link_target
+                if target is None or target.startswith("/"):
+                    return True
+                staged_target = posixpath.normpath(
+                    posixpath.join(posixpath.dirname(path), target)
+                )
+                if (
+                    staged_target in {".", ".."}
+                    or staged_target.startswith("../")
+                    or not _target_present_in_stage(staged_target, source_before)
+                ):
+                    return True
         return False
 
     def _remote_has_rsync(self) -> bool:
@@ -371,14 +380,14 @@ class BatchTransport:
         self,
         batch: TransferBatch,
         source_before: Mapping[str, FingerprintState],
+        local: ProtectedLocalRoot,
     ) -> None:
         paths = tuple(item.path for item in batch.items)
         with tempfile.TemporaryDirectory(prefix="remote-sandbox-rsync-") as raw:
             local_stage = Path(raw) / "local"
             remote_stage: str | None = None
             if batch.direction is TransferDirection.PUSH:
-                stage_entries(
-                    self._local_root,
+                local.stage(
                     paths,
                     local_stage,
                     error_type=TransferError,
@@ -409,6 +418,10 @@ class BatchTransport:
                         capture_output=True,
                     )
                 except OSError as exc:
+                    if exc.errno in {errno.ENOENT, errno.EACCES, errno.ENOEXEC}:
+                        raise _RsyncUnavailable(
+                            f"rsync transfer could not start: {exc}"
+                        ) from exc
                     raise TransferError(f"rsync transfer could not start: {exc}") from exc
                 if result.returncode != 0:
                     detail = (result.stderr or result.stdout).decode(
@@ -420,9 +433,8 @@ class BatchTransport:
                         else "rsync transfer failed"
                     )
                 if batch.direction is TransferDirection.PULL:
-                    finalize_entries(
+                    local.finalize(
                         local_stage,
-                        self._local_root,
                         paths,
                         error_type=TransferError,
                     )
@@ -474,13 +486,13 @@ class BatchTransport:
             ).strip()
             raise TransferError(f"{operation} failed: {detail}" if detail else operation)
 
-    def _transfer_tar(self, batch: TransferBatch) -> None:
+    def _transfer_tar(self, batch: TransferBatch, local: ProtectedLocalRoot) -> None:
         paths = tuple(item.path for item in batch.items)
         if batch.direction is TransferDirection.PUSH:
             with tempfile.TemporaryDirectory(prefix="remote-sandbox-push-") as raw:
                 temporary = Path(raw)
                 archive = temporary / "batch.tar"
-                _create_tar_archive(self._local_root, paths, archive)
+                _create_tar_archive(local, paths, archive)
                 _extract_tar_archive(archive, temporary / "validation")
                 result = self._runner.run_workspace_python_bytes(
                     self._target,
@@ -498,18 +510,14 @@ class BatchTransport:
                 paths,
             )
             if result.returncode == 0:
-                with tempfile.TemporaryDirectory(
-                    prefix=".remote-sandbox-pull-",
-                    dir=self._local_root,
-                ) as raw:
+                with tempfile.TemporaryDirectory(prefix="remote-sandbox-pull-") as raw:
                     temporary = Path(raw)
                     archive = temporary / "batch.tar"
                     archive.write_bytes(result.stdout)
                     staging = temporary / "staging"
                     _extract_tar_archive(archive, staging)
-                    finalize_entries(
+                    local.finalize(
                         staging,
-                        self._local_root,
                         paths,
                         error_type=TransferError,
                     )
@@ -523,7 +531,7 @@ class BatchTransport:
     def _verified_result(
         batch: TransferBatch,
         source_before: Mapping[str, FingerprintState],
-        local_after: Mapping[str, FingerprintState],
+        local_after: Mapping[str, LocalFingerprintState],
         remote_after: Mapping[str, FingerprintState],
         on_progress: ProgressCallback,
     ) -> TransferResult:
@@ -534,6 +542,11 @@ class BatchTransport:
             destination = remote_after[item.path]
             if batch.direction is TransferDirection.PULL:
                 source, destination = destination, source
+            if isinstance(source, LocalPathChanged):
+                changed.append(item.path)
+                continue
+            if isinstance(destination, LocalPathChanged):
+                raise TransferError(f"post-transfer destination changed: {item.path}")
             if source != source_before[item.path]:
                 changed.append(item.path)
                 continue
@@ -542,6 +555,19 @@ class BatchTransport:
             completed.append(item.path)
             on_progress(TransferResult(tuple(completed), ()))
         return TransferResult(tuple(completed), tuple(changed))
+
+    @staticmethod
+    def _local_postflight(
+        local: ProtectedLocalRoot,
+        paths: tuple[str, ...],
+    ) -> dict[str, LocalFingerprintState]:
+        observed: dict[str, LocalFingerprintState] = {}
+        for path in paths:
+            try:
+                observed[path] = local.fingerprint(path, with_hash=True)
+            except LocalPathChanged as exc:
+                observed[path] = exc
+        return observed
 
 
 def _validate_expected(value: object, path: str, side: str) -> None:
@@ -609,11 +635,15 @@ def _check_tar_result(result: subprocess.CompletedProcess[bytes], operation: str
         raise TransferError(f"{message}: {detail}" if detail else message)
 
 
-def _create_tar_archive(source: Path, paths: tuple[str, ...], archive: Path) -> None:
+def _create_tar_archive(
+    source: ProtectedLocalRoot,
+    paths: tuple[str, ...],
+    archive: Path,
+) -> None:
     environment = os.environ.copy()
     environment["COPYFILE_DISABLE"] = "1"
     staging = archive.parent / "safe-source"
-    stage_entries(source, paths, staging, error_type=TransferError)
+    source.stage(paths, staging, error_type=TransferError)
     try:
         result = subprocess.run(
             [

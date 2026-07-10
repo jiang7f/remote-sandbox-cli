@@ -446,3 +446,84 @@ def test_remote_delete_program_is_missing_safe_nonempty_safe_and_no_follow(
         capture_output=True,
     )
     assert missing.returncode == 0
+
+
+def test_local_pull_root_swap_finalizes_through_held_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    outside = tmp_path / "outside"
+    local.mkdir()
+    remote.mkdir()
+    outside.mkdir()
+    (remote / "value.txt").write_text("remote", encoding="utf-8")
+    transport = LocalPairTransport(local, remote, engine="tar")
+    original = transport._transfer_tar
+
+    def swap_then_transfer(*args: object) -> None:
+        local.rename(tmp_path / "original-local")
+        local.symlink_to(outside, target_is_directory=True)
+        original(*args)
+
+    monkeypatch.setattr(transport, "_transfer_tar", swap_then_transfer)
+    result = transport.transfer(
+        TransferBatch(
+            TransferDirection.PULL,
+            (TransferItem("value.txt", None, None),),
+        ),
+        lambda _progress: None,
+    )
+    assert result.completed == ("value.txt",)
+    assert (tmp_path / "original-local" / "value.txt").read_text(encoding="utf-8") == "remote"
+    assert not (outside / "value.txt").exists()
+
+
+def test_remote_push_root_swap_never_uses_mutated_workspace_path(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as handle:
+        member = tarfile.TarInfo("value.txt")
+        member.size = len(b"payload")
+        handle.addfile(member, io.BytesIO(b"payload"))
+    marker = (
+        'root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))\n'
+    )
+    instrumented = REMOTE_EXTRACT_CODE.replace(
+        marker,
+        marker
+        + 'print("ROOT_OPEN", file=sys.stderr, flush=True)\n'
+        + "import time\n"
+        + "time.sleep(0.3)\n",
+        1,
+    )
+    assert instrumented != REMOTE_EXTRACT_CODE
+    process = subprocess.Popen(
+        [sys.executable, "-c", instrumented, str(root), "value.txt"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stderr is not None
+    assert process.stderr.readline() == b"ROOT_OPEN\n"
+    root.rename(tmp_path / "original-root")
+    root.symlink_to(outside, target_is_directory=True)
+    outside.chmod(0)
+    try:
+        assert process.stdin is not None
+        process.stdin.write(archive.getvalue())
+        process.stdin.close()
+        returncode = process.wait(timeout=5)
+        stderr = process.stderr.read().decode(errors="replace")
+    finally:
+        outside.chmod(0o755)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+    assert returncode == 0, stderr
+    assert (tmp_path / "original-root" / "value.txt").read_text(encoding="utf-8") == "payload"
+    assert not (outside / "value.txt").exists()
