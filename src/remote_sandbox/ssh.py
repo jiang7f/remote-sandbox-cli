@@ -69,6 +69,17 @@ class SshRunner(Protocol):
         args: tuple[str, ...] = (),
     ) -> subprocess.Popen[bytes]: ...
 
+    def run_workspace_python_bytes(
+        self,
+        target: str,
+        root: str,
+        code: str,
+        input_data: bytes,
+        args: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess[bytes]: ...
+
+    def delete_workspace_path(self, target: str, root: str, path: str) -> None: ...
+
     def run_command(self, target: str, cwd: str, argv: tuple[str, ...]) -> CommandResult: ...
 
     def clear_master(self, target: str) -> None: ...
@@ -180,7 +191,14 @@ class FakeSshRunner:
     shell_barrier_callbacks: list[Callable[[int], None] | None] = field(default_factory=list)
     python_file_calls: list[tuple[str, str, tuple[str, ...]]] = field(default_factory=list)
     command_calls: list[tuple[str, str, tuple[str, ...]]] = field(default_factory=list)
+    workspace_python_calls: list[tuple[str, str, str, bytes, tuple[str, ...]]] = field(
+        default_factory=list
+    )
+    workspace_delete_calls: list[tuple[str, str, str]] = field(default_factory=list)
     command_result: CommandResult = field(default_factory=lambda: CommandResult(0, "", ""))
+    workspace_python_result: subprocess.CompletedProcess[bytes] = field(
+        default_factory=lambda: subprocess.CompletedProcess(["ssh"], 0, b"", b"")
+    )
     fail_on: set[tuple[str, str]] = field(default_factory=set)
     fail_operations: set[str] = field(default_factory=set)
     probe_result: Literal["ok", "auth", "network"] = "ok"
@@ -303,6 +321,44 @@ class FakeSshRunner:
         self._maybe_fail("run_command", cwd)
         self.command_calls.append((target, _normalize_remote_path(cwd), argv))
         return self.command_result
+
+    def run_workspace_python_bytes(
+        self,
+        target: str,
+        root: str,
+        code: str,
+        input_data: bytes,
+        args: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess[bytes]:
+        self.workspace_python_calls.append(
+            (target, _normalize_remote_path(root), code, input_data, args)
+        )
+        return self.workspace_python_result
+
+    def delete_workspace_path(self, target: str, root: str, path: str) -> None:
+        normalized_root = _normalize_remote_path(root)
+        normalized_relative = _normalize_workspace_relative(path)
+        self.workspace_delete_calls.append((target, normalized_root, normalized_relative))
+        parts = normalized_relative.split("/")
+        current = normalized_root
+        for part in parts[:-1]:
+            current = posixpath.join(current, part)
+            if (target, current) in self.symlinks:
+                raise SshError(f"remote workspace path has symlink parent: {path}")
+        absolute = posixpath.join(normalized_root, normalized_relative)
+        if (target, absolute) in self.dirs:
+            prefix = absolute.rstrip("/") + "/"
+            entries = [*self.files, *self.binary_files, *self.dirs, *self.symlinks]
+            if any(
+                item_target == target and item_path.startswith(prefix)
+                for item_target, item_path in entries
+            ):
+                raise SshError(f"remote directory not empty: {path}")
+            self.dirs.discard((target, absolute))
+            return
+        self.files.pop((target, absolute), None)
+        self.binary_files.pop((target, absolute), None)
+        self.symlinks.discard((target, absolute))
 
     def clear_master(self, target: str) -> None:
         del target
@@ -647,6 +703,58 @@ class SubprocessSshRunner:
             raise
         return process
 
+    def run_workspace_python_bytes(
+        self,
+        target: str,
+        root: str,
+        code: str,
+        input_data: bytes,
+        args: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess[bytes]:
+        validate_target(target)
+        validate_remote_path(root)
+        if type(code) is not str or not code or "\0" in code:
+            raise ValueError("Invalid workspace Python code")
+        if any(type(arg) is not str or _has_control_char(arg) for arg in args):
+            raise ValueError("Invalid workspace Python argument")
+        wrapper = (
+            self._remote_path_function()
+            + 'root=$(remote_sandbox_path "$1") || exit 2\n'
+            + "shift\n"
+            + "code=$1\n"
+            + "shift\n"
+            + 'exec python3 -c "$code" "$root" "$@"\n'
+        )
+        remote_command = " ".join(
+            [
+                "sh",
+                "-c",
+                shlex.quote(wrapper),
+                "sh",
+                shlex.quote(root),
+                shlex.quote(code),
+                *(shlex.quote(arg) for arg in args),
+            ]
+        )
+        return subprocess.run(
+            [*self._ssh_batch_args(), target, remote_command],
+            check=False,
+            input=input_data,
+            capture_output=True,
+            timeout=self.timeout_s,
+        )
+
+    def delete_workspace_path(self, target: str, root: str, path: str) -> None:
+        normalized = _normalize_workspace_relative(path)
+        result = self.run_workspace_python_bytes(
+            target,
+            root,
+            _DELETE_WORKSPACE_PATH_CODE,
+            b"",
+            (normalized,),
+        )
+        self._check_bytes(result, "remote workspace delete failed")
+
     def _python_file_command(
         self,
         target: str,
@@ -813,6 +921,33 @@ _REMOTE_PATH_FUNC = (
 )
 
 
+_DELETE_WORKSPACE_PATH_CODE = (
+    "import os, stat, sys\n"
+    "root, relative = sys.argv[1], sys.argv[2]\n"
+    "parts = relative.split('/')\n"
+    "flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, 'O_NOFOLLOW', 0)\n"
+    "descriptor = os.open(root, flags)\n"
+    "try:\n"
+    "    for part in parts[:-1]:\n"
+    "        try:\n"
+    "            child = os.open(part, flags, dir_fd=descriptor)\n"
+    "        except FileNotFoundError:\n"
+    "            raise SystemExit(0)\n"
+    "        os.close(descriptor)\n"
+    "        descriptor = child\n"
+    "    try:\n"
+    "        entry = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)\n"
+    "    except FileNotFoundError:\n"
+    "        raise SystemExit(0)\n"
+    "    if stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):\n"
+    "        os.rmdir(parts[-1], dir_fd=descriptor)\n"
+    "    else:\n"
+    "        os.unlink(parts[-1], dir_fd=descriptor)\n"
+    "finally:\n"
+    "    os.close(descriptor)\n"
+)
+
+
 def _normalize_remote_path(path: str) -> str:
     validated = validate_remote_path(path)
     if validated == "~":
@@ -820,6 +955,15 @@ def _normalize_remote_path(path: str) -> str:
     if validated.startswith("~/"):
         return posixpath.normpath(posixpath.join("/home/fake", validated[2:]))
     return posixpath.normpath(validated)
+
+
+def _normalize_workspace_relative(path: str) -> str:
+    if type(path) is not str or not path or _has_control_char(path) or "\\" in path:
+        raise ValueError("Invalid workspace relative path")
+    normalized = posixpath.normpath(path)
+    if normalized in {"", ".", ".."} or normalized.startswith("/") or normalized.startswith("../"):
+        raise ValueError("Invalid workspace relative path")
+    return normalized
 
 
 def _workspace_root_from_agent_path(agent_path: str) -> str:
