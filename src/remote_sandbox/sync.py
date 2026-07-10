@@ -45,9 +45,11 @@ def execute_plan(
     from remote_sandbox.syncsession import SyncProgress
 
     local_root = local_root.expanduser().resolve()
-    _refuse_blocking_actions(plan)
     transfer_actions = [
-        action for action in plan.actions if action.type != PlanActionType.UPDATE_BASE
+        action
+        for action in plan.actions
+        if action.type
+        not in {PlanActionType.UPDATE_BASE, PlanActionType.CONFLICT, PlanActionType.NEEDS_HASH}
     ]
     files_total = len(transfer_actions)
     bytes_total = sum(_action_bytes(action) for action in transfer_actions)
@@ -75,7 +77,26 @@ def execute_plan(
         remote_root=remote_root,
     )
     skipped = 0
+    conflicts = 0
     for action in ordered:
+        if action.type in {PlanActionType.CONFLICT, PlanActionType.NEEDS_HASH}:
+            # A single unsyncable path — a symlink/unsupported file (e.g. .venv/bin/python),
+            # a both-sides-changed conflict, or a missing hash — must NOT abort the whole
+            # sync. Skip just this path (base untouched, so it is revisited next cycle) and
+            # keep going. This is what lets `rsb connect` work on a tree that contains a venv.
+            conflicts += 1
+            if on_progress is not None:
+                on_progress(
+                    SyncProgress(
+                        phase="transferring",
+                        files_total=files_total,
+                        files_done=files_done,
+                        bytes_total=bytes_total,
+                        bytes_done=bytes_done,
+                        current_path=f"skipped ({action.reason or 'conflict'}): {action.path}",
+                    )
+                )
+            continue
         key = (action.type, action.path)
         try:
             if key not in bulk_done:
@@ -119,7 +140,12 @@ def execute_plan(
                         current_path=action.path,
                     )
                 )
-    if skipped and on_progress is not None:
+    if (skipped or conflicts) and on_progress is not None:
+        notes = []
+        if skipped:
+            notes.append(f"{skipped} changed mid-sync")
+        if conflicts:
+            notes.append(f"{conflicts} conflicting/unsupported skipped")
         on_progress(
             SyncProgress(
                 phase="transferring",
@@ -127,7 +153,7 @@ def execute_plan(
                 files_done=files_done,
                 bytes_total=bytes_total,
                 bytes_done=bytes_done,
-                current_path=f"{skipped} file(s) changed mid-sync; will retry next cycle",
+                current_path="; ".join(notes) + "; will revisit next cycle",
             )
         )
 
@@ -210,17 +236,6 @@ def placeholder_text(*, remote: FileEntry, target: str, remote_root: str) -> str
             "",
         ]
     )
-
-
-def _refuse_blocking_actions(plan: SyncPlan) -> None:
-    blocking = [
-        action
-        for action in plan.actions
-        if action.type in {PlanActionType.CONFLICT, PlanActionType.NEEDS_HASH}
-    ]
-    if blocking:
-        paths = ", ".join(action.path for action in blocking)
-        raise SyncExecutionError(f"sync cannot continue with conflict or missing hash: {paths}")
 
 
 def _execution_order(actions: tuple[PlanAction, ...]) -> tuple[PlanAction, ...]:
