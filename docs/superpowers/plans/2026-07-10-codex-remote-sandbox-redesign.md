@@ -1148,7 +1148,6 @@ git commit -m "feat: emit local filesystem events"
 - Create: `tests/unit/test_remote_protocol.py`
 - Create: `tests/integration/test_agent_zipapp.py`
 - Modify: `src/remote_sandbox/agent.py:1-117`
-- Modify: `src/remote_sandbox/ssh.py:28-68,577-720`
 
 **Interfaces:**
 - Consumes: development namespace from Task 1
@@ -1159,7 +1158,9 @@ git commit -m "feat: emit local filesystem events"
 - Produces: `decode_response(data) -> AgentResponse`
 - Produces: `build_agent_zipapp(destination: Path) -> Path`
 - Produces: `RemoteAgentManager.ensure(target: str) -> AgentInstall`
-- Extends: `SshRunner.run_agent(target, agent_path, request_bytes) -> bytes`
+- Uses: existing `SshRunner.write_bytes_atomic(...)` and `run_python_file(...)` for bootstrap and
+  self-check only; structured stdin and streaming agent calls are added with SSH regression tests
+  in Task 8
 
 - [ ] **Step 1: Write failing protocol and zipapp tests**
 
@@ -1284,8 +1285,10 @@ name the package `remote_agent` inside the archive, and call `zipapp.create_arch
 `interpreter="/usr/bin/env python3"`. `RemoteAgentManager.ensure()` uploads to
 `~/.codex-remote-sandbox/agents/<version>/agent.pyz`, writes atomically, and verifies `self-check`.
 
-Add an SSH runner method that passes the encoded request on stdin and never embeds payload fields
-in shell source.
+Do not modify `ssh.py` in this task because it contains pre-existing reconnect changes. Task 8 adds
+the structured stdin runner method and streaming process API together with authentication regression
+coverage. Task 6 only uploads the zipapp atomically and invokes its argument-only `self-check` through
+the existing `run_python_file()` interface.
 
 - [ ] **Step 4: Verify Python 3.10 compatibility and agent self-check**
 
@@ -1315,7 +1318,7 @@ check; Linux CI in Task 17 must run it against Python 3.10.
 
 ```bash
 git add src/remote_sandbox/remote_protocol.py src/remote_sandbox/remote_agent \
-  src/remote_sandbox/agent.py src/remote_sandbox/ssh.py tests/unit/test_remote_protocol.py \
+  src/remote_sandbox/agent.py tests/unit/test_remote_protocol.py \
   tests/integration/test_agent_zipapp.py
 git commit -m "feat: bootstrap versioned remote agent"
 ```
