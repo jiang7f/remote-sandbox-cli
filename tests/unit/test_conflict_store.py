@@ -41,6 +41,40 @@ def test_replace_base_round_trips_fingerprints_and_removes_stale_paths(tmp_path:
         assert store.list_base() == {"current": link}
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("size", 4.5),
+        ("mtime_ns", True),
+        ("mode", float(0o100644)),
+        ("link_target", 123),
+        ("content_hash", b"abc"),
+        ("is_placeholder", 1),
+    ],
+)
+def test_invalid_fingerprint_fields_are_rejected_before_base_changes(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    db = tmp_path / "state.sqlite3"
+    with WorkspaceStore.open(db) as store:
+        with pytest.raises(ValueError, match=field):
+            fingerprint = EntryFingerprint(
+                "model.py",
+                EntryKind.FILE,
+                value if field == "size" else 4,  # type: ignore[arg-type]
+                value if field == "mtime_ns" else 456,  # type: ignore[arg-type]
+                value if field == "mode" else 0o100644,  # type: ignore[arg-type]
+                link_target=value if field == "link_target" else None,  # type: ignore[arg-type]
+                content_hash=value if field == "content_hash" else "abc",  # type: ignore[arg-type]
+                is_placeholder=value if field == "is_placeholder" else False,  # type: ignore[arg-type]
+            )
+            store.upsert_base(fingerprint)
+
+        assert store.list_base() == {}
+
+
 def test_conflict_keeps_both_versions_and_remains_unresolved(tmp_path: Path) -> None:
     db = tmp_path / "state.sqlite3"
     local_fingerprint = _fingerprint("model.py", "local")

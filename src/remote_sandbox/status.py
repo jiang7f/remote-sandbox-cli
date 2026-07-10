@@ -34,6 +34,8 @@ class SyncProgress:
             raise ValueError("files_done must not exceed files_total")
         if self.bytes_total and self.bytes_done > self.bytes_total:
             raise ValueError("bytes_done must not exceed bytes_total")
+        if self.current_path is not None and not isinstance(self.current_path, str):
+            raise ValueError("progress current_path must be a string or None")
 
 
 @dataclass(frozen=True, slots=True)

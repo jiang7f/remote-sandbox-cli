@@ -77,6 +77,27 @@ def test_progress_and_status_counts_require_integers() -> None:
         )
 
 
+def test_invalid_current_path_is_rejected_before_status_changes(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "state.sqlite3"
+    with WorkspaceStore.open(db) as store:
+        original = store.get_status()
+
+        with pytest.raises(ValueError, match="current_path"):
+            store.set_status(
+                WorkspaceStatus(
+                    WorkspacePhase.SYNCING,
+                    SyncProgress(
+                        "syncing",
+                        current_path=123,  # type: ignore[arg-type]
+                    ),
+                )
+            )
+
+        assert store.get_status() == original
+
+
 def test_workspace_store_configures_durable_sqlite_pragmas(tmp_path: Path) -> None:
     db = tmp_path / "state.sqlite3"
 

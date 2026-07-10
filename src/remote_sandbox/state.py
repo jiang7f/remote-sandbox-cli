@@ -174,13 +174,7 @@ class WorkspaceStore:
     ) -> JournalEvent:
         _validate_side(side)
         with self.transaction():
-            row = self._connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM events WHERE side = ?",
-                (side,),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("could not allocate journal sequence")
-            sequence = _expect_int(row["next_sequence"], "event sequence")
+            sequence = self._last_allocated_sequence(side) + 1
             event = JournalEvent(side, sequence, EventKind(kind), path, destination_path)
             self._connection.execute(
                 """
@@ -218,6 +212,12 @@ class WorkspaceStore:
         _validate_side(side)
         _validate_non_negative_int(through_sequence, "through_sequence")
         with self.transaction():
+            last_allocated = self._last_allocated_sequence(side)
+            if through_sequence > last_allocated:
+                raise ValueError(
+                    f"cannot acknowledge unallocated journal sequence {through_sequence} "
+                    f"for {side} side"
+                )
             self._connection.execute(
                 """
                 INSERT INTO watermarks(side, acknowledged_sequence) VALUES (?, ?)
@@ -228,6 +228,23 @@ class WorkspaceStore:
                 """,
                 (side, through_sequence),
             )
+
+    def _last_allocated_sequence(self, side: str) -> int:
+        row = self._connection.execute(
+            """
+            SELECT MAX(
+                COALESCE((SELECT MAX(sequence) FROM events WHERE side = ?), 0),
+                COALESCE(
+                    (SELECT acknowledged_sequence FROM watermarks WHERE side = ?),
+                    0
+                )
+            ) AS last_sequence
+            """,
+            (side, side),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("could not read the last allocated journal sequence")
+        return _expect_int(row["last_sequence"], "last allocated event sequence")
 
     def acknowledged_sequence(self, side: str) -> int:
         _validate_side(side)

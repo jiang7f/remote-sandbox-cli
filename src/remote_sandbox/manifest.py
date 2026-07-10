@@ -39,6 +39,27 @@ class EntryFingerprint:
     is_placeholder: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.path, str):
+            raise ValueError("fingerprint path must be a string")
+        if not isinstance(self.kind, EntryKind):
+            raise ValueError("fingerprint kind must be an EntryKind")
+        for field, integer_value in (
+            ("size", self.size),
+            ("mtime_ns", self.mtime_ns),
+            ("mode", self.mode),
+        ):
+            if integer_value is not None and type(integer_value) is not int:
+                raise ValueError(f"fingerprint {field} must be an integer or None")
+        if self.size is not None and self.size < 0:
+            raise ValueError("fingerprint size must be non-negative")
+        for field, string_value in (
+            ("link_target", self.link_target),
+            ("content_hash", self.content_hash),
+        ):
+            if string_value is not None and not isinstance(string_value, str):
+                raise ValueError(f"fingerprint {field} must be a string or None")
+        if type(self.is_placeholder) is not bool:
+            raise ValueError("fingerprint is_placeholder must be a boolean")
         object.__setattr__(self, "path", normalize_relative_path(self.path))
 
 

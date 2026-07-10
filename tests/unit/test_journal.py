@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -57,6 +58,46 @@ def test_acknowledgement_never_moves_backwards(tmp_path: Path) -> None:
 
         assert store.acknowledged_sequence("local") == second.sequence
         assert store.pending_events("local", 0) == []
+
+
+def test_acknowledgement_cannot_exceed_the_last_sequence_for_its_side(
+    tmp_path: Path,
+) -> None:
+    with WorkspaceStore.open(tmp_path / "state.sqlite3") as store:
+        local = store.append_event("local", EventKind.MODIFY, "a.py")
+
+        with pytest.raises(ValueError, match="unallocated journal sequence"):
+            store.acknowledge("local", local.sequence + 1)
+        with pytest.raises(ValueError, match="unallocated journal sequence"):
+            store.acknowledge("remote", local.sequence)
+
+        assert store.acknowledged_sequence("local") == 0
+        assert store.acknowledged_sequence("remote") == 0
+
+
+def test_sequence_allocation_survives_pruning_acknowledged_rows(tmp_path: Path) -> None:
+    db = tmp_path / "state.sqlite3"
+    with WorkspaceStore.open(db) as store:
+        first = store.append_event("local", EventKind.MODIFY, "a.py")
+        second = store.append_event("local", EventKind.MODIFY, "b.py")
+        store.acknowledge("local", second.sequence)
+
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute(
+            "DELETE FROM events WHERE side = ? AND sequence <= ?",
+            ("local", second.sequence),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with WorkspaceStore.open(db) as store:
+        local = store.append_event("local", EventKind.CREATE, "c.py")
+        remote = store.append_event("remote", EventKind.CREATE, "c.py")
+
+        assert local.sequence == second.sequence + 1
+        assert remote.sequence == first.sequence
 
 
 def test_move_event_round_trips_its_destination(tmp_path: Path) -> None:
