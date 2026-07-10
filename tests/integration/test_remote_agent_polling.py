@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -15,7 +16,7 @@ import pytest
 
 import remote_sandbox.remote_agent.__main__ as remote_agent_main
 from remote_sandbox.agent import build_agent_zipapp
-from remote_sandbox.remote_agent.store import RemoteStore
+from remote_sandbox.remote_agent.store import RemoteStore, WatcherState, process_is_alive
 from remote_sandbox.remote_agent.watcher import PollingWatcher, WatcherService, snapshot_entries
 from remote_sandbox.remote_protocol import AgentRequest, decode_response, encode_request
 
@@ -144,12 +145,14 @@ def test_zipapp_manages_detached_watcher_journal_and_safe_forget(tmp_path: Path)
     root = tmp_path / "workspace"
     home = tmp_path / "home"
     control = tmp_path / "control"
+    runtime = tmp_path / "runtime"
     root.mkdir()
     home.mkdir()
     env = {
         **os.environ,
         "HOME": str(home),
         "CODEX_REMOTE_SANDBOX_HOME": str(control),
+        "CODEX_REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
     }
     workspace_id = "00000000-0000-4000-8000-000000000007"
 
@@ -166,6 +169,16 @@ def test_zipapp_manages_detached_watcher_journal_and_safe_forget(tmp_path: Path)
     started_payload = decode_response(started.stdout).payload
     assert started_payload["status"] in {"starting", "running"}
     assert int(started_payload["pid"]) > 0
+    runtime_workspace = runtime / "workspaces" / workspace_id
+    assert runtime.stat().st_mode & 0o777 == 0o700
+    assert runtime_workspace.stat().st_mode & 0o777 == 0o700
+    assert (runtime / "index.lock").stat().st_mode & 0o777 == 0o600
+    assert (runtime_workspace / "control.lock").stat().st_mode & 0o777 == 0o600
+    assert (runtime_workspace / "watcher.log").stat().st_mode & 0o777 == 0o600
+    persistent_workspace = control / "workspaces" / workspace_id
+    assert not (control / "index.lock").exists()
+    assert not (persistent_workspace / "control.lock").exists()
+    assert not (persistent_workspace / "watcher.log").exists()
 
     def watcher_running() -> bool:
         status = _agent_call(archive, AgentRequest("status", {"workspace_id": workspace_id}), env)
@@ -220,7 +233,18 @@ def test_zipapp_manages_detached_watcher_journal_and_safe_forget(tmp_path: Path)
     forgotten = _agent_call(archive, AgentRequest("forget", {"workspace_id": workspace_id}), env)
     assert forgotten.returncode == 0
     assert not (control / "workspaces" / workspace_id).exists()
+    assert not (runtime_workspace / "watcher.log").exists()
     assert root.exists()
+
+
+def test_default_remote_runtime_uses_isolated_codex_tmp_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", raising=False)
+
+    assert remote_agent_main._runtime_root() == (
+        Path("/tmp") / f"codex-remote-sandbox-{os.getuid()}"
+    )
 
 
 def test_register_conflict_does_not_leave_unreachable_workspace_metadata(tmp_path: Path) -> None:
@@ -430,6 +454,199 @@ def test_concurrent_start_calls_share_one_watcher_generation(tmp_path: Path) -> 
         _agent_call(archive, AgentRequest("forget", {"workspace_id": workspace_id}), env).returncode
         == 0
     )
+
+
+def test_concurrent_start_and_forget_never_recreate_persistent_metadata(tmp_path: Path) -> None:
+    archive = build_agent_zipapp(tmp_path / "agent.pyz")
+    root = tmp_path / "workspace"
+    home = tmp_path / "home"
+    control = tmp_path / "control"
+    runtime = tmp_path / "runtime"
+    root.mkdir()
+    home.mkdir()
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+        "CODEX_REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
+    }
+    workspace_id = "00000000-0000-4000-8000-000000000079"
+    assert (
+        _agent_call(
+            archive,
+            AgentRequest("register", {"workspace_id": workspace_id, "root": str(root)}),
+            env,
+        ).returncode
+        == 0
+    )
+    barrier = threading.Barrier(3)
+    results: dict[str, subprocess.CompletedProcess[bytes]] = {}
+
+    def call(command: str) -> None:
+        barrier.wait()
+        results[command] = _agent_call(
+            archive,
+            AgentRequest(command, {"workspace_id": workspace_id}),
+            env,
+        )
+
+    threads = [
+        threading.Thread(target=call, args=("start",)),
+        threading.Thread(target=call, args=("forget",)),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert all(not thread.is_alive() for thread in threads)
+
+    if results["start"].returncode == 0:
+        assert results["forget"].returncode == 2
+        assert _agent_call(
+            archive,
+            AgentRequest("stop", {"workspace_id": workspace_id}),
+            env,
+        ).returncode == 0
+        assert _agent_call(
+            archive,
+            AgentRequest("forget", {"workspace_id": workspace_id}),
+            env,
+        ).returncode == 0
+    else:
+        assert results["start"].returncode == 2
+        assert results["forget"].returncode == 0
+
+    time.sleep(0.1)
+    persistent_workspace = control / "workspaces" / workspace_id
+    assert not persistent_workspace.exists()
+    with RemoteStore(control / "index.sqlite3") as index:
+        assert index.index_entry(workspace_id) is None
+    assert not (persistent_workspace / "control.lock").exists()
+    assert not (persistent_workspace / "watcher.log").exists()
+
+
+def test_status_leaves_running_state_unchanged_when_identity_is_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    home = tmp_path / "home"
+    control = tmp_path / "control"
+    runtime = tmp_path / "runtime"
+    root.mkdir()
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(control))
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    workspace_id = "00000000-0000-4000-8000-000000000080"
+    remote_agent_main._handle_register({"workspace_id": workspace_id, "root": str(root)})
+    state_path = control / "workspaces" / workspace_id / "state.sqlite3"
+    with RemoteStore(state_path) as store:
+        store.record_watcher(
+            os.getpid(),
+            "running",
+            backend="polling",
+            token="generation-a",
+        )
+    monkeypatch.setattr(remote_agent_main, "_watcher_identity", lambda _state, _id: "unknown")
+
+    payload = remote_agent_main._handle_status({"workspace_id": workspace_id})
+
+    assert payload["status"] == "running"
+    with RemoteStore(state_path) as store:
+        state = store.watcher_state()
+        assert state.status == "running"
+        assert state.token == "generation-a"
+
+
+def test_status_cannot_overwrite_a_new_start_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    home = tmp_path / "home"
+    control = tmp_path / "control"
+    runtime = tmp_path / "runtime"
+    root.mkdir()
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(control))
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    workspace_id = "00000000-0000-4000-8000-000000000081"
+    remote_agent_main._handle_register({"workspace_id": workspace_id, "root": str(root)})
+    state_path = control / "workspaces" / workspace_id / "state.sqlite3"
+    with RemoteStore(state_path) as store:
+        store.record_watcher(
+            os.getpid(),
+            "running",
+            backend="polling",
+            token="generation-a",
+        )
+
+    status_entered = threading.Event()
+    generation_b_seen = threading.Event()
+    stop_monitor = threading.Event()
+    status_result: dict[str, object] = {}
+    start_result: dict[str, object] = {}
+
+    def identity(state: WatcherState, _workspace_id: str) -> str:
+        if threading.current_thread().name == "status-thread" and state.token == "generation-a":
+            status_entered.set()
+            generation_b_seen.wait(timeout=1)
+            return "mismatch"
+        return "dead"
+
+    def sleeper_command(current_id: str, current_home: Path, token: str) -> list[str]:
+        return [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+            "_watch",
+            current_id,
+            str(current_home),
+            token,
+        ]
+
+    def monitor_generation() -> None:
+        while not stop_monitor.wait(0.01):
+            with RemoteStore(state_path) as store:
+                if store.watcher_state().token not in {None, "generation-a"}:
+                    generation_b_seen.set()
+                    return
+
+    def read_status() -> None:
+        status_result.update(remote_agent_main._handle_status({"workspace_id": workspace_id}))
+
+    def start_watcher() -> None:
+        start_result.update(remote_agent_main._handle_start({"workspace_id": workspace_id}))
+
+    monkeypatch.setattr(remote_agent_main, "_watcher_identity", identity)
+    monkeypatch.setattr(remote_agent_main, "_watcher_command", sleeper_command)
+    monitor = threading.Thread(target=monitor_generation)
+    status_thread = threading.Thread(target=read_status, name="status-thread")
+    start_thread = threading.Thread(target=start_watcher, name="start-thread")
+    monitor.start()
+    status_thread.start()
+    assert status_entered.wait(timeout=2)
+    start_thread.start()
+    status_thread.join(timeout=5)
+    start_thread.join(timeout=5)
+    stop_monitor.set()
+    monitor.join(timeout=2)
+
+    assert not status_thread.is_alive()
+    assert not start_thread.is_alive()
+    with RemoteStore(state_path) as store:
+        final_state = store.watcher_state()
+    assert final_state.token not in {None, "generation-a"}
+    assert final_state.status == "starting"
+    pid = int(start_result["pid"])
+    assert process_is_alive(pid)
+    os.kill(pid, signal.SIGTERM)
+    waited_pid, _status = os.waitpid(pid, 0)
+    assert waited_pid == pid
+    assert not process_is_alive(pid)
 
 
 def test_forget_restores_index_and_metadata_when_deletion_fails(

@@ -146,42 +146,40 @@ class InotifyBackend:
             root,
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
         )
-        pending = [(root, descriptor)]
         try:
-            while pending:
-                directory, directory_fd = pending.pop()
-                try:
-                    if path_is_hard_ignored(directory, self._root):
-                        continue
-                    self._add_watch(
-                        directory,
-                        watch_source=Path(f"/proc/self/fd/{directory_fd}"),
-                    )
-                    with os.scandir(directory_fd) as entries:
-                        ordered = sorted(entries, key=lambda entry: entry.name)
-                    children: list[tuple[Path, int]] = []
-                    for entry in ordered:
-                        path = directory / entry.name
-                        if path_is_hard_ignored(path, self._root):
-                            continue
-                        try:
-                            if not entry.is_dir(follow_symlinks=False):
-                                continue
-                            child_fd = os.open(
-                                entry.name,
-                                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                                dir_fd=directory_fd,
-                            )
-                        except OSError:
-                            continue
-                        children.append((path, child_fd))
-                    pending.extend(reversed(children))
-                finally:
-                    os.close(directory_fd)
-        except BaseException:
-            for _path, pending_fd in pending:
-                os.close(pending_fd)
-            raise
+            self._add_directory_tree(root, descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _add_directory_tree(self, directory: Path, directory_fd: int) -> None:
+        if path_is_hard_ignored(directory, self._root):
+            return
+        self._add_watch(
+            directory,
+            watch_source=Path(f"/proc/self/fd/{directory_fd}"),
+        )
+        with os.scandir(directory_fd) as entries:
+            ordered = sorted(entries, key=lambda entry: entry.name)
+        for entry in ordered:
+            path = directory / entry.name
+            if path_is_hard_ignored(path, self._root):
+                continue
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                child_fd = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory_fd,
+                )
+            except OSError as exc:
+                if _is_transient_disappearance(exc):
+                    continue
+                raise
+            try:
+                self._add_directory_tree(path, child_fd)
+            finally:
+                os.close(child_fd)
 
     def _add_watch(self, path: Path, *, watch_source: Path | None = None) -> None:
         if path in self._path_watches:
@@ -240,13 +238,11 @@ class InotifyBackend:
 
             if event.mask & IN_MOVED_TO:
                 pending = self._pending_moves.pop(event.cookie, None)
-                if is_directory:
-                    if pending is not None:
-                        self._move_watch_paths(pending.path, path)
-                    self._add_tree(path)
+                if is_directory and pending is not None:
+                    self._move_watch_paths(pending.path, path)
                 if pending is None:
                     self._store.append_event("create", self._relative(path), None)
-                    if is_directory:
+                    if is_directory and self._add_runtime_tree(path):
                         self._emit_created_descendants(path)
                 else:
                     self._store.append_event(
@@ -254,13 +250,13 @@ class InotifyBackend:
                         self._relative(pending.path),
                         self._relative(path),
                     )
+                    if is_directory:
+                        self._add_runtime_tree(path)
                 continue
 
             if event.mask & IN_CREATE:
-                if is_directory:
-                    self._add_tree(path)
                 self._store.append_event("create", self._relative(path), None)
-                if is_directory:
+                if is_directory and self._add_runtime_tree(path):
                     self._emit_created_descendants(path)
                 continue
 
@@ -282,6 +278,17 @@ class InotifyBackend:
             self._store.append_event("delete", self._relative(pending.path), None)
             if pending.is_directory:
                 self._forget_subtree(pending.path)
+
+    def _add_runtime_tree(self, path: Path) -> bool:
+        try:
+            self._add_tree(path)
+        except OSError as exc:
+            if _is_transient_disappearance(exc):
+                return False
+            self.last_error = exc
+            self._store.append_event("rescan-required", "*", None)
+            return False
+        return True
 
     def _emit_created_descendants(self, directory: Path) -> None:
         try:
@@ -346,3 +353,7 @@ class InotifyBackend:
         os.close(fd)
         self._watch_paths.clear()
         self._path_watches.clear()
+
+
+def _is_transient_disappearance(error: OSError) -> bool:
+    return error.errno in {errno.ENOENT, errno.ENOTDIR}

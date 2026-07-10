@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import struct
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,8 @@ import remote_sandbox.remote_agent.inotify as inotify_module
 from remote_sandbox.remote_agent.inotify import (
     IN_ATTRIB,
     IN_CREATE,
+    IN_DELETE,
+    IN_ISDIR,
     IN_MOVED_FROM,
     IN_MOVED_TO,
     IN_Q_OVERFLOW,
@@ -142,3 +145,131 @@ def test_recursive_inotify_adds_each_watch_before_enumerating_children(
         ("watch", root / "child"),
         ("scan", None),
     ]
+
+
+def test_rapid_directory_create_delete_is_transient(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    with RemoteStore(tmp_path / "state.sqlite3") as store:
+        backend = _router(root, store)
+
+        def disappeared(_path: Path) -> None:
+            raise FileNotFoundError(errno.ENOENT, "gone")
+
+        backend._add_tree = disappeared
+
+        backend._process_events(
+            [
+                InotifyEvent(1, IN_CREATE | IN_ISDIR, 0, "temporary", False),
+                InotifyEvent(1, IN_DELETE | IN_ISDIR, 0, "temporary", False),
+            ]
+        )
+
+        assert [(event.kind, event.path) for event in store.events_after(0)] == [
+            ("delete", "temporary")
+        ]
+
+
+def test_rapid_directory_move_in_delete_is_transient(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    with RemoteStore(tmp_path / "state.sqlite3") as store:
+        backend = _router(root, store)
+
+        def disappeared(_path: Path) -> None:
+            raise NotADirectoryError(errno.ENOTDIR, "gone")
+
+        backend._add_tree = disappeared
+
+        backend._process_events(
+            [
+                InotifyEvent(1, IN_MOVED_TO | IN_ISDIR, 17, "incoming", False),
+                InotifyEvent(1, IN_DELETE | IN_ISDIR, 0, "incoming", False),
+            ]
+        )
+
+        assert [(event.kind, event.path) for event in store.events_after(0)] == [
+            ("delete", "incoming")
+        ]
+
+
+def test_runtime_tree_resource_failure_requests_rescan_without_killing_router(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    with RemoteStore(tmp_path / "state.sqlite3") as store:
+        backend = _router(root, store)
+
+        def exhausted(_path: Path) -> None:
+            raise OSError(errno.EMFILE, "too many files")
+
+        backend._add_tree = exhausted
+
+        backend._process_events(
+            [InotifyEvent(1, IN_CREATE | IN_ISDIR, 0, "new", False)]
+        )
+
+        assert isinstance(backend.last_error, OSError)
+        assert [(event.kind, event.path) for event in store.events_after(0)] == [
+            ("create", "new"),
+            ("rescan-required", "*"),
+        ]
+
+
+def test_initial_recursive_setup_surfaces_permission_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    (root / "blocked").mkdir(parents=True)
+    backend = object.__new__(InotifyBackend)
+    backend._root = root
+    backend._add_watch = lambda _path, watch_source=None: None
+    original_open = inotify_module.os.open
+
+    def open_directory(path: Any, flags: int, *, dir_fd: int | None = None) -> int:
+        if path == "blocked":
+            raise PermissionError(errno.EACCES, "denied")
+        return original_open(path, flags, dir_fd=dir_fd)
+
+    monkeypatch.setattr(inotify_module.os, "open", open_directory)
+
+    with pytest.raises(PermissionError, match="denied"):
+        backend._add_tree(root)
+
+
+def test_recursive_setup_bounds_open_descriptors_by_depth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    for index in range(64):
+        (root / f"child-{index:02d}").mkdir()
+    backend = object.__new__(InotifyBackend)
+    backend._root = root
+    backend._add_watch = lambda _path, watch_source=None: None
+    original_open = inotify_module.os.open
+    original_close = inotify_module.os.close
+    tracked: set[int] = set()
+    peak = 0
+
+    def open_directory(path: Any, flags: int, *, dir_fd: int | None = None) -> int:
+        nonlocal peak
+        descriptor = original_open(path, flags, dir_fd=dir_fd)
+        tracked.add(descriptor)
+        peak = max(peak, len(tracked))
+        return descriptor
+
+    def close_directory(descriptor: int) -> None:
+        tracked.discard(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(inotify_module.os, "open", open_directory)
+    monkeypatch.setattr(inotify_module.os, "close", close_directory)
+
+    backend._add_tree(root)
+
+    assert peak <= 2
+    assert not tracked
