@@ -68,16 +68,19 @@ class SyncSession:
         *,
         already_locked: bool = False,
         on_progress: ProgressCallback | None = None,
+        cancel: Callable[[], bool] | None = None,
     ) -> None:
         report = on_progress or _noop_progress
         with self._lock:
             if already_locked:
-                self._sync_locked(report)
+                self._sync_locked(report, cancel)
             else:
                 with workspace_lock(self.local_root):
-                    self._sync_locked(report)
+                    self._sync_locked(report, cancel)
 
-    def _sync_locked(self, report: ProgressCallback) -> None:
+    def _sync_locked(
+        self, report: ProgressCallback, cancel: Callable[[], bool] | None = None
+    ) -> None:
         self.policy = self._load_policy()
         policy = self.policy
         if not self.runner.exists(self.target, remote_agent_path(self.remote)):
@@ -108,6 +111,7 @@ class SyncSession:
                 remote_root=self.remote,
                 state=store,
                 on_progress=report,
+                cancel=cancel,
             )
         report(SyncProgress(phase="done"))
 

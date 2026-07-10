@@ -5,6 +5,7 @@ import os
 import posixpath
 import shlex
 import tempfile
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import TYPE_CHECKING
 from remote_sandbox.manifest import MISSING, EntryKind, EntryState, FileEntry, is_missing
 from remote_sandbox.reconcile import PlanAction, PlanActionType, SyncPlan
 from remote_sandbox.scan import read_placeholder_entry
-from remote_sandbox.ssh import SshRunner
+from remote_sandbox.ssh import SshRunner, TransferCancelled
 from remote_sandbox.state import StateStore
 
 if TYPE_CHECKING:
@@ -32,6 +33,10 @@ class ConcurrentModification(SyncExecutionError):
     """
 
 
+class SyncCancelled(SyncExecutionError):
+    """The sync was aborted because a cancel signal fired (daemon stop)."""
+
+
 def execute_plan(
     plan: SyncPlan,
     *,
@@ -41,6 +46,7 @@ def execute_plan(
     remote_root: str,
     state: StateStore,
     on_progress: ProgressCallback | None = None,
+    cancel: Callable[[], bool] | None = None,
 ) -> None:
     from remote_sandbox.syncsession import SyncProgress
 
@@ -66,6 +72,8 @@ def execute_plan(
             )
         )
     ordered = _execution_order(plan.actions)
+    if cancel is not None and cancel():
+        raise SyncCancelled("sync cancelled")
     # Bulk-transfer regular files in a single tar-over-ssh stream instead of one ssh round
     # trip per file. Falls back to the per-file verified path for any group that errors, so
     # correctness never depends on tar succeeding.
@@ -75,10 +83,13 @@ def execute_plan(
         runner=runner,
         target=target,
         remote_root=remote_root,
+        cancel=cancel,
     )
     skipped = 0
     conflicts = 0
     for action in ordered:
+        if cancel is not None and cancel():
+            raise SyncCancelled("sync cancelled")
         if action.type in {PlanActionType.CONFLICT, PlanActionType.NEEDS_HASH}:
             # A single unsyncable path — a symlink/unsupported file (e.g. .venv/bin/python),
             # a both-sides-changed conflict, or a missing hash — must NOT abort the whole
@@ -181,6 +192,7 @@ def _bulk_transfer_files(
     runner: SshRunner,
     target: str,
     remote_root: str,
+    cancel: Callable[[], bool] | None = None,
 ) -> set[tuple[PlanActionType, str]]:
     """Transfer regular-file PUSH/PULL actions in one tar stream each.
 
@@ -201,15 +213,20 @@ def _bulk_transfer_files(
     done: set[tuple[PlanActionType, str]] = set()
     if len(pushes) >= _BULK_MIN:
         try:
-            runner.push_files(target, str(local_root), remote_root, pushes)
+            runner.push_files(target, str(local_root), remote_root, pushes, cancel)
             done.update((PlanActionType.PUSH, path) for path in pushes)
-        except Exception:  # noqa: BLE001 - any failure falls back to the per-file path
+        except TransferCancelled as exc:
+            # A stop request killed the tar — abort the whole sync, don't fall back.
+            raise SyncCancelled("sync cancelled") from exc
+        except Exception:  # noqa: BLE001 - any other failure falls back to the per-file path
             pass
     if len(pulls) >= _BULK_MIN:
         try:
-            runner.pull_files(target, str(local_root), remote_root, pulls)
+            runner.pull_files(target, str(local_root), remote_root, pulls, cancel)
             done.update((PlanActionType.PULL, path) for path in pulls)
-        except Exception:  # noqa: BLE001 - any failure falls back to the per-file path
+        except TransferCancelled as exc:
+            raise SyncCancelled("sync cancelled") from exc
+        except Exception:  # noqa: BLE001 - any other failure falls back to the per-file path
             pass
     return done
 

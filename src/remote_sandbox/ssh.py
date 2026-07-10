@@ -27,6 +27,10 @@ class SshError(RuntimeError):
     pass
 
 
+class TransferCancelled(RuntimeError):
+    """A batch transfer was aborted because a cancel signal fired (e.g. daemon stop)."""
+
+
 class SshRunner(Protocol):
     def exists(self, target: str, path: str) -> bool: ...
 
@@ -61,13 +65,22 @@ class SshRunner(Protocol):
     def clear_master(self, target: str) -> None: ...
 
     def push_files(
-        self, target: str, local_root: str, remote_root: str, paths: list[str]
+        self,
+        target: str,
+        local_root: str,
+        remote_root: str,
+        paths: list[str],
+        cancel: Callable[[], bool] | None = None,
     ) -> None: ...
 
     def pull_files(
-        self, target: str, local_root: str, remote_root: str, paths: list[str]
+        self,
+        target: str,
+        local_root: str,
+        remote_root: str,
+        paths: list[str],
+        cancel: Callable[[], bool] | None = None,
     ) -> None: ...
-
     def interactive_shell(
         self,
         target: str,
@@ -322,23 +335,37 @@ class FakeSshRunner:
         del target
 
     def push_files(
-        self, target: str, local_root: str, remote_root: str, paths: list[str]
+        self,
+        target: str,
+        local_root: str,
+        remote_root: str,
+        paths: list[str],
+        cancel: Callable[[], bool] | None = None,
     ) -> None:
         from pathlib import Path
 
         base = Path(local_root).expanduser()
         for rel in paths:
+            if cancel is not None and cancel():
+                raise TransferCancelled("push cancelled")
             data = (base / rel).read_bytes()
             remote_path = posixpath.join(remote_root.rstrip("/") or "/", rel)
             self.write_bytes_atomic(target, remote_path, data)
 
     def pull_files(
-        self, target: str, local_root: str, remote_root: str, paths: list[str]
+        self,
+        target: str,
+        local_root: str,
+        remote_root: str,
+        paths: list[str],
+        cancel: Callable[[], bool] | None = None,
     ) -> None:
         from pathlib import Path
 
         base = Path(local_root).expanduser()
         for rel in paths:
+            if cancel is not None and cancel():
+                raise TransferCancelled("pull cancelled")
             data = self.read_bytes(target, posixpath.join(remote_root.rstrip("/") or "/", rel))
             dest = base / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -481,7 +508,12 @@ class SubprocessSshRunner:
     batch_timeout_s = 3600.0
 
     def push_files(
-        self, target: str, local_root: str, remote_root: str, paths: list[str]
+        self,
+        target: str,
+        local_root: str,
+        remote_root: str,
+        paths: list[str],
+        cancel: Callable[[], bool] | None = None,
     ) -> None:
         """Upload many files in ONE ssh connection via a tar stream.
 
@@ -520,10 +552,15 @@ class SubprocessSshRunner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        self._drive_tar_pipeline(tar, ssh, name_blob, direction="push")
+        self._drive_tar_pipeline(tar, ssh, name_blob, direction="push", cancel=cancel)
 
     def pull_files(
-        self, target: str, local_root: str, remote_root: str, paths: list[str]
+        self,
+        target: str,
+        local_root: str,
+        remote_root: str,
+        paths: list[str],
+        cancel: Callable[[], bool] | None = None,
     ) -> None:
         """Download many files in ONE ssh connection via a tar stream (see push_files)."""
         if not paths:
@@ -554,7 +591,7 @@ class SubprocessSshRunner:
             stderr=subprocess.PIPE,
             env=_tar_env(),
         )
-        self._drive_tar_pipeline(ssh, tar, name_blob, direction="pull")
+        self._drive_tar_pipeline(ssh, tar, name_blob, direction="pull", cancel=cancel)
 
     def _drive_tar_pipeline(
         self,
@@ -563,6 +600,7 @@ class SubprocessSshRunner:
         name_blob: bytes,
         *,
         direction: str,
+        cancel: Callable[[], bool] | None = None,
     ) -> None:
         # The consumer reads directly from the producer's stdout (wired at Popen time); close
         # our copy so EOF propagates. The producer takes the NUL-delimited file list on its
@@ -586,8 +624,16 @@ class SubprocessSshRunner:
             with contextlib.suppress(BrokenPipeError):
                 producer.stdin.write(name_blob)
                 producer.stdin.close()
-        producer.wait(timeout=self.batch_timeout_s)
-        consumer.wait(timeout=self.batch_timeout_s)
+        # Poll for completion instead of blocking, so a cancel (daemon stop) can kill the
+        # transfer within ~0.2 s rather than waiting for a multi-minute sync to finish.
+        deadline = None if cancel is not None else self.batch_timeout_s
+        if not _wait_procs([producer, consumer], cancel=cancel, hard_timeout=deadline):
+            for proc in (producer, consumer):
+                with contextlib.suppress(Exception):
+                    proc.kill()
+            for thread in threads:
+                thread.join(timeout=2.0)
+            raise TransferCancelled(f"batch {direction} cancelled")
         for thread in threads:
             thread.join(timeout=5.0)
         if producer.returncode not in (0, None) or consumer.returncode not in (0, None):
@@ -981,6 +1027,30 @@ def _require_metadata_tree(path: str) -> None:
     segments = [seg for seg in path.replace("\\", "/").split("/") if seg not in ("", ".", "~")]
     if METADATA_DIR not in segments:
         raise SshError(f"refusing to recursively remove non-metadata path: {path}")
+
+
+def _wait_procs(
+    procs: list[subprocess.Popen[bytes]],
+    *,
+    cancel: Callable[[], bool] | None,
+    hard_timeout: float | None,
+) -> bool:
+    """Wait for all procs to exit, polling `cancel`. Return True if they finished normally.
+
+    Returns False if `cancel()` becomes true (caller kills the procs) or the hard timeout is
+    hit. Polls every 0.2 s so a stop is honored promptly instead of blocking on a long tar.
+    """
+    import time as _time
+
+    deadline = None if hard_timeout is None else _time.monotonic() + hard_timeout
+    while True:
+        if all(proc.poll() is not None for proc in procs):
+            return True
+        if cancel is not None and cancel():
+            return False
+        if deadline is not None and _time.monotonic() >= deadline:
+            return False
+        _time.sleep(0.2)
 
 
 def _tar_env() -> dict[str, str]:

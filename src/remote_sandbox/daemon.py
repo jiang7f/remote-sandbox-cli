@@ -19,6 +19,7 @@ from urllib.parse import quote, unquote
 from remote_sandbox.agent import remote_agent_path
 from remote_sandbox.marker import local_meta_dir, migrate_local_metadata, read_local_marker
 from remote_sandbox.ssh import SshRunner, SubprocessSshRunner
+from remote_sandbox.sync import SyncCancelled
 from remote_sandbox.syncsession import SyncProgress, SyncSession
 from remote_sandbox.watch import LocalChangeDetector, create_local_watcher
 
@@ -402,8 +403,23 @@ class Daemon:
         """
         self._set_phase(DaemonPhase.INITIAL_SYNCING if initial else DaemonPhase.SYNCING)
         try:
-            session.sync_once(on_progress=self._on_progress)
+            session.sync_once(
+                on_progress=self._on_progress,
+                cancel=self._stop_event.is_set,
+            )
+        except SyncCancelled:
+            # A stop was requested mid-sync; the transfer was killed. Exit quietly — not a
+            # failure, don't mark degraded. The worker loop sees _stop_event and shuts down.
+            self._log.info("sync cancelled (%s) for shutdown", source)
+            with self._status_lock:
+                self._progress = None
+            return
         except Exception as exc:  # keep the daemon alive across transient sync errors
+            if self._stop_event.is_set():
+                # Shutting down; treat any error during teardown as a clean stop.
+                with self._status_lock:
+                    self._progress = None
+                return
             with self._status_lock:
                 self._last_error = str(exc)
                 self._consecutive_failures += 1
@@ -557,13 +573,41 @@ def stop_daemon(local_root: Path) -> bool:
 
 def stop_daemon_result(local_root: Path) -> StopResult:
     local_root = local_root.expanduser().resolve()
-    if not daemon_status(local_root).running:
+    status = daemon_status(local_root)
+    if not status.running:
         return StopResult.NOT_RUNNING
-    if _request(local_root, "stop") is None:
-        return StopResult.TIMEOUT
-    if _wait_until_stopped(local_root):
+    # Ask nicely: the daemon cancels any in-flight sync (killing the tar) and shuts down.
+    if _request(local_root, "stop") is not None and _wait_until_stopped(local_root):
+        return StopResult.STOPPED
+    # Guaranteed stop: if graceful shutdown did not complete in time (e.g. a wedged transfer),
+    # signal the process directly so `rsb stop`/`forget` can never be permanently stuck.
+    pid = status.pid if status.pid is not None else _read_pidfile(local_root)
+    if pid is not None and _terminate_process(pid):
         return StopResult.STOPPED
     return StopResult.TIMEOUT
+
+
+def _terminate_process(pid: int, *, timeout: float = 6.0) -> bool:
+    """SIGTERM then SIGKILL a daemon pid; return True once it is gone."""
+    import signal
+
+    if not _process_exists(pid):
+        return True
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _process_exists(pid):
+            return True
+        time.sleep(0.1)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if not _process_exists(pid):
+            return True
+        time.sleep(0.1)
+    return not _process_exists(pid)
 
 
 def ensure_daemon(local_root: Path, *, runner: SshRunner | None = None) -> DaemonStatus:
