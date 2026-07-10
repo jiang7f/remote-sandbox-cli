@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from remote_sandbox import namespace
+
 DEFAULT_PLACEHOLDER_LIMIT = 10 * 1000 * 1000
 CONFIG_FILE_NAME = "config.toml"
 
@@ -21,10 +23,7 @@ class Settings:
 
 
 def remote_sandbox_home() -> Path:
-    override = os.environ.get("REMOTE_SANDBOX_HOME")
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".remote-sandbox"
+    return namespace.tool_home()
 
 
 def settings_path() -> Path:
