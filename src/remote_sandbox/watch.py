@@ -16,6 +16,23 @@ from remote_sandbox.policy import PolicyEngine
 
 EventCallback = Callable[[EventKind, str, str | None], None]
 PolicySource = PolicyEngine | Callable[[], PolicyEngine]
+Clock = Callable[[], float]
+
+
+class ScheduledCall(Protocol):
+    def cancel(self) -> None: ...
+
+
+class Scheduler(Protocol):
+    def call_later(self, delay: float, callback: Callable[[], None]) -> ScheduledCall: ...
+
+
+class _ThreadingScheduler:
+    def call_later(self, delay: float, callback: Callable[[], None]) -> ScheduledCall:
+        timer = threading.Timer(delay, callback)
+        timer.daemon = True
+        timer.start()
+        return timer
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +42,24 @@ class LocalSignature:
     mtime_ns: int
     mode: int
     link_target: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RootIdentity:
+    device: int
+    inode: int
+
+
+@dataclass(slots=True)
+class _DebounceState:
+    last_emitted: float
+    pending: bool = False
+    generation: int = 0
+    scheduled_call: ScheduledCall | None = None
+
+
+class WatchRootInvalid(RuntimeError):
+    pass
 
 
 class LocalEventWatcher(Protocol):
@@ -86,9 +121,16 @@ class PollingLocalWatcher:
         self._policy = policy
         self._on_event = on_event
         self._interval = interval
-        self._snapshot = _scan_snapshot(self._root, _current_policy(self._policy))
+        self._root_identity = _root_identity(self._root)
+        self._snapshot = _scan_snapshot(
+            self._root,
+            _current_policy(self._policy),
+            expected_root=self._root_identity,
+        )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._health_lock = threading.Lock()
+        self._unhealthy = False
         self.last_error: BaseException | None = None
 
     def start(self) -> None:
@@ -108,14 +150,46 @@ class PollingLocalWatcher:
 
     def _run(self) -> None:
         while not self._stop.wait(self._interval):
-            try:
-                current = _scan_snapshot(self._root, _current_policy(self._policy))
-                for kind, path, destination in _snapshot_events(self._snapshot, current):
-                    self._on_event(kind, path, destination)
-                self._snapshot = current
-                self.last_error = None
-            except Exception as exc:  # pragma: no cover - exercised through thread behaviour
-                self.last_error = exc
+            self._poll_once()
+
+    def _poll_once(self) -> None:
+        try:
+            current = _scan_snapshot(
+                self._root,
+                _current_policy(self._policy),
+                expected_root=self._root_identity,
+            )
+        except WatchRootInvalid as exc:
+            self.last_error = exc
+            self._report_unhealthy()
+            return
+        except Exception as exc:  # pragma: no cover - exercised through thread behaviour
+            self.last_error = exc
+            return
+
+        try:
+            for kind, path, destination in _snapshot_events(self._snapshot, current):
+                self._on_event(kind, path, destination)
+        except Exception as exc:  # pragma: no cover - exercised through thread behaviour
+            self.last_error = exc
+            return
+
+        self._snapshot = current
+        with self._health_lock:
+            self._unhealthy = False
+        self.last_error = None
+
+    def _report_unhealthy(self) -> None:
+        with self._health_lock:
+            if self._unhealthy:
+                return
+            self._unhealthy = True
+        try:
+            self._on_event(EventKind.RESCAN_REQUIRED, "*", None)
+        except Exception as exc:  # pragma: no cover - exercised through thread behaviour
+            with self._health_lock:
+                self._unhealthy = False
+            self.last_error = exc
 
 
 class WatchdogLocalWatcher:
@@ -128,71 +202,256 @@ class WatchdogLocalWatcher:
         on_event: EventCallback,
         *,
         debounce: float = 0.1,
+        clock: Clock = time.monotonic,
+        scheduler: Scheduler | None = None,
+        observer_factory: Callable[[], Any] | None = None,
+        event_handler_base: type[Any] | None = None,
+        health_interval: float = 0.5,
     ) -> None:
+        if debounce < 0:
+            raise ValueError("debounce must be non-negative")
+        if health_interval <= 0:
+            raise ValueError("health_interval must be positive")
         self._root = root.expanduser().resolve()
         self._policy = policy
         self._on_event = on_event
         self._debounce = debounce
-        self._recent: dict[tuple[EventKind, str, str | None], float] = {}
-        self._recent_lock = threading.Lock()
+        self._clock = clock
+        self._scheduler = scheduler or _ThreadingScheduler()
+        self._observer_factory = observer_factory
+        self._event_handler_base = event_handler_base
+        self._health_interval = health_interval
+        self._debounce_state: dict[tuple[EventKind, str, str | None], _DebounceState] = {}
+        self._state_lock = threading.RLock()
+        self._generation = 0
         self._observer: Any | None = None
+        self._health_call: ScheduledCall | None = None
+        self._accepting_events = True
+        self._stopping = False
+        self._unhealthy = False
+        self._terminal_health_failure = False
         self.last_error: BaseException | None = None
 
     def start(self) -> None:
-        if self._observer is not None:
-            return
-        events, observers = _watchdog_modules()
+        with self._state_lock:
+            if self._observer is not None:
+                return
+            self._accepting_events = True
+            self._stopping = False
+            self._unhealthy = False
+            self._terminal_health_failure = False
+        if self._observer_factory is None or self._event_handler_base is None:
+            events, observers = _watchdog_modules()
+            observer_factory = observers.Observer
+            event_handler_base = events.FileSystemEventHandler
+        else:
+            observer_factory = self._observer_factory
+            event_handler_base = self._event_handler_base
         watcher = self
 
-        class Handler(events.FileSystemEventHandler):  # type: ignore[misc, name-defined]
+        class Handler(event_handler_base):  # type: ignore[misc, valid-type]
             def on_any_event(self, event: object) -> None:
                 watcher._dispatch(event)
 
-        observer = observers.Observer()
+        observer = observer_factory()
         observer.schedule(Handler(), str(self._root), recursive=True)
         try:
             observer.start()
         except BaseException:
             observer.stop()
             raise
-        self._observer = observer
+        with self._state_lock:
+            self._observer = observer
+            self._schedule_health_check_locked()
 
     def stop(self) -> None:
-        if self._observer is None:
-            return
-        observer = self._observer
-        self._observer = None
-        observer.stop()
-        observer.join(timeout=2.0)
+        with self._state_lock:
+            self._stopping = True
+            observer = self._observer
+            self._observer = None
+            health_call = self._health_call
+            self._health_call = None
+        if health_call is not None:
+            health_call.cancel()
+        if observer is not None:
+            observer.stop()
+            observer.join(timeout=2.0)
+        pending = self._close_debounce()
+        for mapped in pending:
+            self._emit(mapped)
+        with self._state_lock:
+            self._stopping = False
 
     def _dispatch(self, event: object) -> None:
         try:
             mapped = map_watchdog_event(self._root, _current_policy(self._policy), event)
             if mapped is None:
                 return
-            now = time.monotonic()
-            with self._recent_lock:
-                previous = self._recent.get(mapped)
-                if previous is not None and now - previous < self._debounce:
-                    return
-                self._recent[mapped] = now
-                if len(self._recent) > 1024:
-                    cutoff = now - self._debounce
-                    self._recent = {
-                        key: emitted_at
-                        for key, emitted_at in self._recent.items()
-                        if emitted_at >= cutoff
-                    }
-            try:
-                self._on_event(*mapped)
-            except Exception:
-                with self._recent_lock:
-                    if self._recent.get(mapped) == now:
-                        self._recent.pop(mapped, None)
-                raise
-            self.last_error = None
+            if mapped[0] is EventKind.RESCAN_REQUIRED:
+                terminal = _event_invalidates_root(self._root, event)
+                reason = (
+                    "watched root was deleted or renamed"
+                    if terminal
+                    else "filesystem event history was lost"
+                )
+                self._report_unhealthy(RuntimeError(reason), terminal=terminal)
+                return
+            self._mark_healthy()
+            self._cancel_superseded_pending(mapped)
+            self._debounce_event(mapped)
         except Exception as exc:  # pragma: no cover - exercised through observer thread behaviour
             self.last_error = exc
+
+    def _debounce_event(self, mapped: tuple[EventKind, str, str | None]) -> None:
+        now = self._clock()
+        emit_immediately = False
+        with self._state_lock:
+            if not self._accepting_events:
+                return
+            existing = self._debounce_state.get(mapped)
+            if existing is None or now - existing.last_emitted >= self._debounce:
+                if existing is not None and existing.scheduled_call is not None:
+                    existing.scheduled_call.cancel()
+                state = _DebounceState(last_emitted=now)
+                self._debounce_state[mapped] = state
+                emit_immediately = True
+            else:
+                state = existing
+                state.pending = True
+                if state.scheduled_call is None:
+                    self._generation += 1
+                    generation = self._generation
+                    state.generation = generation
+                    delay = max(0.0, self._debounce - (now - state.last_emitted))
+                    state.scheduled_call = self._scheduler.call_later(
+                        delay,
+                        lambda: self._emit_trailing(mapped, generation),
+                    )
+            self._prune_debounce_locked(now)
+        if emit_immediately:
+            self._emit(mapped)
+
+    def _emit_trailing(
+        self,
+        mapped: tuple[EventKind, str, str | None],
+        generation: int,
+    ) -> None:
+        with self._state_lock:
+            state = self._debounce_state.get(mapped)
+            if (
+                state is None
+                or state.generation != generation
+                or not state.pending
+                or not self._accepting_events
+            ):
+                return
+            state.pending = False
+            state.scheduled_call = None
+            state.last_emitted = self._clock()
+        self._emit(mapped)
+
+    def _emit(self, mapped: tuple[EventKind, str, str | None]) -> None:
+        try:
+            self._on_event(*mapped)
+        except Exception as exc:
+            self.last_error = exc
+            return
+        with self._state_lock:
+            if not self._terminal_health_failure:
+                self.last_error = None
+
+    def _close_debounce(self) -> list[tuple[EventKind, str, str | None]]:
+        with self._state_lock:
+            self._accepting_events = False
+            pending = [mapped for mapped, state in self._debounce_state.items() if state.pending]
+            for state in self._debounce_state.values():
+                if state.scheduled_call is not None:
+                    state.scheduled_call.cancel()
+            self._debounce_state.clear()
+        return pending
+
+    def _cancel_superseded_pending(
+        self,
+        mapped: tuple[EventKind, str, str | None],
+    ) -> None:
+        kind, path, destination = mapped
+        if kind not in {EventKind.DELETE, EventKind.MOVE}:
+            return
+        affected_paths = {path}
+        if destination is not None:
+            affected_paths.add(destination)
+        with self._state_lock:
+            superseded = [
+                candidate
+                for candidate in self._debounce_state
+                if candidate != mapped
+                and (
+                    candidate[1] in affected_paths
+                    or (candidate[2] is not None and candidate[2] in affected_paths)
+                )
+            ]
+            for candidate in superseded:
+                state = self._debounce_state.pop(candidate)
+                if state.scheduled_call is not None:
+                    state.scheduled_call.cancel()
+
+    def _prune_debounce_locked(self, now: float) -> None:
+        if len(self._debounce_state) <= 1024:
+            return
+        cutoff = now - self._debounce
+        self._debounce_state = {
+            mapped: state
+            for mapped, state in self._debounce_state.items()
+            if state.pending or state.last_emitted >= cutoff
+        }
+
+    def _report_unhealthy(self, error: BaseException, *, terminal: bool) -> None:
+        with self._state_lock:
+            self.last_error = error
+            self._terminal_health_failure = self._terminal_health_failure or terminal
+            if self._unhealthy:
+                return
+            self._unhealthy = True
+        try:
+            self._on_event(EventKind.RESCAN_REQUIRED, "*", None)
+        except Exception as exc:
+            with self._state_lock:
+                self._unhealthy = False
+                self.last_error = exc
+
+    def _mark_healthy(self) -> None:
+        with self._state_lock:
+            if not self._terminal_health_failure:
+                self._unhealthy = False
+
+    def _schedule_health_check_locked(self) -> None:
+        if self._health_call is not None or self._observer is None or self._stopping:
+            return
+        self._health_call = self._scheduler.call_later(
+            self._health_interval,
+            self._check_observer_health,
+        )
+
+    def _check_observer_health(self) -> None:
+        with self._state_lock:
+            self._health_call = None
+            observer = self._observer
+            if observer is None or self._stopping:
+                return
+        try:
+            healthy = bool(observer.is_alive()) and all(
+                bool(emitter.is_alive()) for emitter in getattr(observer, "emitters", ())
+            )
+        except Exception:
+            healthy = False
+        if not healthy:
+            self._report_unhealthy(
+                RuntimeError("filesystem observer stopped unexpectedly"),
+                terminal=True,
+            )
+            return
+        with self._state_lock:
+            self._schedule_health_check_locked()
 
 
 def map_watchdog_event(
@@ -205,6 +464,8 @@ def map_watchdog_event(
     event_type = getattr(event, "event_type", None)
     if not isinstance(event_type, str):
         return None
+    if _event_requires_rescan(root, event):
+        return EventKind.RESCAN_REQUIRED, "*", None
     source = _relative_event_path(root, getattr(event, "src_path", None))
     if source is not None and policy.is_ignored(source):
         source = None
@@ -304,7 +565,13 @@ def _snapshot_events(
     ]
 
 
-def _scan_snapshot(root: Path, policy: PolicyEngine) -> dict[str, LocalSignature]:
+def _scan_snapshot(
+    root: Path,
+    policy: PolicyEngine,
+    *,
+    expected_root: _RootIdentity | None = None,
+) -> dict[str, LocalSignature]:
+    _validate_root_identity(root, expected_root)
     snapshot: dict[str, LocalSignature] = {}
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         current_dir = Path(dirpath)
@@ -332,6 +599,7 @@ def _scan_snapshot(root: Path, policy: PolicyEngine) -> dict[str, LocalSignature
             signature = _read_signature(path)
             if signature is not None:
                 snapshot[relative_path] = signature
+    _validate_root_identity(root, expected_root)
     return snapshot
 
 
@@ -368,6 +636,55 @@ def _relative_event_path(root: Path, value: object) -> str | None:
         return normalize_relative_path(relative)
     except (TypeError, ValueError):
         return None
+
+
+def _event_requires_rescan(root: Path, event: object) -> bool:
+    event_type = getattr(event, "event_type", None)
+    if event_type in {
+        "overflow",
+        "queue-overflow",
+        "lost-history",
+        "history-lost",
+        EventKind.RESCAN_REQUIRED.value,
+    }:
+        return True
+    if any(
+        getattr(event, attribute, False) is True
+        for attribute in (
+            "is_overflow",
+            "overflow",
+            "lost_history",
+            "history_lost",
+            "rescan_required",
+        )
+    ):
+        return True
+    return _event_invalidates_root(root, event)
+
+
+def _event_invalidates_root(root: Path, event: object) -> bool:
+    if getattr(event, "event_type", None) not in {"deleted", "moved"}:
+        return False
+    value = getattr(event, "src_path", None)
+    if not isinstance(value, (str, bytes, os.PathLike)):
+        return False
+    return os.path.normcase(os.path.abspath(os.fsdecode(value))) == os.path.normcase(str(root))
+
+
+def _root_identity(root: Path) -> _RootIdentity:
+    try:
+        metadata = root.stat()
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise WatchRootInvalid(f"watched root is unavailable: {root}") from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise WatchRootInvalid(f"watched root is not a directory: {root}")
+    return _RootIdentity(metadata.st_dev, metadata.st_ino)
+
+
+def _validate_root_identity(root: Path, expected: _RootIdentity | None) -> None:
+    current = _root_identity(root)
+    if expected is not None and current != expected:
+        raise WatchRootInvalid(f"watched root was replaced: {root}")
 
 
 def _current_policy(policy: PolicySource) -> PolicyEngine:

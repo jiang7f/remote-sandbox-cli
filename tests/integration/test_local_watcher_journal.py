@@ -139,3 +139,23 @@ def test_polling_fallback_emits_changed_paths_instead_of_a_global_poke(
         for kind, path, destination in events
     )
     assert all(path != "*" for _kind, path, _destination in events)
+
+
+def test_polling_fallback_requests_one_rescan_when_its_root_is_replaced(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    events: list[tuple[EventKind, str, str | None]] = []
+    watcher = PollingLocalWatcher(
+        root,
+        StaticPolicyEngine(),
+        lambda kind, path, destination: events.append((kind, path, destination)),
+    )
+    root.rename(tmp_path / "old-workspace")
+    root.mkdir()
+
+    watcher._poll_once()
+    watcher._poll_once()
+
+    assert events == [(EventKind.RESCAN_REQUIRED, "*", None)]
