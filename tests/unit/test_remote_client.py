@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import subprocess
+import sys
 import threading
 from typing import Any
 
@@ -97,6 +98,60 @@ class StreamingRunner(RecordingRunner):
     ) -> StreamingProcess:
         self.stream_calls.append((target, path, input_data, args))
         return self.streams.pop(0)
+
+
+class LaunchBarrierRunner(StreamingRunner):
+    def __init__(self, process: StreamingProcess) -> None:
+        super().__init__({}, [process])
+        self.process_created = threading.Event()
+        self.release_process = threading.Event()
+
+    def stream_python_file(
+        self,
+        target: str,
+        path: str,
+        input_data: bytes,
+        args: tuple[str, ...] = (),
+    ) -> StreamingProcess:
+        self.stream_calls.append((target, path, input_data, args))
+        process = self.streams.pop(0)
+        self.process_created.set()
+        assert self.release_process.wait(timeout=1.0)
+        return process
+
+
+class RealSubprocessStreamingRunner(RecordingRunner):
+    def __init__(self) -> None:
+        super().__init__({})
+        self.processes: list[subprocess.Popen[bytes]] = []
+
+    def stream_python_file(
+        self,
+        target: str,
+        path: str,
+        input_data: bytes,
+        args: tuple[str, ...] = (),
+    ) -> subprocess.Popen[bytes]:
+        del target, path, args
+        script = (
+            "import sys\n"
+            "sys.stdin.buffer.read()\n"
+            "sys.stderr.buffer.write(b'x' * (4 * 1024 * 1024))\n"
+            "sys.stderr.buffer.write(b'\\nuseful-stderr-tail\\n')\n"
+            "sys.stderr.buffer.flush()\n"
+            "raise SystemExit(7)\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert process.stdin is not None
+        process.stdin.write(input_data)
+        process.stdin.close()
+        self.processes.append(process)
+        return process
 
 
 class RawRunner:
@@ -457,6 +512,92 @@ def test_close_interrupts_reopen_backoff_without_spawning_again(
     assert stopped.is_set()
     assert not thread.is_alive()
     assert len(runner.stream_calls) == 1
+
+
+def test_close_during_stream_launch_terminates_late_process_without_reopening() -> None:
+    process = StreamingProcess(b"")
+    runner = LaunchBarrierRunner(process)
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+    )
+    subscription = client.subscribe(after_sequence=0)
+    iterator = iter(subscription)
+    stopped = threading.Event()
+    failures: list[BaseException] = []
+
+    def consume() -> None:
+        try:
+            next(iterator)
+        except StopIteration:
+            stopped.set()
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=consume)
+    thread.start()
+    assert runner.process_created.wait(timeout=1.0)
+
+    subscription.close()
+    subscription.close()
+    runner.release_process.set()
+    thread.join(timeout=1.0)
+
+    assert failures == []
+    assert stopped.is_set()
+    assert not thread.is_alive()
+    assert len(runner.stream_calls) == 1
+    assert process.terminated
+    assert process.wait_calls == [1.0]
+    assert process.stdin.closed
+    assert process.stdout.closed
+    assert process.stderr.closed
+
+
+@pytest.mark.timeout(5)
+def test_subscription_drains_large_stderr_without_pipe_deadlock() -> None:
+    runner = RealSubprocessStreamingRunner()
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+    )
+    subscription = client.subscribe(after_sequence=0)
+    iterator = iter(subscription)
+    finished = threading.Event()
+    failures: list[BaseException] = []
+
+    def consume() -> None:
+        try:
+            next(iterator)
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=consume)
+    thread.start()
+    completed_promptly = finished.wait(timeout=2.0)
+    if not completed_promptly:
+        subscription.close()
+    thread.join(timeout=1.0)
+    subscription.close()
+
+    assert completed_promptly
+    assert not thread.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], RemoteProtocolError)
+    assert "useful-stderr-tail" in str(failures[0])
+    assert len(str(failures[0]).encode("utf-8")) <= 66 * 1024
+    assert len(runner.processes) == 1
+    process = runner.processes[0]
+    assert process.returncode == 7
+    assert process.stdin is not None and process.stdin.closed
+    assert process.stdout is not None and process.stdout.closed
+    assert process.stderr is not None and process.stderr.closed
 
 
 def test_malformed_foreground_response_raises_protocol_error() -> None:

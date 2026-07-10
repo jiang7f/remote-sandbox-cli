@@ -65,6 +65,36 @@ class _AgentManager(Protocol):
     def ensure(self, target: str) -> AgentInstall: ...
 
 
+class _BoundedStderrDrainer:
+    _READ_SIZE = 8192
+
+    def __init__(self, stream: BinaryIO | None, limit: int) -> None:
+        self._stream = stream
+        self._limit = limit
+        self._buffer = bytearray()
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def finish(self) -> bytes:
+        self._thread.join()
+        return bytes(self._buffer)
+
+    def _drain(self) -> None:
+        if self._stream is None:
+            return
+        with contextlib.suppress(OSError, ValueError):
+            while chunk := self._stream.read(self._READ_SIZE):
+                if len(chunk) >= self._limit:
+                    self._buffer[:] = chunk[-self._limit :]
+                    continue
+                overflow = len(self._buffer) + len(chunk) - self._limit
+                if overflow > 0:
+                    del self._buffer[:overflow]
+                self._buffer.extend(chunk)
+
+
 class RemoteWorkspaceClient:
     def __init__(
         self,
@@ -212,41 +242,73 @@ class RemoteWorkspaceClient:
 class RemoteEventSubscription:
     _INITIAL_REOPEN_DELAY_S = 0.05
     _MAX_REOPEN_DELAY_S = 1.0
+    _STDERR_LIMIT = 64 * 1024
 
     def __init__(self, client: RemoteWorkspaceClient, after_sequence: int) -> None:
         self._client = client
         self._last_acknowledged = after_sequence
         self._process: _StreamProcess | None = None
+        self._stderr_drainer: _BoundedStderrDrainer | None = None
         self._closed = False
         self._close_event = threading.Event()
         self._iterating = False
+        self._state_lock = threading.Lock()
 
     def __iter__(self) -> Iterator[JournalEvent]:
-        if self._iterating:
-            raise RuntimeError("remote event subscription already has an iterator")
-        self._iterating = True
+        with self._state_lock:
+            if self._iterating:
+                raise RuntimeError("remote event subscription already has an iterator")
+            self._iterating = True
         reopen_delay = self._INITIAL_REOPEN_DELAY_S
         try:
-            while not self._closed:
-                process = self._client._open_event_stream(self._last_acknowledged)
-                self._process = process
-                stream = process.stdout
-                if stream is None:
-                    self._terminate_process(process)
-                    raise RemoteProtocolError("remote event process has no stdout pipe")
-                delivered_event = False
-                for line in stream:
+            while True:
+                with self._state_lock:
                     if self._closed:
                         return
-                    delivered_event = True
-                    yield parse_event_line(line)
-                returncode, stderr = self._wait_process(process)
-                if self._process is process:
-                    self._process = None
+                    after_sequence = self._last_acknowledged
+                process = self._client._open_event_stream(after_sequence)
+                drainer = _BoundedStderrDrainer(process.stderr, self._STDERR_LIMIT)
+                drainer.start()
+                with self._state_lock:
+                    if self._closed:
+                        publish = False
+                    else:
+                        self._process = process
+                        self._stderr_drainer = drainer
+                        publish = True
+                if not publish:
+                    self._terminate_process(process, drainer)
+                    return
+                stream = process.stdout
+                if stream is None:
+                    self._detach_process(process)
+                    self._terminate_process(process, drainer)
+                    raise RemoteProtocolError("remote event process has no stdout pipe")
+                delivered_event = False
+                try:
+                    for line in stream:
+                        with self._state_lock:
+                            if self._closed:
+                                return
+                        delivered_event = True
+                        yield parse_event_line(line)
+                except (OSError, ValueError):
+                    with self._state_lock:
+                        if self._closed:
+                            return
+                    raise
+                owned_drainer = self._detach_process(process)
+                if owned_drainer is None:
+                    with self._state_lock:
+                        if self._closed:
+                            return
+                    raise RuntimeError("remote event process ownership was lost")
+                returncode, stderr = self._wait_process(process, owned_drainer)
                 if returncode != 0:
                     raise RemoteProtocolError(_stream_failure_detail(stderr, returncode))
-                if self._closed:
-                    return
+                with self._state_lock:
+                    if self._closed:
+                        return
                 if delivered_event:
                     reopen_delay = self._INITIAL_REOPEN_DELAY_S
                 if self._wait_before_reopen(reopen_delay):
@@ -254,40 +316,69 @@ class RemoteEventSubscription:
                 if not delivered_event:
                     reopen_delay = min(reopen_delay * 2, self._MAX_REOPEN_DELAY_S)
         finally:
-            active_process = self._process
+            active_process, active_drainer = self._take_process()
             if active_process is not None:
-                self._terminate_process(active_process)
-                self._process = None
-            self._iterating = False
+                assert active_drainer is not None
+                self._terminate_process(active_process, active_drainer)
+            with self._state_lock:
+                self._iterating = False
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._close_event.set()
-        process = self._process
-        if process is not None:
-            self._terminate_process(process)
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._close_event.set()
+            process = self._process
+            drainer = self._stderr_drainer
             self._process = None
+            self._stderr_drainer = None
+        if process is not None:
+            assert drainer is not None
+            self._terminate_process(process, drainer)
         self._client._discard_subscription(self)
 
     def _acknowledged(self, sequence: int) -> None:
-        self._last_acknowledged = max(self._last_acknowledged, sequence)
+        with self._state_lock:
+            self._last_acknowledged = max(self._last_acknowledged, sequence)
 
     def _wait_before_reopen(self, delay: float) -> bool:
         return self._close_event.wait(delay)
 
+    def _detach_process(self, process: _StreamProcess) -> _BoundedStderrDrainer | None:
+        with self._state_lock:
+            if self._process is not process:
+                return None
+            drainer = self._stderr_drainer
+            self._process = None
+            self._stderr_drainer = None
+            return drainer
+
+    def _take_process(self) -> tuple[_StreamProcess | None, _BoundedStderrDrainer | None]:
+        with self._state_lock:
+            process = self._process
+            drainer = self._stderr_drainer
+            self._process = None
+            self._stderr_drainer = None
+            return process, drainer
+
     @staticmethod
-    def _wait_process(process: _StreamProcess) -> tuple[int, bytes]:
+    def _wait_process(
+        process: _StreamProcess,
+        drainer: _BoundedStderrDrainer,
+    ) -> tuple[int, bytes]:
         try:
             returncode = process.wait()
-            stderr = b"" if process.stderr is None else process.stderr.read()
+            stderr = drainer.finish()
             return returncode, stderr
         finally:
             _close_process_pipes(process)
 
     @staticmethod
-    def _terminate_process(process: _StreamProcess) -> None:
+    def _terminate_process(
+        process: _StreamProcess,
+        drainer: _BoundedStderrDrainer,
+    ) -> None:
         try:
             if process.stdin is not None:
                 with contextlib.suppress(Exception):
@@ -300,6 +391,7 @@ class RemoteEventSubscription:
                 process.kill()
                 process.wait(timeout=1.0)
         finally:
+            drainer.finish()
             _close_process_pipes(process)
 
 
