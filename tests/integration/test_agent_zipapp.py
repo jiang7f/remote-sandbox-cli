@@ -52,7 +52,7 @@ def test_agent_zipapp_self_check(tmp_path: Path) -> None:
 
 def test_agent_zipapp_returns_structured_error_for_unsupported_request(tmp_path: Path) -> None:
     archive = build_agent_zipapp(tmp_path / "agent.pyz")
-    request = AgentRequest("register", {"root": "/home/u/算法测试"})
+    request = AgentRequest("not-a-command", {"root": "/home/u/算法测试"})
 
     result = subprocess.run(
         ["python3", str(archive)],
@@ -65,7 +65,7 @@ def test_agent_zipapp_returns_structured_error_for_unsupported_request(tmp_path:
     assert decode_response(result.stdout) == AgentResponse(
         ok=False,
         payload={},
-        error="unsupported command: register",
+        error="unsupported command: not-a-command",
     )
 
 
@@ -83,12 +83,18 @@ def test_agent_zipapp_has_stable_bytes_and_self_contained_layout(tmp_path: Path)
             "remote_agent/",
             "remote_agent/__init__.py",
             "remote_agent/__main__.py",
+            "remote_agent/inotify.py",
+            "remote_agent/store.py",
+            "remote_agent/watcher.py",
         ]
-        assert [entry.date_time for entry in entries] == [(1980, 1, 1, 0, 0, 0)] * 4
-        assert [entry.compress_type for entry in entries] == [zipfile.ZIP_STORED] * 4
+        assert [entry.date_time for entry in entries] == [(1980, 1, 1, 0, 0, 0)] * 7
+        assert [entry.compress_type for entry in entries] == [zipfile.ZIP_STORED] * 7
         assert [stat.S_IMODE(entry.external_attr >> 16) for entry in entries] == [
             0o644,
             0o755,
+            0o644,
+            0o644,
+            0o644,
             0o644,
             0o644,
         ]
