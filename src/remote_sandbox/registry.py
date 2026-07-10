@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import os
 import re
 import tempfile
@@ -10,8 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from remote_sandbox.marker import read_local_marker
 from remote_sandbox.settings import remote_sandbox_home
+from remote_sandbox.workspace import WorkspaceSpec, validate_workspace_id
 
 _VALID_CONNECTION_NAME = re.compile(r"^[A-Za-z0-9_.@-]+$")
 
@@ -70,6 +69,7 @@ def list_binding_records(path: Path | None = None) -> list[BindingRecord]:
 
 def upsert_binding_record(path: Path | None, record: BindingRecord) -> None:
     validate_connection_name(record.name)
+    validate_workspace_id(record.workspace_id)
     registry = path or registry_path()
     record_local = _resolved_local_path(record.local_path)
     records = []
@@ -78,8 +78,10 @@ def upsert_binding_record(path: Path | None, record: BindingRecord) -> None:
         same_workspace = existing.workspace_id == record.workspace_id
         same_local = existing_local == record_local
         same_name = existing.name == record.name
-        if same_name and not (same_workspace or same_local):
+        if same_name and not same_workspace:
             raise RegistryError(f"Connection name already exists: {record.name}")
+        if same_local and not same_workspace:
+            raise RegistryError(f"Local path is already registered: {record_local}")
         if same_workspace or same_local:
             continue
         records.append(existing)
@@ -133,6 +135,26 @@ def delete_binding_record(name: str, path: Path | None = None) -> bool:
     return True
 
 
+def register_workspace(
+    spec: WorkspaceSpec,
+    *,
+    registry: Path | None = None,
+) -> BindingRecord:
+    """Register a workspace from its external durable specification."""
+    validate_workspace_id(spec.workspace_id)
+    local_path = str(_resolved_local_path(spec.local_root))
+    record = BindingRecord(
+        name=spec.name,
+        workspace_id=spec.workspace_id,
+        target=spec.target,
+        remote_path=spec.remote_root,
+        local_path=local_path,
+        updated_at=spec.created_at,
+    )
+    upsert_binding_record(registry, record)
+    return record
+
+
 def record_binding_from_marker(
     *,
     workspace_id: str,
@@ -150,19 +172,16 @@ def record_binding_from_marker(
         target=target,
         local_path=local_path,
     )
-    record = BindingRecord(
-        name=connection_name,
+    spec = WorkspaceSpec(
+        schema_version=1,
         workspace_id=workspace_id,
+        name=connection_name,
         target=target,
-        remote_path=remote_path,
-        local_path=local_path,
-        updated_at=now_iso(),
+        local_root=local_path,
+        remote_root=remote_path,
+        created_at=now_iso(),
     )
-    upsert_binding_record(
-        registry,
-        record,
-    )
-    return record
+    return register_workspace(spec, registry=registry)
 
 
 def validate_connection_name(name: str) -> str:
@@ -239,23 +258,15 @@ def generate_connection_name(
 
 
 def current_workspace_record(path: Path | None, cwd: Path) -> BindingRecord | None:
-    resolved = cwd.expanduser().resolve()
+    resolved = cwd.expanduser().resolve(strict=False)
     matches: list[tuple[int, BindingRecord]] = []
     for record in list_binding_records(path):
-        local_path = Path(record.local_path).expanduser()
+        local_resolved = _resolved_local_path(record.local_path)
         try:
-            local_resolved = local_path.resolve(strict=False)
             resolved.relative_to(local_resolved)
         except ValueError:
             continue
-        with contextlib.suppress(Exception):
-            marker = read_local_marker(local_resolved)
-            if marker is not None:
-                if marker.workspace_id == record.workspace_id:
-                    matches.append((len(local_resolved.parts), record))
-                continue
-        if path is not None:
-            matches.append((len(local_resolved.parts), record))
+        matches.append((len(local_resolved.parts), record))
     if not matches:
         return None
     return max(matches, key=lambda item: item[0])[1]
@@ -264,6 +275,7 @@ def current_workspace_record(path: Path | None, cwd: Path) -> BindingRecord | No
 def _record_from_dict(item: dict[str, Any]) -> BindingRecord:
     try:
         workspace_id = _expect_str(item["workspace_id"])
+        validate_workspace_id(workspace_id)
         target = _expect_str(item["target"])
         remote_path = _expect_str(item["remote_path"])
         local_path = _expect_str(item["local_path"])
