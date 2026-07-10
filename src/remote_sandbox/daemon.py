@@ -241,7 +241,7 @@ class _RemoteWatcher:
             proc = None
             try:
                 proc = self._runner.spawn_remote_watch(  # type: ignore[attr-defined]
-                    self._target, agent_path, 1.0
+                    self._target, agent_path, self._remote, 1.0
                 )
                 self._proc = proc
                 failures = 0

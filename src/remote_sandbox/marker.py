@@ -37,6 +37,26 @@ def local_meta_dir(root: Path) -> Path:
     return remote_sandbox_home() / "workspaces" / f"L-{digest}"
 
 
+def remote_meta_dir(remote_root: str) -> str:
+    """Per-workspace remote metadata dir (POSIX), OUTSIDE the remote working tree.
+
+    Returns `~/.remote-sandbox/workspaces/R-<hash>`; `~` is expanded on the remote by the
+    shell helper at call time. Keyed by a hash of the remote root string (kept consistent by
+    the registry) so it is locatable without reading anything, mirroring local_meta_dir. This
+    keeps the remote working directory clean — no `.remote-sandbox` inside it.
+    """
+    import posixpath
+
+    digest = hashlib.sha256(remote_root.encode("utf-8")).hexdigest()[:16]
+    return posixpath.join("~", METADATA_DIR, "workspaces", f"R-{digest}")
+
+
+def legacy_remote_meta_dir(remote_root: str) -> str:
+    import posixpath
+
+    return posixpath.join(remote_root.rstrip("/") or "/", METADATA_DIR)
+
+
 def _legacy_meta_dir(root: Path) -> Path:
     return root.expanduser() / METADATA_DIR
 

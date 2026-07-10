@@ -10,6 +10,7 @@ from remote_sandbox.agent import bootstrap_agent
 from remote_sandbox.marker import (
     METADATA_DIR,
     WorkspaceMarker,
+    legacy_remote_meta_dir,
     marker_to_toml,
     migrate_local_metadata,
     read_local_marker,
@@ -22,7 +23,13 @@ from remote_sandbox.registry import (
     record_binding_from_marker,
 )
 from remote_sandbox.settings import load_settings
-from remote_sandbox.ssh import SshRunner, remote_marker_path, validate_remote_path, validate_target
+from remote_sandbox.ssh import (
+    SshRunner,
+    legacy_remote_marker_path,
+    remote_marker_path,
+    validate_remote_path,
+    validate_target,
+)
 
 
 class BindError(RuntimeError):
@@ -87,6 +94,9 @@ def bind_workspace(
     if runner.is_symlink(safe_target, posixpath.dirname(remote_marker_path(safe_remote))):
         raise BindError("Remote metadata path is a symlink")
     runner.mkdir_p(safe_target, safe_remote)
+    # Relocate a legacy in-tree remote .remote-sandbox into the out-of-tree home dir (keeps
+    # the remote working directory clean, preserves the workspace id), best-effort.
+    _migrate_remote_metadata(runner, safe_target, safe_remote)
 
     local_marker = _read_local_marker_checked(local_root)
     remote_marker = _read_remote_marker_checked(runner, safe_target, safe_remote)
@@ -210,6 +220,33 @@ def _read_remote_marker_checked(
         return marker_from_toml(runner.read_text(target, marker_path))
     except Exception as exc:
         raise BindError(f"Invalid remote workspace marker: {exc}") from exc
+
+
+def _migrate_remote_metadata(runner: SshRunner, target: str, remote: str) -> None:
+    """Move a legacy in-tree remote `.remote-sandbox` into the out-of-tree home dir.
+
+    Best-effort and idempotent: if the new home-dir marker already exists, or there is no
+    legacy in-tree marker, do nothing. Otherwise copy the legacy marker's workspace identity
+    into the home dir and delete the whole legacy in-tree metadata dir so the remote working
+    directory is left clean. The agent + hashcache are re-bootstrapped fresh in the home dir
+    by the normal bind flow, so only the marker needs carrying over.
+    """
+    new_marker = remote_marker_path(remote)
+    legacy_marker = legacy_remote_marker_path(remote)
+    legacy_dir = legacy_remote_meta_dir(remote)
+    try:
+        if runner.exists(target, new_marker):
+            # Already migrated (or fresh): just make sure no stale in-tree dir lingers.
+            if runner.exists(target, legacy_marker):
+                runner.remove_metadata_tree(target, legacy_dir)
+            return
+        if not runner.exists(target, legacy_marker):
+            return
+        content = runner.read_text(target, legacy_marker)
+        runner.write_text_atomic(target, new_marker, content)
+        runner.remove_metadata_tree(target, legacy_dir)
+    except Exception:  # noqa: BLE001 - migration is best-effort; bind proceeds regardless
+        return
 
 
 def _write_remote_marker(

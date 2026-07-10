@@ -3,10 +3,10 @@ from __future__ import annotations
 import posixpath
 from dataclasses import dataclass
 
-from remote_sandbox.marker import METADATA_DIR
+from remote_sandbox.marker import remote_meta_dir
 from remote_sandbox.ssh import SshRunner
 
-AGENT_VERSION = "0.3.0"
+AGENT_VERSION = "0.4.0"
 AGENT_FILE = "agent.py"
 
 AGENT_SOURCE = f'''# remote-sandbox remote agent
@@ -21,8 +21,10 @@ import sys
 VERSION = "{AGENT_VERSION}"
 
 
-def workspace_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+def resolve_root(value: str) -> Path:
+    if value == "~" or value.startswith("~/"):
+        return Path(value).expanduser()
+    return Path(value)
 
 
 def cache_path() -> Path:
@@ -60,8 +62,7 @@ def save_cache(cache: dict) -> None:
         pass
 
 
-def manifest() -> dict:
-    root = workspace_root()
+def manifest(root: Path) -> dict:
     cache = load_cache()
     new_cache = {{}}
     entries = []
@@ -118,12 +119,11 @@ def manifest() -> dict:
     return {{"entries": entries}}
 
 
-def snapshot() -> dict:
+def snapshot(root: Path) -> dict:
     """Cheap stat-only signature of every tracked file/dir: path -> (mtime_ns, size).
 
     No hashing — this is the fast poll used by watch mode to detect adds/edits/deletes.
     """
-    root = workspace_root()
     snap = {{}}
     for path in root.rglob("*"):
         rel = path.relative_to(root).as_posix()
@@ -142,7 +142,7 @@ def snapshot() -> dict:
     return snap
 
 
-def watch(interval: float) -> int:
+def watch(root: Path, interval: float) -> int:
     """Emit one line per detected change until stdin closes or we are killed.
 
     Pure stdlib, stat-only polling (no hashing) so it is cheap even on a big tree. Each
@@ -151,12 +151,12 @@ def watch(interval: float) -> int:
     tree on a timer. The exact line content is only a hint — the daemon reconciles by
     manifest — so we simply print the path.
     """
-    prev = snapshot()
+    prev = snapshot(root)
     # Announce readiness so the local side knows the watcher is live.
     print("__rsb_watch_ready__", flush=True)
     while True:
         time.sleep(interval)
-        cur = snapshot()
+        cur = snapshot(root)
         if cur != prev:
             changed = set(cur) ^ set(prev)
             changed |= {{k for k in (set(cur) & set(prev)) if cur[k] != prev[k]}}
@@ -165,22 +165,38 @@ def watch(interval: float) -> int:
             prev = cur
 
 
+def _extract_root(argv: list) -> tuple[str, list]:
+    root = "."
+    rest = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--root" and i + 1 < len(argv):
+            root = argv[i + 1]
+            i += 2
+        else:
+            rest.append(argv[i])
+            i += 1
+    return root, rest
+
+
 def main(argv: list) -> int:
-    if argv == ["self-check"]:
+    root_arg, rest = _extract_root(argv)
+    root = resolve_root(root_arg)
+    if rest == ["self-check"]:
         print("remote-sandbox-agent " + VERSION)
         return 0
-    if argv == ["manifest"]:
-        print(json.dumps(manifest(), separators=(",", ":")))
+    if rest == ["manifest"]:
+        print(json.dumps(manifest(root), separators=(",", ":")))
         return 0
-    if argv and argv[0] == "watch":
+    if rest and rest[0] == "watch":
         interval = 1.0
-        if len(argv) == 3 and argv[1] == "--interval":
+        if len(rest) == 3 and rest[1] == "--interval":
             try:
-                interval = max(0.2, float(argv[2]))
+                interval = max(0.2, float(rest[2]))
             except ValueError:
                 interval = 1.0
         try:
-            return watch(interval)
+            return watch(root, interval)
         except KeyboardInterrupt:
             return 0
     print("unknown command", file=sys.stderr)
@@ -199,7 +215,8 @@ class AgentBootstrapResult:
 
 
 def remote_agent_dir(remote_root: str) -> str:
-    return posixpath.join(remote_root.rstrip("/") or "/", METADATA_DIR, "agent")
+    # Out-of-tree home dir for this workspace's agent + hashcache + marker.
+    return remote_meta_dir(remote_root)
 
 
 def remote_agent_path(remote_root: str) -> str:
@@ -211,7 +228,9 @@ def bootstrap_agent(runner: SshRunner, target: str, remote_root: str) -> AgentBo
     agent_path = remote_agent_path(remote_root)
     runner.mkdir_p(target, agent_dir)
     runner.write_text_atomic(target, agent_path, AGENT_SOURCE)
-    output = runner.run_python_file(target, agent_path, ("self-check",))
+    # Pass --root so the agent, which no longer lives under the workspace tree, knows which
+    # directory to scan.
+    output = runner.run_python_file(target, agent_path, ("--root", remote_root, "self-check"))
     expected = f"remote-sandbox-agent {AGENT_VERSION}"
     if output.strip() != expected:
         raise RuntimeError(f"Remote agent self-check failed: {output.strip()}")

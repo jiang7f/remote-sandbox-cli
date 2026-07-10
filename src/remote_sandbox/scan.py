@@ -133,7 +133,9 @@ def scan_remote_manifest(
     target: str,
     remote_root: str,
 ) -> dict[str, FileEntry]:
-    output = runner.run_python_file(target, remote_agent_path(remote_root), ("manifest",))
+    output = runner.run_python_file(
+        target, remote_agent_path(remote_root), ("--root", remote_root, "manifest")
+    )
     raw = json.loads(output)
     if not isinstance(raw, dict):
         raise ValueError("Invalid remote manifest")

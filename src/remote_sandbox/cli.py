@@ -150,6 +150,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     forget = subparsers.add_parser("forget", help="Remove a saved connection record")
     forget.add_argument("name", help="Connection name to remove")
+    forget.add_argument(
+        "--remote",
+        action="store_true",
+        help="Also delete the remote metadata dir (~/.remote-sandbox/workspaces/...)",
+    )
 
     fetch = subparsers.add_parser("fetch", help="Fetch placeholder file content")
     fetch.add_argument("path", nargs="?", help="Workspace-relative placeholder path")
@@ -308,7 +313,25 @@ def stop_binding_daemon(name: str | None) -> int:
     return 0
 
 
-def forget_connection(name: str) -> int:
+def _forget_remote_metadata(record: BindingRecord) -> str:
+    """Best-effort remove of the remote workspace metadata dir; returns a note for output."""
+    from remote_sandbox.marker import remote_meta_dir
+
+    if not confirm_prompt(
+        f"Also delete remote metadata on {record.target} "
+        f"({remote_meta_dir(record.remote_path)})? This does not touch your project files. "
+        "[y/N] "
+    ):
+        return "; kept remote metadata"
+    try:
+        runner = _connected_runner(record.target)
+        runner.remove_metadata_tree(record.target, remote_meta_dir(record.remote_path))
+        return "; removed remote metadata"
+    except CLI_ERRORS as exc:
+        return f"; remote metadata not removed ({exc})"
+
+
+def forget_connection(name: str, *, forget_remote: bool = False) -> int:
     record = find_binding_record(name)
     if record is None:
         print(f"{_error_prefix()} no connection named {name!r}", file=sys.stderr)
@@ -330,11 +353,14 @@ def forget_connection(name: str) -> int:
                 file=sys.stderr,
             )
             return 2
+    remote_note = ""
+    if forget_remote:
+        remote_note = _forget_remote_metadata(record)
     delete_binding_record(record.name)
     if remove_local_metadata(local_root):
-        print(f"Forgot connection {record.name}; removed its local metadata")
+        print(f"Forgot connection {record.name}; removed its local metadata{remote_note}")
     else:
-        print(f"Forgot connection {record.name}")
+        print(f"Forgot connection {record.name}{remote_note}")
     return 0
 
 
@@ -791,7 +817,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "forget":
         try:
-            return forget_connection(args.name)
+            return forget_connection(args.name, forget_remote=args.remote)
         except CLI_ERRORS as exc:
             print(f"{_error_prefix()} {exc}", file=sys.stderr)
             return 2

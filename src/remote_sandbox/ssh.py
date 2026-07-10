@@ -19,6 +19,7 @@ from remote_sandbox.marker import (
     WorkspaceMarker,
     marker_from_toml,
     marker_to_toml,
+    remote_meta_dir,
 )
 
 
@@ -50,6 +51,8 @@ class SshRunner(Protocol):
     def write_bytes_atomic(self, target: str, path: str, content: bytes) -> None: ...
 
     def delete_path(self, target: str, path: str) -> None: ...
+
+    def remove_metadata_tree(self, target: str, path: str) -> None: ...
 
     def run_python_file(self, target: str, path: str, args: tuple[str, ...]) -> str: ...
 
@@ -106,6 +109,11 @@ def validate_remote_path(path: str) -> str:
 
 
 def remote_marker_path(remote_root: str) -> str:
+    # Out-of-tree home dir for this workspace (mirrors the agent location).
+    return posixpath.join(remote_meta_dir(remote_root), WORKSPACE_FILE)
+
+
+def legacy_remote_marker_path(remote_root: str) -> str:
     base = remote_root.rstrip("/") or "/"
     return posixpath.join(base, METADATA_DIR, WORKSPACE_FILE)
 
@@ -276,16 +284,32 @@ class FakeSshRunner:
         self.files.pop((target, normalized), None)
         self.binary_files.pop((target, normalized), None)
 
+    def remove_metadata_tree(self, target: str, path: str) -> None:
+        _require_metadata_tree(path)
+        normalized = _normalize_remote_path(path)
+        prefix = normalized.rstrip("/") + "/"
+        for key in [*self.files.keys(), *self.binary_files.keys()]:
+            t, p = key
+            if t == target and (p == normalized or p.startswith(prefix)):
+                self.files.pop(key, None)
+                self.binary_files.pop(key, None)
+        self.dirs = {
+            (t, p)
+            for (t, p) in self.dirs
+            if not (t == target and (p == normalized or p.startswith(prefix)))
+        }
+
     def run_python_file(self, target: str, path: str, args: tuple[str, ...]) -> str:
         self._maybe_fail("run_python_file", path)
         normalized = _normalize_remote_path(path)
         if (target, normalized) not in self.files:
             raise FileNotFoundError(path)
         self.python_file_calls.append((target, normalized, args))
-        if args == ("self-check",):
+        root, rest = _fake_extract_root(args)
+        if rest == ("self-check",):
             return f"{_fake_agent_selfcheck(self.files.get((target, normalized), ''))}\n"
-        if args == ("manifest",):
-            return self._manifest_json(target, normalized)
+        if rest == ("manifest",):
+            return self._manifest_json(target, _normalize_remote_path(root))
         return "ok\n"
 
     def run_command(self, target: str, cwd: str, argv: tuple[str, ...]) -> CommandResult:
@@ -348,8 +372,7 @@ class FakeSshRunner:
         if operation in self.fail_operations or key in self.fail_on:
             raise SshError(f"Injected failure for {operation} {path}")
 
-    def _manifest_json(self, target: str, agent_path: str) -> str:
-        root = _workspace_root_from_agent_path(agent_path)
+    def _manifest_json(self, target: str, root: str) -> str:
         root_prefix = root.rstrip("/") + "/"
         paths: set[str] = set()
         entries: list[dict[str, object]] = []
@@ -698,6 +721,23 @@ class SubprocessSshRunner:
         result = self._run_script(target, script, [path], capture=True)
         self._check(result, "remote delete failed")
 
+    def remove_metadata_tree(self, target: str, path: str) -> None:
+        # Guarded recursive delete: refuse anything whose final component is not
+        # `.remote-sandbox`, so a bug can never `rm -rf` a project directory. Also require the
+        # directory to exist and not be a symlink.
+        _require_metadata_tree(path)
+        script = (
+            'p=$(remote_sandbox_path "$1") || exit 2\n'
+            'case "$p" in\n'
+            '  */.remote-sandbox|*/.remote-sandbox/*) ;;\n'
+            '  *) echo "refusing to remove non-metadata path" >&2; exit 3 ;;\n'
+            'esac\n'
+            'if [ -L "$p" ]; then rm -f -- "$p"; exit 0; fi\n'
+            'if [ -d "$p" ]; then rm -rf -- "$p"; fi\n'
+        )
+        result = self._run_script(target, script, [path], capture=True)
+        self._check(result, "remote metadata cleanup failed")
+
     def run_python_file(self, target: str, path: str, args: tuple[str, ...]) -> str:
         script = (
             'p=$(remote_sandbox_path "$1") || exit 2\n'
@@ -715,19 +755,20 @@ class SubprocessSshRunner:
         return result.stdout
 
     def spawn_remote_watch(
-        self, target: str, agent_path: str, interval: float
+        self, target: str, agent_path: str, remote_root: str, interval: float
     ) -> subprocess.Popen[str]:
         """Start the resident remote watcher and return the live process (text stdout).
 
-        Runs `python3 <agent> watch --interval N` over the shared master; each line on
-        stdout is one changed path. The caller reads it in a thread and closes/kills the
-        process to stop. Uses -T (no PTY) so EOF/kill cleanly ends the remote python.
+        Runs `python3 <agent> --root <root> watch --interval N` over the shared master; each
+        line on stdout is one changed path. The caller reads it in a thread and closes/kills
+        the process to stop. Uses -T (no PTY) so EOF/kill cleanly ends the remote python.
         """
         validate_target(target)
         validate_remote_path(agent_path)
+        validate_remote_path(remote_root)
         script = (
             'p=$(remote_sandbox_path "$1") || exit 2\n'
-            'exec python3 -u "$p" watch --interval "$2"\n'
+            'exec python3 -u "$p" --root "$2" watch --interval "$3"\n'
         )
         full_script = self._remote_path_function() + script
         remote_command = " ".join(
@@ -737,6 +778,7 @@ class SubprocessSshRunner:
                 shlex.quote(full_script),
                 "sh",
                 shlex.quote(agent_path),
+                shlex.quote(remote_root),
                 shlex.quote(str(interval)),
             ]
         )
@@ -906,12 +948,34 @@ def _normalize_remote_path(path: str) -> str:
     return posixpath.normpath(validated)
 
 
-def _workspace_root_from_agent_path(agent_path: str) -> str:
-    suffix = "/.remote-sandbox/agent/agent.py"
-    if not agent_path.endswith(suffix):
-        raise SshError(f"Invalid agent path: {agent_path}")
-    root = agent_path[: -len(suffix)]
-    return root or "/"
+def _fake_extract_root(args: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+    """Mirror the real agent's --root parsing so the fake uses the same arg convention."""
+    root = "."
+    rest: list[str] = []
+    i = 0
+    items = list(args)
+    while i < len(items):
+        if items[i] == "--root" and i + 1 < len(items):
+            root = items[i + 1]
+            i += 2
+        else:
+            rest.append(items[i])
+            i += 1
+    return root, tuple(rest)
+
+
+def _require_metadata_tree(path: str) -> None:
+    """Fail unless `path` sits inside the `.remote-sandbox` namespace — a recursive-delete guard.
+
+    The recursive remove is only ever meant for a workspace's own metadata: the legacy in-tree
+    `<remote>/.remote-sandbox`, or the out-of-tree home dir `~/.remote-sandbox/workspaces/…`.
+    Requiring `.remote-sandbox` to be one of the path segments — plus the remote-side shell
+    check — makes an accidental `rm -rf` of a project directory impossible.
+    """
+    validate_remote_path(path)
+    segments = [seg for seg in path.replace("\\", "/").split("/") if seg not in ("", ".", "~")]
+    if METADATA_DIR not in segments:
+        raise SshError(f"refusing to recursively remove non-metadata path: {path}")
 
 
 def _tar_env() -> dict[str, str]:
