@@ -22,16 +22,18 @@ class PolicyDecision(StrEnum):
 
 POLICY_FILE_NAME = ".rsbignore"
 
-# Written by `rsb init`. Ignores the usual build/venv/cache junk that should never sync
-# (and would otherwise churn the sync loop). `.git/` is left syncing by default — mid-sync
-# git churn is handled by skipping individual changed files — but offered as a commented
-# opt-out. Large files fall back to placeholders via the user-level placeholder-limit.
+# Written by `rsb init`. These mirror the built-in default ignores (venv/build/cache junk,
+# plus `.git/`), written into the project so they are visible and easy to tweak. `.git/` is
+# ignored by default because syncing a git repo file-by-file risks corrupting it — commit
+# locally, run remotely. To use git ON the remote, move `.git/` under `[sync]`. Large files
+# fall back to placeholders via the user-level placeholder-limit.
 DEFAULT_RSBIGNORE = """\
 # remote-sandbox ignore file.
 # Plain rules below are NOT synced. Rules under [placeholder] keep a local stub for large
 # remote files instead of downloading them. The large-file threshold is user-level:
 # `rsb set placeholder-limit 10MB`.
 
+.git/
 .venv/
 venv/
 env/
@@ -45,7 +47,8 @@ __pycache__/
 node_modules/
 .DS_Store
 
-# Uncomment to stop syncing git internals entirely (remote loses git history):
+# Want git to work on the remote (e.g. `git describe` in a build)? Re-enable it:
+# [sync]
 # .git/
 
 [placeholder]

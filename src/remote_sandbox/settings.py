@@ -13,7 +13,14 @@ CONFIG_FILE_NAME = "config.toml"
 # Directories/files that are almost never worth syncing. Applied as SOFT defaults (a project
 # `.rsbignore` can re-enable any of them), so binding a tree that contains a venv or caches
 # just works without `rsb init`. Stored in config.toml so the user can edit the list.
+#
+# `.git/` is ignored by default on purpose: a git repo is a transactional database, and
+# syncing its index/refs/pack files file-by-file with lag risks a corrupt/inconsistent repo
+# (git's own answer for moving work between machines is push/pull). The model here is "commit
+# locally, run remotely", so history stays on the local side. To use git ON the remote
+# (e.g. `git describe` in a build), re-enable it in `.rsbignore` with `[sync]` + `.git/`.
 DEFAULT_IGNORES: tuple[str, ...] = (
+    ".git/",
     ".venv/",
     "venv/",
     "env/",
