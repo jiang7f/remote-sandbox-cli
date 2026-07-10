@@ -6,7 +6,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
-from remote_sandbox.manifest import EntryKind, FileEntry, normalize_relative_path
+from remote_sandbox.manifest import (
+    EntryFingerprint,
+    EntryKind,
+    FileEntry,
+    normalize_relative_path,
+)
 
 
 class ReplicaSide(StrEnum):
@@ -22,9 +27,27 @@ class PolicyDecision(StrEnum):
 
 POLICY_FILE_NAME = ".rsbignore"
 
-# OS / editor cruft that should never sync. Applied as soft defaults (a user `.rsbignore`
-# rule can still re-enable one), so a directory containing only these counts as empty.
-_JUNK_IGNORE_PATTERNS = (
+# Environment, cache, OS, and editor files that do not travel well between hosts. These are soft
+# defaults so an explicit `.rsbignore` sync rule can accept the portability cost.
+_PORTABILITY_IGNORE_PATTERNS = (
+    ".venv/**",
+    "*/.venv/**",
+    "venv/**",
+    "*/venv/**",
+    "__pycache__/**",
+    "*/__pycache__/**",
+    ".pytest_cache/**",
+    "*/.pytest_cache/**",
+    ".mypy_cache/**",
+    "*/.mypy_cache/**",
+    ".ruff_cache/**",
+    "*/.ruff_cache/**",
+    ".tox/**",
+    "*/.tox/**",
+    ".nox/**",
+    "*/.nox/**",
+    "node_modules/**",
+    "*/node_modules/**",
     ".DS_Store",
     "*/.DS_Store",
     "._*",
@@ -34,13 +57,31 @@ _JUNK_IGNORE_PATTERNS = (
     ".fseventsd",
     "Thumbs.db",
     "*/Thumbs.db",
+    "*.swp",
+    "*.swo",
+    "*~",
+    ".#*",
+)
+
+_HARD_IGNORE_PATTERNS = (
+    ".git/",
+    "*/.git/",
+    ".remote-sandbox/",
+    "*/.remote-sandbox/",
+    ".codex-remote-sandbox/",
+    "*/.codex-remote-sandbox/",
 )
 
 
 class PolicyEngine(Protocol):
     def is_ignored(self, path: str) -> bool: ...
 
-    def classify(self, entry: FileEntry, *, side: ReplicaSide) -> PolicyDecision: ...
+    def classify(
+        self,
+        entry: FileEntry | EntryFingerprint,
+        *,
+        side: ReplicaSide,
+    ) -> PolicyDecision: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,14 +100,11 @@ class StaticPolicyEngine:
         sync_patterns: tuple[str, ...] = (),
         large_file_threshold: int | None = None,
     ) -> None:
-        self._hard_ignore_patterns = (".remote-sandbox/**", ".remote-sandbox/")
-        rules: list[PolicyRule] = [
-            PolicyRule(PolicyDecision.IGNORE, ".remote-sandbox/**", explicit=True),
-            PolicyRule(PolicyDecision.IGNORE, ".remote-sandbox/", explicit=True),
-        ]
+        self._hard_ignore_patterns = _HARD_IGNORE_PATTERNS
+        rules: list[PolicyRule] = []
         rules.extend(
             PolicyRule(PolicyDecision.IGNORE, pattern, explicit=False)
-            for pattern in _JUNK_IGNORE_PATTERNS
+            for pattern in _PORTABILITY_IGNORE_PATTERNS
         )
         rules.extend(PolicyRule(PolicyDecision.IGNORE, pattern) for pattern in ignore_patterns)
         rules.extend(
@@ -123,7 +161,12 @@ class StaticPolicyEngine:
         decision, _explicit = self._decision_for_path(normalized)
         return decision == PolicyDecision.IGNORE
 
-    def classify(self, entry: FileEntry, *, side: ReplicaSide) -> PolicyDecision:
+    def classify(
+        self,
+        entry: FileEntry | EntryFingerprint,
+        *,
+        side: ReplicaSide,
+    ) -> PolicyDecision:
         decision, explicit = self._decision_for_path(entry.path)
         if decision == PolicyDecision.IGNORE:
             return PolicyDecision.IGNORE
@@ -157,11 +200,15 @@ def _matches(pattern: str, path: str) -> bool:
     normalized_pattern = pattern.strip().replace("\\", "/")
     normalized_path = normalize_relative_path(path)
     if normalized_pattern.endswith("/"):
-        prefix = normalized_pattern.rstrip("/")
-        return normalized_path == prefix or normalized_path.startswith(prefix + "/")
+        directory_pattern = normalized_pattern.rstrip("/")
+        return fnmatch.fnmatchcase(normalized_path, directory_pattern) or fnmatch.fnmatchcase(
+            normalized_path, directory_pattern + "/*"
+        )
     if normalized_pattern.endswith("/**"):
-        prefix = normalized_pattern[:-3].rstrip("/")
-        return normalized_path == prefix or normalized_path.startswith(prefix + "/")
+        directory_pattern = normalized_pattern[:-3].rstrip("/")
+        return fnmatch.fnmatchcase(normalized_path, directory_pattern) or fnmatch.fnmatchcase(
+            normalized_path, directory_pattern + "/*"
+        )
     return fnmatch.fnmatchcase(normalized_path, normalized_pattern)
 
 
