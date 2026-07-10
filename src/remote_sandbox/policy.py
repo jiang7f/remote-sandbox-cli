@@ -86,6 +86,7 @@ class StaticPolicyEngine:
         ignore_patterns: tuple[str, ...] = (),
         placeholder_patterns: tuple[str, ...] = (),
         sync_patterns: tuple[str, ...] = (),
+        default_ignore_patterns: tuple[str, ...] = (),
         large_file_threshold: int | None = None,
     ) -> None:
         self._hard_ignore_patterns = (".remote-sandbox/**", ".remote-sandbox/")
@@ -97,6 +98,12 @@ class StaticPolicyEngine:
             PolicyRule(PolicyDecision.IGNORE, pattern, explicit=False)
             for pattern in _JUNK_IGNORE_PATTERNS
         )
+        # User-configurable soft defaults (venv/caches). Soft so a project `.rsbignore` can
+        # re-enable any of them; they sit before the explicit rules parsed from `.rsbignore`.
+        rules.extend(
+            PolicyRule(PolicyDecision.IGNORE, pattern, explicit=False)
+            for pattern in default_ignore_patterns
+        )
         rules.extend(PolicyRule(PolicyDecision.IGNORE, pattern) for pattern in ignore_patterns)
         rules.extend(
             PolicyRule(PolicyDecision.PLACEHOLDER, pattern) for pattern in placeholder_patterns
@@ -104,6 +111,7 @@ class StaticPolicyEngine:
         rules.extend(PolicyRule(PolicyDecision.SYNC, pattern) for pattern in sync_patterns)
         self._rules = tuple(rules)
         self._large_file_threshold = large_file_threshold
+        self._default_ignore_patterns = default_ignore_patterns
 
     @classmethod
     def from_file(
@@ -111,12 +119,17 @@ class StaticPolicyEngine:
         path: Path,
         *,
         large_file_threshold: int | None = None,
+        default_ignore_patterns: tuple[str, ...] = (),
     ) -> StaticPolicyEngine:
         if not path.exists():
-            return cls(large_file_threshold=large_file_threshold)
+            return cls(
+                large_file_threshold=large_file_threshold,
+                default_ignore_patterns=default_ignore_patterns,
+            )
         return cls.from_lines(
             path.read_text(encoding="utf-8").splitlines(),
             large_file_threshold=large_file_threshold,
+            default_ignore_patterns=default_ignore_patterns,
         )
 
     @classmethod
@@ -125,8 +138,12 @@ class StaticPolicyEngine:
         lines: list[str],
         *,
         large_file_threshold: int | None = None,
+        default_ignore_patterns: tuple[str, ...] = (),
     ) -> StaticPolicyEngine:
-        engine = cls(large_file_threshold=large_file_threshold)
+        engine = cls(
+            large_file_threshold=large_file_threshold,
+            default_ignore_patterns=default_ignore_patterns,
+        )
         rules = list(engine._rules)
         section = PolicyDecision.IGNORE
         for line_no, raw_line in enumerate(lines, start=1):
@@ -143,7 +160,10 @@ class StaticPolicyEngine:
                 )
             decision, pattern = _parse_rule(stripped, section, line_no)
             rules.append(PolicyRule(decision, pattern))
-        parsed = cls(large_file_threshold=large_file_threshold)
+        parsed = cls(
+            large_file_threshold=large_file_threshold,
+            default_ignore_patterns=default_ignore_patterns,
+        )
         parsed._rules = tuple(rules)
         return parsed
 

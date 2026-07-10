@@ -21,6 +21,7 @@ from remote_sandbox.registry import (
     ensure_connection_name_available,
     record_binding_from_marker,
 )
+from remote_sandbox.settings import load_settings
 from remote_sandbox.ssh import SshRunner, remote_marker_path, validate_remote_path, validate_target
 
 
@@ -259,7 +260,10 @@ def _guard_new_pairing(
     direction first. Files the policy ignores (`.remote-sandbox`, OS cruft) don't count.
     Not called for an already-bound same-workspace reconnect.
     """
-    policy = StaticPolicyEngine.from_file(local_root / POLICY_FILE_NAME)
+    policy = StaticPolicyEngine.from_file(
+        local_root / POLICY_FILE_NAME,
+        default_ignore_patterns=load_settings().default_ignores,
+    )
     local_names = _local_user_content(local_root, policy)
     remote_names = _remote_user_content(runner, target, remote, policy)
     local_content = bool(local_names)

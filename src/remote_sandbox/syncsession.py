@@ -112,9 +112,11 @@ class SyncSession:
         report(SyncProgress(phase="done"))
 
     def _load_policy(self) -> StaticPolicyEngine:
+        settings = load_settings()
         return StaticPolicyEngine.from_file(
             _policy_file_path(self.local_root),
-            large_file_threshold=load_settings().placeholder_limit,
+            large_file_threshold=settings.placeholder_limit,
+            default_ignore_patterns=settings.default_ignores,
         )
 
 

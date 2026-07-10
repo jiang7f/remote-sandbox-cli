@@ -10,6 +10,23 @@ from typing import Any
 DEFAULT_PLACEHOLDER_LIMIT = 10 * 1000 * 1000
 CONFIG_FILE_NAME = "config.toml"
 
+# Directories/files that are almost never worth syncing. Applied as SOFT defaults (a project
+# `.rsbignore` can re-enable any of them), so binding a tree that contains a venv or caches
+# just works without `rsb init`. Stored in config.toml so the user can edit the list.
+DEFAULT_IGNORES: tuple[str, ...] = (
+    ".venv/",
+    "venv/",
+    "env/",
+    "node_modules/",
+    "__pycache__/",
+    "*.pyc",
+    "*.pyo",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    ".ipynb_checkpoints/",
+)
+
 
 class SettingsError(RuntimeError):
     pass
@@ -18,6 +35,7 @@ class SettingsError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class Settings:
     placeholder_limit: int = DEFAULT_PLACEHOLDER_LIMIT
+    default_ignores: tuple[str, ...] = DEFAULT_IGNORES
 
 
 def remote_sandbox_home() -> Path:
@@ -47,7 +65,11 @@ def load_settings(path: Path | None = None) -> Settings:
 def save_settings(settings: Settings, path: Path | None = None) -> None:
     config_path = path or settings_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    content = f'placeholder_limit = "{format_size_compact(settings.placeholder_limit)}"\n'
+    lines = [f'placeholder_limit = "{format_size_compact(settings.placeholder_limit)}"']
+    # Write the ignore list out (even when unchanged) so the user can see and edit it.
+    ignores = ", ".join(f'"{_toml_escape(pattern)}"' for pattern in settings.default_ignores)
+    lines.append(f"default_ignores = [{ignores}]")
+    content = "\n".join(lines) + "\n"
     fd, tmp_name = tempfile.mkstemp(
         prefix="config.",
         suffix=".tmp",
@@ -68,7 +90,9 @@ def save_settings(settings: Settings, path: Path | None = None) -> None:
 
 def set_placeholder_limit(value: str, path: Path | None = None) -> Settings:
     limit = parse_size(value)
-    settings = Settings(placeholder_limit=limit)
+    # Preserve any customized default_ignores rather than resetting them.
+    current = load_settings(path)
+    settings = Settings(placeholder_limit=limit, default_ignores=current.default_ignores)
     save_settings(settings, path)
     return settings
 
@@ -128,7 +152,25 @@ def _settings_from_dict(data: dict[str, Any], path: Path) -> Settings:
         raise SettingsError(
             f"Invalid placeholder_limit in {path}: use a value like 10MB or 1GB"
         ) from exc
-    return Settings(placeholder_limit=placeholder_limit)
+    return Settings(
+        placeholder_limit=placeholder_limit,
+        default_ignores=_default_ignores_from_dict(data, path),
+    )
+
+
+def _default_ignores_from_dict(data: dict[str, Any], path: Path) -> tuple[str, ...]:
+    if "default_ignores" not in data:
+        return DEFAULT_IGNORES
+    raw = data["default_ignores"]
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise SettingsError(
+            f"Invalid default_ignores in {path}: expected a list of strings"
+        )
+    return tuple(raw)
+
+
+def _toml_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _parse_positive_int(value: str) -> int:
