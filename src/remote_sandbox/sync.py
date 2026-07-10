@@ -63,16 +63,29 @@ def execute_plan(
                 bytes_done=0,
             )
         )
+    ordered = _execution_order(plan.actions)
+    # Bulk-transfer regular files in a single tar-over-ssh stream instead of one ssh round
+    # trip per file. Falls back to the per-file verified path for any group that errors, so
+    # correctness never depends on tar succeeding.
+    bulk_done = _bulk_transfer_files(
+        ordered,
+        local_root=local_root,
+        runner=runner,
+        target=target,
+        remote_root=remote_root,
+    )
     skipped = 0
-    for action in _execution_order(plan.actions):
+    for action in ordered:
+        key = (action.type, action.path)
         try:
-            _execute_action(
-                action,
-                local_root=local_root,
-                runner=runner,
-                target=target,
-                remote_root=remote_root,
-            )
+            if key not in bulk_done:
+                _execute_action(
+                    action,
+                    local_root=local_root,
+                    runner=runner,
+                    target=target,
+                    remote_root=remote_root,
+                )
         except ConcurrentModification as exc:
             # One file moved under us (classically git rewriting .git/index or a pack tmp
             # file mid-sync). Skip just this path and leave its base untouched so the next
@@ -117,6 +130,62 @@ def execute_plan(
                 current_path=f"{skipped} file(s) changed mid-sync; will retry next cycle",
             )
         )
+
+
+# Below this many same-direction file transfers, the per-file verified path (with its
+# mid-sync change detection) is used; at or above it, one tar stream is worth the small
+# loss of per-file verification.
+_BULK_MIN = 4
+
+
+def _is_regular_file_transfer(action: PlanAction) -> bool:
+    if action.type == PlanActionType.PUSH:
+        entry = action.local
+    elif action.type == PlanActionType.PULL:
+        entry = action.remote
+    else:
+        return False
+    return isinstance(entry, FileEntry) and entry.kind == EntryKind.FILE
+
+
+def _bulk_transfer_files(
+    ordered: tuple[PlanAction, ...],
+    *,
+    local_root: Path,
+    runner: SshRunner,
+    target: str,
+    remote_root: str,
+) -> set[tuple[PlanActionType, str]]:
+    """Transfer regular-file PUSH/PULL actions in one tar stream each.
+
+    Returns the set of (type, path) actions successfully handled in bulk so the caller can
+    skip re-transferring them (but still update base + progress). Any group whose tar fails
+    is simply left out, so the per-file loop retransfers it the slow-but-verified way.
+    """
+    pushes = [
+        a.path
+        for a in ordered
+        if a.type == PlanActionType.PUSH and _is_regular_file_transfer(a)
+    ]
+    pulls = [
+        a.path
+        for a in ordered
+        if a.type == PlanActionType.PULL and _is_regular_file_transfer(a)
+    ]
+    done: set[tuple[PlanActionType, str]] = set()
+    if len(pushes) >= _BULK_MIN:
+        try:
+            runner.push_files(target, str(local_root), remote_root, pushes)
+            done.update((PlanActionType.PUSH, path) for path in pushes)
+        except Exception:  # noqa: BLE001 - any failure falls back to the per-file path
+            pass
+    if len(pulls) >= _BULK_MIN:
+        try:
+            runner.pull_files(target, str(local_root), remote_root, pulls)
+            done.update((PlanActionType.PULL, path) for path in pulls)
+        except Exception:  # noqa: BLE001 - any failure falls back to the per-file path
+            pass
+    return done
 
 
 def _action_bytes(action: PlanAction) -> int:

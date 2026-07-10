@@ -8,6 +8,7 @@ import posixpath
 import secrets
 import shlex
 import subprocess
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -55,6 +56,14 @@ class SshRunner(Protocol):
     def run_command(self, target: str, cwd: str, argv: tuple[str, ...]) -> CommandResult: ...
 
     def clear_master(self, target: str) -> None: ...
+
+    def push_files(
+        self, target: str, local_root: str, remote_root: str, paths: list[str]
+    ) -> None: ...
+
+    def pull_files(
+        self, target: str, local_root: str, remote_root: str, paths: list[str]
+    ) -> None: ...
 
     def interactive_shell(
         self,
@@ -287,6 +296,29 @@ class FakeSshRunner:
     def clear_master(self, target: str) -> None:
         del target
 
+    def push_files(
+        self, target: str, local_root: str, remote_root: str, paths: list[str]
+    ) -> None:
+        from pathlib import Path
+
+        base = Path(local_root).expanduser()
+        for rel in paths:
+            data = (base / rel).read_bytes()
+            remote_path = posixpath.join(remote_root.rstrip("/") or "/", rel)
+            self.write_bytes_atomic(target, remote_path, data)
+
+    def pull_files(
+        self, target: str, local_root: str, remote_root: str, paths: list[str]
+    ) -> None:
+        from pathlib import Path
+
+        base = Path(local_root).expanduser()
+        for rel in paths:
+            data = self.read_bytes(target, posixpath.join(remote_root.rstrip("/") or "/", rel))
+            dest = base / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+
     def interactive_shell(
         self,
         target: str,
@@ -417,6 +449,126 @@ class SubprocessSshRunner:
                 text=True,
                 timeout=self.timeout_s,
             )
+
+    # Batch transfer time budget scales with volume; a big initial sync can legitimately
+    # run for many minutes, unlike the fixed 30 s used for small metadata ops.
+    batch_timeout_s = 3600.0
+
+    def push_files(
+        self, target: str, local_root: str, remote_root: str, paths: list[str]
+    ) -> None:
+        """Upload many files in ONE ssh connection via a tar stream.
+
+        Replaces N per-file round trips (each its own ssh + `cat`) with a single
+        `tar -cf - -T - | ssh ... tar -xf -`, the reason bulk/initial sync now approaches
+        git/rsync speed. tar is universally present, so this keeps the ssh+python3-only
+        promise. Paths are workspace-relative and fed NUL-delimited so odd names are safe.
+        """
+        if not paths:
+            return
+        validate_target(target)
+        validate_remote_path(remote_root)
+        local_base = os.path.abspath(os.path.expanduser(local_root))
+        name_blob = b"".join(p.encode("utf-8") + b"\0" for p in paths)
+        # The caller passes only regular-file paths (dirs are created separately), so no
+        # --no-recursion is needed. Flags are kept to the portable GNU/bsd-tar intersection
+        # so the LOCAL tar works whether it is GNU tar (Linux) or bsdtar (macOS).
+        remote_script = self._remote_path_function() + (
+            'p=$(remote_sandbox_path "$1") || exit 2\n'
+            'mkdir -p -- "$p"\n'
+            'tar -C "$p" -xf -\n'
+        )
+        remote_cmd = " ".join(
+            ["sh", "-c", shlex.quote(remote_script), "sh", shlex.quote(remote_root)]
+        )
+        tar = subprocess.Popen(
+            ["tar", "-C", local_base, "--null", "-T", "-", "-cf", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        ssh = subprocess.Popen(
+            self._ssh_exec(target, remote_cmd),
+            stdin=tar.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self._drive_tar_pipeline(tar, ssh, name_blob, direction="push")
+
+    def pull_files(
+        self, target: str, local_root: str, remote_root: str, paths: list[str]
+    ) -> None:
+        """Download many files in ONE ssh connection via a tar stream (see push_files)."""
+        if not paths:
+            return
+        validate_target(target)
+        validate_remote_path(remote_root)
+        local_base = os.path.abspath(os.path.expanduser(local_root))
+        os.makedirs(local_base, exist_ok=True)
+        name_blob = b"".join(p.encode("utf-8") + b"\0" for p in paths)
+        remote_script = self._remote_path_function() + (
+            'p=$(remote_sandbox_path "$1") || exit 2\n'
+            'cd -- "$p" || exit 2\n'
+            "tar --null -T - -cf -\n"
+        )
+        remote_cmd = " ".join(
+            ["sh", "-c", shlex.quote(remote_script), "sh", shlex.quote(remote_root)]
+        )
+        ssh = subprocess.Popen(
+            self._ssh_exec(target, remote_cmd),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        tar = subprocess.Popen(
+            ["tar", "-C", local_base, "-xf", "-"],
+            stdin=ssh.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self._drive_tar_pipeline(ssh, tar, name_blob, direction="pull")
+
+    def _drive_tar_pipeline(
+        self,
+        producer: subprocess.Popen[bytes],
+        consumer: subprocess.Popen[bytes],
+        name_blob: bytes,
+        *,
+        direction: str,
+    ) -> None:
+        # The consumer reads directly from the producer's stdout (wired at Popen time); close
+        # our copy so EOF propagates. The producer takes the NUL-delimited file list on its
+        # stdin (local tar for push, remote ssh for pull). stderr is drained in threads to
+        # avoid a full-pipe deadlock on a chatty error.
+        if producer.stdout is not None:
+            producer.stdout.close()
+        errs: dict[str, bytes] = {}
+
+        def _drain(name: str, proc: subprocess.Popen[bytes]) -> None:
+            if proc.stderr is not None:
+                errs[name] = proc.stderr.read()
+
+        threads = [
+            threading.Thread(target=_drain, args=("producer", producer)),
+            threading.Thread(target=_drain, args=("consumer", consumer)),
+        ]
+        for thread in threads:
+            thread.start()
+        if producer.stdin is not None:
+            with contextlib.suppress(BrokenPipeError):
+                producer.stdin.write(name_blob)
+                producer.stdin.close()
+        producer.wait(timeout=self.batch_timeout_s)
+        consumer.wait(timeout=self.batch_timeout_s)
+        for thread in threads:
+            thread.join(timeout=5.0)
+        if producer.returncode not in (0, None) or consumer.returncode not in (0, None):
+            detail = (
+                (errs.get("consumer") or errs.get("producer") or b"")
+                .decode("utf-8", "replace")
+                .strip()
+            )
+            raise SshError(f"batch {direction} failed: {detail or 'tar/ssh error'}")
 
     def exists(self, target: str, path: str) -> bool:
         result = self._run_test(target, path, "-e")
@@ -673,6 +825,10 @@ class SubprocessSshRunner:
     @staticmethod
     def _remote_path_function() -> str:
         return _REMOTE_PATH_FUNC
+
+    def _ssh_exec(self, target: str, remote_cmd: str) -> list[str]:
+        """Full argv to run one remote command over the shared master. Seam for tests."""
+        return [*self._ssh_batch_args(), target, remote_cmd]
 
     @staticmethod
     def _ssh_batch_args() -> list[str]:
