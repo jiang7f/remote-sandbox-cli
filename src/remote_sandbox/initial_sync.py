@@ -214,8 +214,9 @@ class InitialSyncCoordinator:
                 self.engine.apply_initial_placeholders(plan.placeholders)
 
             self._replay_until_quiet()
-            self._publish("ready", phase=WorkspacePhase.READY)
-            self.store.clear_initial_sync_watermarks()
+            self.store.complete_initial_sync(
+                self._status("ready", phase=WorkspacePhase.READY)
+            )
             return InitialSyncResult(
                 direction,
                 len(batch.items) if batch is not None else 0,
@@ -363,21 +364,42 @@ class InitialSyncCoordinator:
         current_path: str | None = None,
     ) -> None:
         self.store.set_status(
-            WorkspaceStatus(
-                phase,
-                SyncProgress(
-                    stage,
-                    files_done=files_done,
-                    files_total=files_total,
-                    bytes_done=bytes_done,
-                    bytes_total=bytes_total,
-                    current_path=current_path,
-                    elapsed_seconds=max(0.0, self._clock() - self._started_at),
-                ),
-                pending=_pending_count(self.store),
-                conflicts=len(self.store.list_conflicts(unresolved_only=True)),
-                last_sync_at=time.time() if phase is WorkspacePhase.READY else None,
+            self._status(
+                stage,
+                phase=phase,
+                files_done=files_done,
+                files_total=files_total,
+                bytes_done=bytes_done,
+                bytes_total=bytes_total,
+                current_path=current_path,
             )
+        )
+
+    def _status(
+        self,
+        stage: str,
+        *,
+        phase: WorkspacePhase,
+        files_done: int = 0,
+        files_total: int = 0,
+        bytes_done: int = 0,
+        bytes_total: int = 0,
+        current_path: str | None = None,
+    ) -> WorkspaceStatus:
+        return WorkspaceStatus(
+            phase,
+            SyncProgress(
+                stage,
+                files_done=files_done,
+                files_total=files_total,
+                bytes_done=bytes_done,
+                bytes_total=bytes_total,
+                current_path=current_path,
+                elapsed_seconds=max(0.0, self._clock() - self._started_at),
+            ),
+            pending=_pending_count(self.store),
+            conflicts=len(self.store.list_conflicts(unresolved_only=True)),
+            last_sync_at=time.time() if phase is WorkspacePhase.READY else None,
         )
 
     def _publish_progress(

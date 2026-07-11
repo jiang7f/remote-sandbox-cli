@@ -464,6 +464,9 @@ class RemoteEventSubscription:
                 self._terminate_process(active_process, active_drainer)
             with self._state_lock:
                 self._iterating = False
+                self._closed = True
+                self._close_event.set()
+            self._client._discard_subscription(self)
 
     def close(self) -> None:
         with self._state_lock:

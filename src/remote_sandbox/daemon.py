@@ -391,7 +391,6 @@ class WorkspaceSupervisor:
                 else:
                     assert self.initial_sync is not None
                     self.initial_sync.run()
-                    self.store.mark_initial_sync_completed()
                 return True
             except Exception as exc:
                 delay = self.handle_subscription_failure(exc)

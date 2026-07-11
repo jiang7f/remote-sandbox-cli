@@ -24,6 +24,7 @@ def test_remote_source_bulk_sync_starts_watchers_before_copy(
     assert initial_pair.remote_watcher.started_before_transfer is True
     assert (initial_pair.local / "a.txt").read_text(encoding="utf-8") == "a"
     assert initial_pair.store.get_status().phase.value == "ready"
+    assert initial_pair.store.initial_sync_completed() is True
     assert initial_pair.store.get_initial_sync_watermarks() is None
     assert initial_pair.transport.transfer_calls == 1
 

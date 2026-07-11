@@ -60,6 +60,53 @@ def test_initial_sync_completion_survives_reopen(tmp_path: Path) -> None:
         assert reopened.initial_sync_completed() is True
 
 
+def test_initial_sync_terminal_commit_is_atomic_across_crash_boundary(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    syncing = WorkspaceStatus(WorkspacePhase.INITIAL_SYNCING, SyncProgress("replaying"))
+    ready = WorkspaceStatus(
+        WorkspacePhase.READY,
+        SyncProgress("ready"),
+        last_sync_at=123.0,
+    )
+    with WorkspaceStore.open(database) as store:
+        store.set_initial_sync_watermarks(7, 11)
+        store.set_status(syncing)
+
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """
+        CREATE TRIGGER fail_initial_completion
+        BEFORE INSERT ON schema_meta
+        WHEN NEW.key = 'initial_sync_completed'
+        BEGIN
+            SELECT RAISE(ABORT, 'injected initial completion crash');
+        END
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with WorkspaceStore.open(database) as store:
+        with pytest.raises(sqlite3.IntegrityError, match="initial completion crash"):
+            store.complete_initial_sync(ready)
+        assert store.get_status() == syncing
+        assert store.initial_sync_completed() is False
+        assert store.get_initial_sync_watermarks() == (7, 11)
+
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TRIGGER fail_initial_completion")
+    connection.commit()
+    connection.close()
+
+    with WorkspaceStore.open(database) as store:
+        store.complete_initial_sync(ready)
+
+    with WorkspaceStore.open(database) as reopened:
+        assert reopened.get_status() == ready
+        assert reopened.initial_sync_completed() is True
+        assert reopened.get_initial_sync_watermarks() is None
+
+
 def test_v4_store_migrates_initial_sync_checkpoint_table(tmp_path: Path) -> None:
     db = tmp_path / "state.sqlite3"
     with WorkspaceStore.open(db):

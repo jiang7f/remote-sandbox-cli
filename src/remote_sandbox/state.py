@@ -359,6 +359,21 @@ class WorkspaceStore:
                 """
             )
 
+    def complete_initial_sync(self, status: WorkspaceStatus) -> None:
+        if status.phase is not WorkspacePhase.READY:
+            raise ValueError("initial sync completion status must be ready")
+        with self.transaction():
+            self.set_status(status)
+            self._connection.execute(
+                """
+                INSERT INTO schema_meta(key, value) VALUES ('initial_sync_completed', '1')
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """
+            )
+            self._connection.execute(
+                "DELETE FROM initial_sync_checkpoint WHERE singleton = 1"
+            )
+
     def acknowledged_sequence(self, side: str) -> int:
         _validate_side(side)
         with self._lock:
@@ -372,28 +387,31 @@ class WorkspaceStore:
 
     def set_status(self, status: WorkspaceStatus) -> None:
         with self.transaction():
-            self._connection.execute(
-                """
-                INSERT INTO workspace_status(
-                    singleton, phase, progress_json, pending, conflicts, last_error, last_sync_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(singleton) DO UPDATE SET
-                    phase = excluded.phase,
-                    progress_json = excluded.progress_json,
-                    pending = excluded.pending,
-                    conflicts = excluded.conflicts,
-                    last_error = excluded.last_error,
-                    last_sync_at = excluded.last_sync_at
-                """,
-                (
-                    status.phase.value,
-                    _encode_progress(status.progress),
-                    status.pending,
-                    status.conflicts,
-                    status.last_error,
-                    status.last_sync_at,
-                ),
-            )
+            self._set_status(status)
+
+    def _set_status(self, status: WorkspaceStatus) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO workspace_status(
+                singleton, phase, progress_json, pending, conflicts, last_error, last_sync_at
+            ) VALUES (1, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(singleton) DO UPDATE SET
+                phase = excluded.phase,
+                progress_json = excluded.progress_json,
+                pending = excluded.pending,
+                conflicts = excluded.conflicts,
+                last_error = excluded.last_error,
+                last_sync_at = excluded.last_sync_at
+            """,
+            (
+                status.phase.value,
+                _encode_progress(status.progress),
+                status.pending,
+                status.conflicts,
+                status.last_error,
+                status.last_sync_at,
+            ),
+        )
 
     def get_status(self) -> WorkspaceStatus:
         with self._lock:

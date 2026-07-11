@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import hashlib
+import multiprocessing
 import os
 import shutil
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Literal
 
-from remote_sandbox.daemon import SupervisorClient, WorkspaceSupervisor
+from remote_sandbox.daemon import (
+    SupervisorClient,
+    SupervisorRuntime,
+    WorkspaceSupervisor,
+)
 from remote_sandbox.engine import SyncEngine
 from remote_sandbox.initial_sync import InitialSyncCoordinator
 from remote_sandbox.journal import EventKind, JournalEvent
@@ -35,10 +42,24 @@ FingerprintState = EntryFingerprint | MissingEntry
 
 
 class LocalReplicaClient:
-    def __init__(self, root: Path, database: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        database: Path,
+        *,
+        order_log: Path | None = None,
+        subscription_gate: Path | None = None,
+        local_state_db: Path | None = None,
+        ack_commit_marker: Path | None = None,
+    ) -> None:
         self.root = root
         self._store = RemoteStore(database)
         self._store.register_workspace("test-workspace", root)
+        self._order_log = order_log
+        self._subscription_gate = subscription_gate
+        self._local_state_db = local_state_db
+        self._ack_commit_marker = ack_commit_marker
+        self._subscriptions: set[LocalReplicaSubscription] = set()
         self.metadata_calls: list[tuple[str, ...]] = []
         self.hash_calls: list[tuple[str, ...]] = []
         self.snapshot_calls = 0
@@ -46,7 +67,32 @@ class LocalReplicaClient:
         self.on_before_snapshot: Callable[[], object] | None = None
 
     def close(self) -> None:
+        for subscription in tuple(self._subscriptions):
+            subscription.close()
         self._store.close()
+
+    def ensure_agent(self) -> None:
+        return
+
+    def start_watcher(self) -> dict[str, int]:
+        _append_order(self._order_log, "remote-watcher")
+        return {"latest_sequence": self.latest_sequence()}
+
+    def subscribe(self, after_sequence: int) -> LocalReplicaSubscription:
+        subscription = LocalReplicaSubscription(
+            self,
+            after_sequence,
+            order_log=self._order_log,
+            gate=self._subscription_gate,
+        )
+        self._subscriptions.add(subscription)
+        return subscription
+
+    def clear_master(self) -> None:
+        return
+
+    def probe_connection(self) -> Literal["ok", "auth", "network"]:
+        return "ok"
 
     def append_event(
         self,
@@ -69,6 +115,12 @@ class LocalReplicaClient:
         ]
 
     def acknowledge(self, sequence: int) -> int:
+        if self._local_state_db is not None and self._ack_commit_marker is not None:
+            pending = [event for event in self._store.events_after(0) if event.sequence <= sequence]
+            with WorkspaceStore.open(self._local_state_db) as local_store:
+                base = local_store.list_base()
+            committed = all(event.path in base for event in pending)
+            self._ack_commit_marker.write_text("1" if committed else "0", encoding="utf-8")
         self.acknowledge_calls.append(sequence)
         self._store.acknowledge(sequence)
         return self._store.acknowledged_sequence()
@@ -102,6 +154,9 @@ class LocalReplicaClient:
 
     def latest_sequence(self) -> int:
         return self._store.latest_sequence()
+
+    def _discard_subscription(self, subscription: LocalReplicaSubscription) -> None:
+        self._subscriptions.discard(subscription)
 
     def audit_signatures(
         self,
@@ -138,6 +193,38 @@ class LocalReplicaClient:
         if entry.kind is EntryKind.SYMLINK:
             return candidate.readlink().as_posix().encode()
         return None
+
+
+class LocalReplicaSubscription:
+    def __init__(
+        self,
+        client: LocalReplicaClient,
+        after_sequence: int,
+        *,
+        order_log: Path | None,
+        gate: Path | None,
+    ) -> None:
+        self._client = client
+        self._after_sequence = after_sequence
+        self._order_log = order_log
+        self._gate = gate
+        self._closed = threading.Event()
+
+    def __iter__(self) -> Iterator[JournalEvent]:
+        _append_order(self._order_log, "subscription")
+        while not self._closed.wait(0.01):
+            if self._gate is not None and not self._gate.exists():
+                continue
+            events = self._client.events_after(self._after_sequence)
+            for event in events:
+                if self._closed.is_set():
+                    return
+                self._after_sequence = event.sequence
+                yield event
+
+    def close(self) -> None:
+        self._closed.set()
+        self._client._discard_subscription(self)
 
 
 class ControllableLocalPairTransport:
@@ -451,14 +538,6 @@ class SupervisorHarness:
         self.supervisor.runtime.socket.unlink(missing_ok=True)
 
 
-class CompletedInitialSync:
-    def __init__(self) -> None:
-        self.run_calls = 0
-
-    def run(self) -> None:
-        self.run_calls += 1
-
-
 class RecordingEngine:
     def __init__(self, store: WorkspaceStore) -> None:
         self.store = store
@@ -469,16 +548,92 @@ class RecordingEngine:
         self.store.set_status(WorkspaceStatus(WorkspacePhase.READY, SyncProgress("idle")))
 
 
-@dataclass(slots=True)
-class InProcessSupervisor:
-    supervisor: WorkspaceSupervisor
-    thread: threading.Thread
+@dataclass(frozen=True, slots=True)
+class DaemonProcessConfig:
+    local: Path
+    remote: Path
+    state_db: Path
+    remote_state_db: Path
+    runtime: SupervisorRuntime
+    order_log: Path
+    subscription_gate: Path
+    ack_commit_marker: Path
+    initial_sync_marker: Path
 
-    def kill(self) -> None:
-        self.supervisor.stop()
 
-    def wait(self, timeout: float) -> None:
-        self.thread.join(timeout=timeout)
+class ProcessLocalWatcher:
+    def __init__(self, config: DaemonProcessConfig, store: WorkspaceStore) -> None:
+        self._config = config
+        self._store = store
+        self._watcher: PollingLocalWatcher | None = None
+        self.last_error: BaseException | None = None
+
+    def start(self) -> None:
+        _append_order(self._config.order_log, "local-watcher")
+        if self._watcher is None:
+            self._watcher = PollingLocalWatcher(
+                self._config.local,
+                StaticPolicyEngine(),
+                lambda kind, path, destination: self._store.append_event(
+                    "local", kind, path, destination
+                ),
+                interval=0.01,
+            )
+        self._watcher.start()
+
+    def stop(self) -> None:
+        if self._watcher is not None:
+            self._watcher.stop()
+            self.last_error = self._watcher.last_error
+
+
+class OrderedEngine:
+    def __init__(self, engine: SyncEngine, order_log: Path) -> None:
+        self._engine = engine
+        self._order_log = order_log
+
+    def run_once(self, reason: str) -> object:
+        _append_order(self._order_log, f"engine:{reason}")
+        return self._engine.run_once(reason)
+
+
+class ForbiddenInitialSync:
+    def __init__(self, marker: Path) -> None:
+        self._marker = marker
+
+    def run(self) -> None:
+        self._marker.write_text("called", encoding="utf-8")
+        raise AssertionError("initial sync repeated after durable completion")
+
+
+def _run_daemon_pair_process(config: DaemonProcessConfig) -> None:
+    store = WorkspaceStore.open(config.state_db)
+    remote = LocalReplicaClient(
+        config.remote,
+        config.remote_state_db,
+        order_log=config.order_log,
+        subscription_gate=config.subscription_gate,
+        local_state_db=config.state_db,
+        ack_commit_marker=config.ack_commit_marker,
+    )
+    transport = ControllableLocalPairTransport(config.local, config.remote)
+    engine = SyncEngine(
+        store=store,
+        local_root=config.local,
+        remote=remote,
+        transport=transport,
+        policy=StaticPolicyEngine(),
+    )
+    supervisor = WorkspaceSupervisor(
+        config.runtime,
+        store=store,
+        initial_sync=ForbiddenInitialSync(config.initial_sync_marker),
+        remote=remote,
+        engine=OrderedEngine(engine, config.order_log),
+        local_watcher=ProcessLocalWatcher(config, store),
+        close_store=True,
+    )
+    supervisor.run()
 
 
 @dataclass(slots=True)
@@ -486,13 +641,11 @@ class DaemonPairHarness:
     local: Path
     remote: Path
     store: WorkspaceStore
-    supervisor: WorkspaceSupervisor
     client: SupervisorClient
     remote_client: LocalReplicaClient
-    engine: SyncEngine
-    initial_sync: CompletedInitialSync
-    process: InProcessSupervisor
-    metadata_root: Path
+    process: BaseProcess
+    runtime: SupervisorRuntime
+    config: DaemonProcessConfig
 
     def append_remote_change(self, path: str, content: bytes) -> None:
         destination = self.remote / path
@@ -501,36 +654,51 @@ class DaemonPairHarness:
         self.remote_client.append_event(EventKind.MODIFY, path)
 
     def kill_local_daemon(self) -> None:
-        self.process.kill()
-        self.process.wait(timeout=2.0)
+        self.process.terminate()
+        self.process.join(timeout=2.0)
+        if self.process.is_alive():
+            self.process.kill()
+            self.process.join(timeout=2.0)
+        if self.process.exitcode in {None, 0}:
+            raise AssertionError("daemon process did not terminate abruptly")
+        self.config.order_log.write_text("", encoding="utf-8")
 
     def start_local_daemon(self) -> None:
-        self.supervisor = WorkspaceSupervisor.for_test(
-            workspace_id="00000000-0000-4000-8000-000000000113",
-            metadata_root=self.metadata_root,
-            store=self.store,
-            initial_sync=self.initial_sync,
-            engine=self.engine,
-        )
-        self.client = SupervisorClient(self.supervisor.runtime)
-        thread = threading.Thread(target=self.supervisor.run, daemon=True)
-        thread.start()
-        self.process = InProcessSupervisor(self.supervisor, thread)
+        self.config.subscription_gate.write_text("open", encoding="utf-8")
+        self.config.ack_commit_marker.unlink(missing_ok=True)
+        self.process = _start_daemon_process(self.config)
         self.client.wait_until_running(timeout=2.0)
 
     def wait_until_ready(self) -> None:
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            if self.store.get_status().phase is WorkspacePhase.READY:
+            if self.client.status().phase is WorkspacePhase.READY:
+                _wait_for_order(self.config.order_log, "subscription", timeout=2.0)
                 return
             time.sleep(0.01)
         raise AssertionError("supervisor did not become ready")
 
     def close(self) -> None:
-        self.supervisor.stop()
-        self.process.wait(timeout=2.0)
+        if self.process.is_alive():
+            self.client.stop()
+            self.process.join(timeout=2.0)
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(timeout=2.0)
         self.remote_client.close()
         self.store.close()
+
+    @property
+    def restart_order(self) -> list[str]:
+        return _read_order(self.config.order_log)
+
+    @property
+    def ack_after_commit(self) -> bool:
+        return self.config.ack_commit_marker.read_text(encoding="utf-8") == "1"
+
+    @property
+    def initial_sync_repeated(self) -> bool:
+        return self.config.initial_sync_marker.exists()
 
 
 def make_supervisor_harness(tmp_path: Path) -> SupervisorHarness:
@@ -550,34 +718,93 @@ def make_supervisor_harness(tmp_path: Path) -> SupervisorHarness:
     return SupervisorHarness(store, remote, initial_sync, engine, supervisor, client)
 
 
-def make_daemon_pair(tmp_path: Path) -> DaemonPairHarness:
-    pair = make_sync_pair(tmp_path)
-    pair.store.mark_initial_sync_completed()
-    initial_sync = CompletedInitialSync()
-    metadata_root = tmp_path / "metadata"
-    supervisor = WorkspaceSupervisor.for_test(
-        workspace_id="00000000-0000-4000-8000-000000000113",
-        metadata_root=metadata_root,
-        store=pair.store,
-        initial_sync=initial_sync,
-        engine=pair.engine,
+def _append_order(path: Path | None, label: str) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{label}\n")
+
+
+def _read_order(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    return [line for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def _wait_for_order(path: Path, label: str, *, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if label in _read_order(path):
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"daemon process did not record {label}")
+
+
+def _start_daemon_process(config: DaemonProcessConfig) -> BaseProcess:
+    process = multiprocessing.get_context("spawn").Process(
+        target=_run_daemon_pair_process,
+        args=(config,),
+        daemon=True,
     )
-    client = SupervisorClient(supervisor.runtime)
-    thread = threading.Thread(target=supervisor.run, daemon=True)
-    thread.start()
-    process = InProcessSupervisor(supervisor, thread)
-    client.wait_until_running(timeout=2.0)
-    return DaemonPairHarness(
-        pair.local,
-        pair.remote,
-        pair.store,
-        supervisor,
-        client,
-        pair.remote_client,
-        pair.engine,
-        initial_sync,
-        process,
+    process.start()
+    return process
+
+
+def make_daemon_pair(tmp_path: Path) -> DaemonPairHarness:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    local.mkdir()
+    remote.mkdir()
+    metadata_root = tmp_path / "metadata"
+    state_db = metadata_root / "state.sqlite3"
+    remote_state_db = tmp_path / "remote-state.sqlite3"
+    runtime_key = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:12]
+    runtime = SupervisorRuntime(
+        "00000000-0000-4000-8000-000000000113",
         metadata_root,
+        Path("/tmp") / f"codex-rsb-process-{runtime_key}",
+    )
+    runtime.pidfile.unlink(missing_ok=True)
+    runtime.socket.unlink(missing_ok=True)
+    store = WorkspaceStore.open(state_db)
+    store.set_initial_sync_watermarks(0, 0)
+    store.complete_initial_sync(
+        WorkspaceStatus(WorkspacePhase.READY, SyncProgress("ready"), last_sync_at=time.time())
+    )
+    remote_client = LocalReplicaClient(remote, remote_state_db)
+    config = DaemonProcessConfig(
+        local=local,
+        remote=remote,
+        state_db=state_db,
+        remote_state_db=remote_state_db,
+        runtime=runtime,
+        order_log=tmp_path / "restart-order.log",
+        subscription_gate=tmp_path / "subscription-open",
+        ack_commit_marker=tmp_path / "ack-after-commit",
+        initial_sync_marker=tmp_path / "initial-sync-repeated",
+    )
+    for path in (
+        config.order_log,
+        config.subscription_gate,
+        config.ack_commit_marker,
+        config.initial_sync_marker,
+    ):
+        path.unlink(missing_ok=True)
+    process = _start_daemon_process(config)
+    client = SupervisorClient(runtime)
+    client.wait_until_running(timeout=2.0)
+    client.wait_for_phase(WorkspacePhase.READY, timeout=5.0)
+    _wait_for_order(config.order_log, "subscription", timeout=2.0)
+    return DaemonPairHarness(
+        local,
+        remote,
+        store,
+        client,
+        remote_client,
+        process,
+        runtime,
+        config,
     )
 
 

@@ -562,6 +562,25 @@ def test_subscription_raises_nonzero_stream_error_without_reopening() -> None:
     assert process.wait_calls == [None]
 
 
+def test_repeated_failed_subscriptions_do_not_accumulate() -> None:
+    processes = [
+        StreamingProcess(b"", stderr=b"watcher stopped\n", exit_code=2)
+        for _ in range(3)
+    ]
+    runner = StreamingRunner({}, processes)
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+    )
+
+    for _ in range(3):
+        with pytest.raises(RemoteProtocolError, match="watcher stopped"):
+            next(iter(client.subscribe(after_sequence=0)))
+        assert client._subscriptions == set()
+
+
 def test_subscription_backs_off_between_repeated_clean_eof_reopens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

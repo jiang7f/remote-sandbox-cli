@@ -48,6 +48,7 @@ def test_restart_mid_transfer_only_copies_unfinished_paths(
     with pytest.raises(RuntimeError, match="interruption"):
         initial_pair.coordinator.run()
 
+    assert initial_pair.store.initial_sync_completed() is False
     assert initial_pair.store.get_initial_sync_watermarks() == (0, 0)
 
     assert initial_pair.store.get_status().phase.value == "degraded"
@@ -102,6 +103,9 @@ def test_restart_during_replay_does_not_repeat_bulk_transfer(
 
     with pytest.raises(RuntimeError, match="replay interruption"):
         initial_pair.coordinator.run()
+
+    assert initial_pair.store.initial_sync_completed() is False
+    assert initial_pair.store.get_initial_sync_watermarks() == (0, 0)
     initial_pair.coordinator.run()
 
     assert initial_pair.transport.transfer_calls == 1
