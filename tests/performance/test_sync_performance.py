@@ -1,24 +1,8 @@
 from __future__ import annotations
 
-import time
 from statistics import median
 
 import pytest
-
-
-@pytest.mark.performance
-def test_small_remote_delete_reaches_local_within_two_seconds(performance_pair) -> None:
-    path = performance_pair.remote / "delete-me.txt"
-    path.write_text("x", encoding="utf-8")
-    performance_pair.wait_until_synced(path)
-
-    started = time.monotonic()
-    path.unlink()
-    performance_pair.wait_until_missing(performance_pair.local / "delete-me.txt")
-    elapsed = time.monotonic() - started
-
-    print(f"small_remote_delete_seconds={elapsed:.6f}")
-    assert elapsed < 2.0
 
 
 @pytest.mark.performance

@@ -4,7 +4,7 @@ from pathlib import Path
 
 from helpers.sync_harness import CliHarness, DaemonPairHarness
 
-from remote_sandbox.manifest import EntryFingerprint, fingerprint_local
+from remote_sandbox.manifest import EntryFingerprint, MissingEntry, fingerprint_local
 
 
 def test_use_local_resolution_transfers_selected_version_and_closes_conflict(
@@ -64,6 +64,124 @@ def test_use_remote_resolution_transfers_selected_version_and_closes_conflict(
     assert cli_fixture.local_bytes("model.py") == b"remote\n"
     assert cli_fixture.store.get_conflict(conflict.conflict_id).resolved_at is not None
     assert cli_fixture.store.get_expected_echo("local", "model.py") is not None
+
+
+def test_resolve_use_local_can_select_deletion(cli_fixture: CliHarness) -> None:
+    path = "deleted-by-local.txt"
+    for root in (cli_fixture.pair.local, cli_fixture.pair.remote):
+        (root / path).write_bytes(b"base")
+    cli_fixture.pair.seed_current_base()
+    (cli_fixture.pair.local / path).unlink()
+    (cli_fixture.pair.remote / path).write_bytes(b"remote changed")
+    remote = fingerprint_local(cli_fixture.pair.remote, path, with_hash=True)
+    conflict = cli_fixture.store.create_conflict(
+        path=path,
+        reason="delete-versus-modify",
+        local_blob=None,
+        remote_blob=b"remote changed",
+        local_fingerprint=None,
+        remote_fingerprint=remote,
+    )
+
+    result = cli_fixture.run(["resolve", path, "--use-local"])
+
+    assert result.exit_code == 0
+    assert not (cli_fixture.pair.local / path).exists()
+    assert not (cli_fixture.pair.remote / path).exists()
+    assert path not in cli_fixture.store.list_base()
+    assert cli_fixture.store.get_expected_echo("remote", path) == MissingEntry(path)
+    assert cli_fixture.store.get_conflict(conflict.conflict_id).resolved_at is not None
+
+
+def test_resolve_use_remote_can_select_deletion(cli_fixture: CliHarness) -> None:
+    path = "deleted-by-remote.txt"
+    for root in (cli_fixture.pair.local, cli_fixture.pair.remote):
+        (root / path).write_bytes(b"base")
+    cli_fixture.pair.seed_current_base()
+    (cli_fixture.pair.local / path).write_bytes(b"local changed")
+    (cli_fixture.pair.remote / path).unlink()
+    local = fingerprint_local(cli_fixture.pair.local, path, with_hash=True)
+    conflict = cli_fixture.store.create_conflict(
+        path=path,
+        reason="modify-versus-delete",
+        local_blob=b"local changed",
+        remote_blob=None,
+        local_fingerprint=local,
+        remote_fingerprint=None,
+    )
+
+    result = cli_fixture.run(["resolve", path, "--use-remote"])
+
+    assert result.exit_code == 0
+    assert not (cli_fixture.pair.local / path).exists()
+    assert not (cli_fixture.pair.remote / path).exists()
+    assert path not in cli_fixture.store.list_base()
+    assert cli_fixture.store.get_expected_echo("local", path) == MissingEntry(path)
+    assert cli_fixture.store.get_conflict(conflict.conflict_id).resolved_at is not None
+
+
+def test_deletion_winner_rejects_selected_side_reappearance(
+    cli_fixture: CliHarness,
+) -> None:
+    path = "reappeared.txt"
+    for root in (cli_fixture.pair.local, cli_fixture.pair.remote):
+        (root / path).write_bytes(b"base")
+    cli_fixture.pair.seed_current_base()
+    (cli_fixture.pair.local / path).unlink()
+    remote_before = b"remote changed"
+    (cli_fixture.pair.remote / path).write_bytes(remote_before)
+    remote = fingerprint_local(cli_fixture.pair.remote, path, with_hash=True)
+    conflict = cli_fixture.store.create_conflict(
+        path=path,
+        reason="delete-versus-modify",
+        local_blob=None,
+        remote_blob=remote_before,
+        local_fingerprint=None,
+        remote_fingerprint=remote,
+    )
+    (cli_fixture.pair.local / path).write_bytes(b"reappeared")
+
+    result = cli_fixture.run(["resolve", path, "--use-local"])
+
+    assert result.exit_code == 2
+    assert "selected source changed" in result.stderr
+    assert (cli_fixture.pair.remote / path).read_bytes() == remote_before
+    assert path in cli_fixture.store.list_base()
+    assert cli_fixture.store.get_conflict(conflict.conflict_id).resolved_at is None
+
+
+def test_deletion_failure_rolls_back_conflict_base_and_echo(
+    cli_fixture: CliHarness,
+) -> None:
+    path = "delete-fails.txt"
+    for root in (cli_fixture.pair.local, cli_fixture.pair.remote):
+        (root / path).write_bytes(b"base")
+    cli_fixture.pair.seed_current_base()
+    base_before = cli_fixture.store.list_base()[path]
+    (cli_fixture.pair.local / path).unlink()
+    (cli_fixture.pair.remote / path).write_bytes(b"remote changed")
+    remote = fingerprint_local(cli_fixture.pair.remote, path, with_hash=True)
+    conflict = cli_fixture.store.create_conflict(
+        path=path,
+        reason="delete-versus-modify",
+        local_blob=None,
+        remote_blob=b"remote changed",
+        local_fingerprint=None,
+        remote_fingerprint=remote,
+    )
+    cli_fixture.pair.transport.change_destination_before_delete(
+        "remote",
+        path,
+        b"changed before delete",
+    )
+
+    result = cli_fixture.run(["resolve", path, "--use-local"])
+
+    assert result.exit_code == 2
+    assert "destination changed" in result.stderr
+    assert cli_fixture.store.list_base()[path] == base_before
+    assert cli_fixture.store.get_expected_echo("remote", path) is None
+    assert cli_fixture.store.get_conflict(conflict.conflict_id).resolved_at is None
 
 
 def test_resolve_rejects_path_escape(cli_fixture: CliHarness) -> None:

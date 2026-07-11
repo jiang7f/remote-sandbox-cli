@@ -611,18 +611,19 @@ class WorkspaceSupervisor:
         if self._subscription_thread is not None and self._subscription_thread.is_alive():
             return
         after = self.store.acknowledged_sequence("remote")
-        self._subscription = self.remote.subscribe(after)
+        subscription = self.remote.subscribe(after)
+        self._subscription = subscription
         self._subscription_thread = threading.Thread(
             target=self._consume_subscription,
+            args=(subscription,),
             name="codex-rsb-remote-events",
             daemon=True,
         )
         self._subscription_thread.start()
 
-    def _consume_subscription(self) -> None:
-        assert self._subscription is not None
+    def _consume_subscription(self, subscription: Iterable[JournalEvent]) -> None:
         try:
-            for event in self._subscription:
+            for event in subscription:
                 if self._stop_event.is_set():
                     return
                 self.store.record_events((event,))

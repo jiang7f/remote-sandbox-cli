@@ -38,6 +38,10 @@ jobs:
         run: uv run pytest -q tests/unit/test_release_quality.py -k test_no_legacy_module_imports
       - name: Check E2E fixture contract
         run: uv run pytest -q tests/e2e/test_fixture_contract.py
+      - name: Check watcher daemon latency
+        run: >-
+          uv run pytest -q tests/integration/test_watcher_daemon_latency.py
+          -k test_real_local_watcher_daemon_propagates_within_two_seconds
       - name: Check in-tree metadata
         run: >-
           uv run pytest -q tests/unit/test_release_quality.py

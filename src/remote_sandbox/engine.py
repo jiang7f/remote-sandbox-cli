@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Protocol, TypeAlias
 
 from remote_sandbox._engine_audit import AuditCoordinator
-from remote_sandbox._engine_events import acknowledge_pending, contains_rescan, dirty_sources
+from remote_sandbox._engine_events import (
+    acknowledge_pending,
+    contains_rescan,
+    dirty_sources,
+)
 from remote_sandbox._engine_metadata import LocalMetadata
 from remote_sandbox._engine_planning import (
     satisfy_hash_requests,
@@ -154,7 +158,10 @@ class SyncEngine:
             "local", self.store.acknowledged_sequence("local")
         )
         remote_events = self.store.pending_events("remote", remote_after)
-        if contains_rescan(local_events, remote_events):
+        if contains_rescan(local_events, remote_events) or self._directory_move_requires_audit(
+            local_events,
+            remote_events,
+        ):
             self._record_audit_drift()
         requeued_before = set(self.store.list_requeued_paths())
         sources = dirty_sources(local_events, remote_events, requeued_before)
@@ -225,6 +232,54 @@ class SyncEngine:
         with self._cycle_lock:
             self._record_audit_drift()
             return self.run_once("audit")
+
+    def _directory_move_requires_audit(
+        self,
+        local_events: list[JournalEvent],
+        remote_events: list[JournalEvent],
+    ) -> bool:
+        moves = tuple(
+            event
+            for event in coalesce_events([*local_events, *remote_events])
+            if event.kind is EventKind.MOVE
+        )
+        if not moves:
+            return False
+        base = self.store.list_base()
+        if any(
+            isinstance((entry := base.get(event.path)), EntryFingerprint)
+            and entry.kind is EntryKind.DIR
+            for event in moves
+        ):
+            return True
+        local_destinations = tuple(
+            sorted(
+                {
+                    event.destination_path
+                    for event in moves
+                    if event.side == "local" and event.destination_path is not None
+                }
+            )
+        )
+        remote_destinations = tuple(
+            sorted(
+                {
+                    event.destination_path
+                    for event in moves
+                    if event.side == "remote" and event.destination_path is not None
+                }
+            )
+        )
+        local = (
+            self.local_metadata.paths(local_destinations, with_hash=False, base=base)
+            if local_destinations
+            else {}
+        )
+        remote = self.remote.metadata_paths(remote_destinations) if remote_destinations else {}
+        return any(
+            isinstance(entry, EntryFingerprint) and entry.kind is EntryKind.DIR
+            for entry in (*local.values(), *remote.values())
+        )
 
     def seed_base_from_transfer(
         self,

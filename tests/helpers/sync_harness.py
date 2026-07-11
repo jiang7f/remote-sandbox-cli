@@ -499,7 +499,7 @@ class ControllableLocalPairTransport:
                 candidate.parent.mkdir(parents=True, exist_ok=True)
                 candidate.write_bytes(replacement)
             observed = fingerprint_local(root, path, with_hash=True)
-            if observed != expected_entry:
+            if not _matches_expected(expected_entry, observed):
                 changed.append(path)
                 continue
             if self.before_destination_change is not None:
@@ -1273,7 +1273,11 @@ class ProcessLocalWatcher:
         self._config = config
         self._store = store
         self._watcher: PollingLocalWatcher | None = None
+        self._wake: Callable[[], None] | None = None
         self.last_error: BaseException | None = None
+
+    def set_wake(self, wake: Callable[[], None]) -> None:
+        self._wake = wake
 
     def start(self) -> None:
         _append_order(self._config.order_log, "local-watcher")
@@ -1281,12 +1285,20 @@ class ProcessLocalWatcher:
             self._watcher = PollingLocalWatcher(
                 self._config.local,
                 StaticPolicyEngine(),
-                lambda kind, path, destination: self._store.append_event(
-                    "local", kind, path, destination
-                ),
+                self._record_event,
                 interval=0.01,
             )
         self._watcher.start()
+
+    def _record_event(
+        self,
+        kind: EventKind,
+        path: str,
+        destination: str | None,
+    ) -> None:
+        self._store.append_event("local", kind, path, destination)
+        if self._wake is not None:
+            self._wake()
 
     def stop(self) -> None:
         if self._watcher is not None:
@@ -1349,16 +1361,18 @@ def _run_daemon_pair_process(config: DaemonProcessConfig) -> None:
         )
         return {"path": conflict.path, "conflict_id": conflict.conflict_id}
 
+    local_watcher = ProcessLocalWatcher(config, store)
     supervisor = WorkspaceSupervisor(
         config.runtime,
         store=store,
         initial_sync=ForbiddenInitialSync(config.initial_sync_marker),
         remote=remote,
         engine=OrderedEngine(engine, config.order_log),
-        local_watcher=ProcessLocalWatcher(config, store),
+        local_watcher=local_watcher,
         mutation_handler=mutate,
         close_store=True,
     )
+    local_watcher.set_wake(supervisor.request_sync)
     supervisor.run()
 
 
@@ -1715,6 +1729,14 @@ def _content_identity(entry: FingerprintState) -> tuple[object, ...]:
 
 def _matches_expected(expected: FingerprintState | None, observed: FingerprintState) -> bool:
     if expected is None or expected == observed:
+        return True
+    if (
+        isinstance(expected, EntryFingerprint)
+        and isinstance(observed, EntryFingerprint)
+        and expected.kind is EntryKind.DIR
+        and observed.kind is EntryKind.DIR
+        and expected.mode == observed.mode
+    ):
         return True
     return (
         isinstance(expected, EntryFingerprint)

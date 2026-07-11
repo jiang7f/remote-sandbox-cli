@@ -165,6 +165,40 @@ def test_control_mutation_keeps_supervisor_and_watchers_alive(
     assert calls == [("resolve", {"path": "model.py"})]
 
 
+def test_subscription_thread_uses_captured_iterable_when_stop_clears_field(
+    supervisor_fixture: SupervisorHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = supervisor_fixture.supervisor
+
+    class ImmediateThread:
+        def __init__(
+            self,
+            *,
+            target: object,
+            name: str,
+            daemon: bool,
+            args: tuple[object, ...] = (),
+        ) -> None:
+            del name, daemon
+            self._target = target
+            self._args = args
+
+        def start(self) -> None:
+            supervisor._subscription = None  # type: ignore[attr-defined]
+            self._target(*self._args)  # type: ignore[operator]
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+
+    monkeypatch.setattr(daemon_module.threading, "Thread", ImmediateThread)
+
+    supervisor._start_subscription()  # type: ignore[attr-defined]
+
+
 def test_control_mutation_cannot_overlap_incremental_engine(
     supervisor_fixture: SupervisorHarness,
 ) -> None:

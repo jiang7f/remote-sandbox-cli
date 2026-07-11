@@ -1,7 +1,10 @@
 import dataclasses
 import errno
 import shlex
+import shutil
 import subprocess
+import sys
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import cast
@@ -426,6 +429,53 @@ class _CleanupFailureRunner(_TransportRunner):
             self.transport_calls.append((target, root, code, input_data, args))
             return subprocess.CompletedProcess(["ssh"], 17, b"", b"cleanup failed")
         return super().run_workspace_python_bytes(target, root, code, input_data, args)
+
+
+def test_remote_cleanup_helper_removes_staging_directory() -> None:
+    staging = Path(tempfile.mkdtemp(prefix="remote-sandbox-rsync-cleanup-success-"))
+    (staging / "payload").write_bytes(b"payload")
+
+    result = subprocess.run(
+        [sys.executable, "-c", REMOTE_CLEANUP_RSYNC_CODE, "workspace", str(staging)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not staging.exists()
+
+
+def test_remote_cleanup_helper_propagates_removal_failure() -> None:
+    staging = Path(tempfile.mkdtemp(prefix="remote-sandbox-rsync-cleanup-failure-"))
+    (staging / "payload").write_bytes(b"payload")
+    injected = (
+        "import shutil\n"
+        "def controlled(path, ignore_errors=False):\n"
+        "    if ignore_errors:\n"
+        "        return\n"
+        "    raise PermissionError('injected cleanup failure')\n"
+        "shutil.rmtree = controlled\n"
+    )
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                injected + REMOTE_CLEANUP_RSYNC_CODE,
+                "workspace",
+                str(staging),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert "injected cleanup failure" in result.stderr
+        assert staging.exists()
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def test_remote_rsync_cleanup_failure_prevents_success(

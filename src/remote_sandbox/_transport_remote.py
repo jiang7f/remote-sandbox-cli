@@ -440,7 +440,9 @@ REMOTE_CLEANUP_RSYNC_CODE = textwrap.dedent(
         "remote-sandbox-rsync-"
     ):
         raise ValueError("invalid rsync staging root")
-    shutil.rmtree(staging, ignore_errors=True)
+    shutil.rmtree(staging)
+    if os.path.lexists(staging):
+        raise RuntimeError("rsync staging cleanup left residue")
     """
 ).strip()
 

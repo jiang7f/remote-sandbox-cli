@@ -39,6 +39,9 @@ def test_quality_job_has_explicit_non_skippable_release_checks() -> None:
         "Check Python 3.10 packaged agent": "test_agent_zipapp_runs_on_python_310",
         "Check legacy imports": "test_no_legacy_module_imports",
         "Check E2E fixture contract": "tests/e2e/test_fixture_contract.py",
+        "Check watcher daemon latency": (
+            "test_real_local_watcher_daemon_propagates_within_two_seconds"
+        ),
         "Check in-tree metadata": "test_no_in_tree_control_metadata",
         "Check generated artifacts": "test_no_tracked_generated_artifacts",
         "Check git diff": "git diff --check",
@@ -167,3 +170,16 @@ def test_readme_advertises_only_codex_rsb_command() -> None:
         "uv run codex-rsb" in line or not line.startswith("uv run codex-")
         for line in command_lines
     )
+
+
+def test_readme_documents_controlled_rename_back_procedure() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert "## 回迁正式命名" in readme
+    assert "退役 `codex-rsb`" in readme
+    assert "恢复发行包名和命令名" in readme
+    assert "迁移或明确丢弃开发元数据" in readme
+    assert "验收通过后" in readme
+    assert "兼容别名" in readme
+    assert "CODEX_REMOTE_SANDBOX_HOME" in readme
+    assert "REMOTE_SANDBOX_HOME" in readme

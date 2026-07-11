@@ -109,7 +109,7 @@ uv run codex-rsb forget <name> --local-only
 ~/.codex-remote-sandbox/workspaces/<workspace-id>/
 ```
 
-测试可以通过 `CODEX_REMOTE_SANDBOX_HOME` 和 `CODEX_REMOTE_SANDBOX_RUNTIME_DIR` 指向一次性目录。正式开发流程不应设置旧版 `REMOTE_SANDBOX_HOME`、`REMOTE_SANDBOX_RUNTIME_DIR` 或 `REMOTE_SANDBOX_CONTROL_DIR` 来替代开发命名空间。
+测试可以通过 `CODEX_REMOTE_SANDBOX_HOME`、`CODEX_REMOTE_SANDBOX_RUNTIME_DIR` 和 `CODEX_REMOTE_SANDBOX_CONNECTIONS` 指向一次性目录。正式开发流程不应设置旧版 `REMOTE_SANDBOX_HOME`、`REMOTE_SANDBOX_RUNTIME_DIR`、`REMOTE_SANDBOX_CONTROL_DIR` 或 `REMOTE_SANDBOX_CONNECTIONS` 来替代开发命名空间。
 
 ## `.git` 规则
 
@@ -149,6 +149,20 @@ uv run codex-rsb resolve path/to/file --use-remote
 ```
 
 冲突解决通过 supervisor mutation 队列执行，不会与增量同步引擎并发修改同一路径。
+
+## 回迁正式命名
+
+只有在开发版本完成 Linux 和 macOS 自动化测试、Docker OpenSSH E2E、真实服务器验收、升级与回滚演练后，才能开始正式命名回迁。回迁前应冻结新的连接创建，并备份开发和已安装版本各自的外部元数据。
+
+受控步骤如下。
+
+1. 先发布停止写入的新版本，退役 `codex-rsb` 的日常使用，并确认没有运行中的开发 supervisor、watcher 或 SSH control master。
+2. 恢复发行包名和命令名，将开发发行名 `codex-remote-sandbox` 和命令 `codex-rsb` 切换到最终批准的正式名称与 `rsb` 入口。
+3. 逐个检查 `CODEX_REMOTE_SANDBOX_HOME`、`CODEX_REMOTE_SANDBOX_RUNTIME_DIR` 和 `CODEX_REMOTE_SANDBOX_CONNECTIONS` 指向的开发状态。根据发布计划迁移或明确丢弃开发元数据，不能让它自动覆盖 `REMOTE_SANDBOX_HOME` 或其他已安装版本状态。
+4. 在隔离副本上验证 registry、workspace ID、远程 agent、冲突、forget 和回滚行为，再执行真实用户状态迁移。
+5. 保留一个发布周期的只读检测和回滚路径。只有升级、回滚和清理验收通过后，才能移除旧命令与配置的兼容别名。
+
+任何一步失败都应停止迁移，恢复备份，并继续使用相互隔离的开发和已安装命名空间。
 
 ## 忽略和占位文件
 

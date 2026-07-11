@@ -33,7 +33,7 @@ class BindingRecord:
 
 
 def registry_path() -> Path:
-    override = os.environ.get("REMOTE_SANDBOX_CONNECTIONS")
+    override = os.environ.get("CODEX_REMOTE_SANDBOX_CONNECTIONS")
     if override:
         return Path(override).expanduser()
     return remote_sandbox_home() / "connections.toml"

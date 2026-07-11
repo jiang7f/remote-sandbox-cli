@@ -38,6 +38,36 @@ def test_local_only_forget_removes_local_state_and_reports_remote_residue(
     assert cli_fixture.record.workspace_id in result.stdout
 
 
+def test_local_only_forget_does_not_read_or_delete_installed_registry(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    development_home = tmp_path / "codex-home"
+    installed_registry = tmp_path / "installed" / "connections.toml"
+    installed = BindingRecord(
+        name="installed",
+        workspace_id="00000000-0000-4000-8000-000000000183",
+        target="host",
+        remote_path="/work/installed",
+        local_path=str(tmp_path / "installed-project"),
+        updated_at="2026-07-12T00:00:00Z",
+    )
+    upsert_binding_record(installed_registry, installed)
+    installed_before = installed_registry.read_bytes()
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(development_home))
+    monkeypatch.setenv("REMOTE_SANDBOX_CONNECTIONS", str(installed_registry))
+    services = default_cli_services()
+
+    result = invoke_cli(
+        ["forget", "installed", "--local-only"],
+        services=services,
+    )
+
+    assert result.exit_code == 0
+    assert "already forgotten" in result.stdout
+    assert installed_registry.read_bytes() == installed_before
+
+
 def test_normal_forget_uses_double_ended_cleanup_order(cli_fixture: CliHarness) -> None:
     result = cli_fixture.run(["forget", "dq"])
 

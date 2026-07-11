@@ -17,6 +17,7 @@ from remote_sandbox.registry import (
     delete_binding_record,
     list_binding_records,
     register_workspace,
+    registry_path,
     upsert_binding_record,
 )
 from remote_sandbox.workspace import WorkspaceSpec
@@ -96,6 +97,74 @@ def _record(name: str, workspace_suffix: int, local_root: Path) -> BindingRecord
         local_path=str(local_root),
         updated_at="2026-07-10T00:00:00Z",
     )
+
+
+def test_registry_path_ignores_legacy_installed_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    development_home = tmp_path / "codex-home"
+    installed_registry = tmp_path / "installed" / "connections.toml"
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(development_home))
+    monkeypatch.setenv("REMOTE_SANDBOX_CONNECTIONS", str(installed_registry))
+
+    assert registry_path() == development_home / "connections.toml"
+
+
+def test_registry_path_honors_development_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    development_registry = tmp_path / "development" / "connections.toml"
+    monkeypatch.setenv(
+        "CODEX_REMOTE_SANDBOX_CONNECTIONS",
+        str(development_registry),
+    )
+
+    assert registry_path() == development_registry
+
+
+def test_default_registry_reads_and_writes_ignore_installed_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    development_home = tmp_path / "codex-home"
+    installed_registry = tmp_path / "installed" / "connections.toml"
+    installed = _record("installed", 81, tmp_path / "installed-project")
+    development = _record("development", 82, tmp_path / "development-project")
+    upsert_binding_record(installed_registry, installed)
+    installed_before = installed_registry.read_bytes()
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(development_home))
+    monkeypatch.setenv("REMOTE_SANDBOX_CONNECTIONS", str(installed_registry))
+
+    assert list_binding_records() == []
+    upsert_binding_record(None, development)
+
+    assert list_binding_records() == [development]
+    assert installed_registry.read_bytes() == installed_before
+
+
+def test_connect_registration_does_not_write_installed_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    development_home = tmp_path / "codex-home"
+    installed_registry = tmp_path / "installed" / "connections.toml"
+    installed = _record("installed", 83, tmp_path / "installed-project")
+    upsert_binding_record(installed_registry, installed)
+    installed_before = installed_registry.read_bytes()
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(development_home))
+    monkeypatch.setenv("REMOTE_SANDBOX_CONNECTIONS", str(installed_registry))
+    spec = _workspace_spec(
+        workspace_id="00000000-0000-4000-8000-000000000084",
+        name="development",
+        local_root=tmp_path / "development-project",
+    )
+
+    record = register_workspace(spec)
+
+    assert list_binding_records() == [record]
+    assert installed_registry.read_bytes() == installed_before
 
 
 def test_register_workspace_persists_binding_record(tmp_path: Path) -> None:

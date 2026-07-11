@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 
 
@@ -32,3 +34,23 @@ def test_connect_sync_run_and_forget_without_workspace_metadata(ssh_fixture) -> 
     assert not ssh_fixture.remote_exists(remote_metadata)
     assert production_sentinel.read_bytes() == b"do-not-touch"
     assert ssh_fixture.read_remote(remote_production_sentinel) == b"remote"
+
+
+@pytest.mark.e2e
+def test_remote_watcher_subscription_propagates_within_two_seconds(ssh_fixture) -> None:
+    local, remote = ssh_fixture.bound_pair(name="remote-latency", password=False)
+    remote_path = remote / "latency.txt"
+    local_path = local / "latency.txt"
+
+    created_at = time.monotonic()
+    ssh_fixture.write_remote(remote_path, b"observed")
+    ssh_fixture.wait_for_local_file(local_path, timeout=2.0)
+    create_elapsed = time.monotonic() - created_at
+
+    deleted_at = time.monotonic()
+    ssh_fixture.delete_remote(remote_path)
+    ssh_fixture.wait_until_missing(local_path, timeout=2.0)
+    delete_elapsed = time.monotonic() - deleted_at
+
+    assert create_elapsed < 2.0
+    assert delete_elapsed < 2.0
