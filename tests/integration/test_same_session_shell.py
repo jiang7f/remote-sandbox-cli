@@ -378,6 +378,119 @@ def test_blocked_ready_probe_does_not_block_pty_passthrough(tmp_path: Path) -> N
         os.close(frontend_master)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded, use of fork\\(\\) may lead to "
+    "deadlocks in the child\\.:DeprecationWarning"
+)
+@pytest.mark.parametrize("old_result", ["pending", "ready"])
+@pytest.mark.timeout(8)
+def test_successful_reconnect_invalidates_in_flight_ready_probe(
+    tmp_path: Path,
+    old_result: str,
+) -> None:
+    nonce = f"stale14-{old_result}"
+    workspace = tmp_path / "remote"
+    workspace.mkdir()
+    probe_started = tmp_path / "probe-started"
+    release_probe = tmp_path / "release-probe"
+    probe_log = tmp_path / "probe.log"
+    ready_log = tmp_path / "ready.log"
+    rcfile = tmp_path / "bashrc"
+    rc_script = _enter_rcfile(nonce).replace(
+        "__codex_rsb_publish_ready() {",
+        "__codex_rsb_publish_ready_impl() {",
+        1,
+    )
+    rcfile.write_text(
+        "CODEX_RSB_DISPLAY_LABEL=host\n"
+        f"__codex_nonce={shlex.quote(nonce)}\n{rc_script}\n"
+        "__codex_rsb_publish_ready() {\n"
+        f"  printf 'ready\\n' >> {shlex.quote(str(ready_log))}\n"
+        "  __codex_rsb_publish_ready_impl\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    frontend_master, frontend_slave = pty.openpty()
+    pid = os.fork()
+    if pid == 0:
+        os.close(frontend_master)
+        os.login_tty(frontend_slave)
+        sys.stdin = os.fdopen(os.dup(0), "r", encoding="utf-8")
+        sys.stdout = os.fdopen(os.dup(1), "w", encoding="utf-8")
+        connect_calls = 0
+
+        def connect(_event: ConnectRequestEvent) -> ConnectResponse:
+            nonlocal connect_calls
+            connect_calls += 1
+            if connect_calls == 1:
+
+                def old_probe() -> str:
+                    with probe_log.open("a", encoding="utf-8") as handle:
+                        handle.write("old\n")
+                    probe_started.touch()
+                    deadline = time.monotonic() + 2.0
+                    while not release_probe.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    return old_result
+
+                return ConnectResponse(
+                    ok=True,
+                    workspace_id="old",
+                    name="dq",
+                    remote_root=str(workspace),
+                    direction="local-to-remote",
+                    ready_probe=old_probe,
+                )
+            return ConnectResponse(
+                ok=True,
+                workspace_id="new",
+                name="next",
+                remote_root=str(workspace),
+                direction="remote-to-local",
+            )
+
+        try:
+            status = shell_module._pty_enter_shell_backend(
+                ["bash", "--noprofile", "--rcfile", str(rcfile), "-i"],
+                nonce,
+                connect,
+            )
+        except BaseException:
+            traceback.print_exc()
+            status = 1
+        os._exit(status)
+
+    os.close(frontend_slave)
+    output = bytearray()
+    try:
+        _read_pty_until(frontend_master, output, b":enter]", timeout=2.0)
+        _connect_remote(frontend_master, output, workspace)
+        _wait_for_path(probe_started, timeout=1.0)
+        _connect_remote(frontend_master, output, workspace, name="next")
+        release_probe.touch()
+        time.sleep(0.65)
+        assert _line_count(probe_log) == 1
+        assert _line_count(ready_log) == 0
+
+        command_start = len(output)
+        os.write(frontend_master, b"printf 'NEW:%s\\n' \"$PWD\"\n")
+        _read_command_until_prompt(
+            frontend_master,
+            output,
+            f"\r\nNEW:{workspace}".encode(),
+            start=command_start,
+            prompt=b"[host:next]",
+        )
+        text = output.decode("utf-8", errors="replace")
+        assert "bash_execute_unix_command" not in text
+    finally:
+        release_probe.touch()
+        with suppress(OSError):
+            os.write(frontend_master, b"\nexit\n")
+        _terminate_child(pid)
+        os.close(frontend_master)
+
+
 def _enter_rcfile(nonce: str) -> str:
     remote_command = shell_module.build_enter_remote_shell_command(
         "host",
@@ -388,13 +501,25 @@ def _enter_rcfile(nonce: str) -> str:
     return outer_script.split("cat <<'EOF'\n", 1)[1].split("\nEOF\n", 1)[0]
 
 
-def _connect_remote(fd: int, output: bytearray, workspace: Path) -> None:
+def _connect_remote(
+    fd: int,
+    output: bytearray,
+    workspace: Path,
+    *,
+    name: str = "dq",
+) -> None:
     output_start = len(output)
     os.write(
         fd,
         f"codex-rsb connect --remote {shlex.quote(str(workspace))}\n".encode(),
     )
-    _read_pty_until(fd, output, b"[host:dq]", timeout=3.0, start=output_start)
+    _read_pty_until(
+        fd,
+        output,
+        f"[host:{name}]".encode(),
+        timeout=3.0,
+        start=output_start,
+    )
 
 
 def _read_command_until_prompt(

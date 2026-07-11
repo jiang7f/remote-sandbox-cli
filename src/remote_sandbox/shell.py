@@ -731,15 +731,17 @@ def _pty_enter_shell_backend(
                                 if original_terminal is not None:
                                     tty.setraw(stdin_fd)
                             os.write(master_fd, payload)
-                            if (
-                                response.ok
-                                and response.direction == "local-to-remote"
-                                and response.ready_probe is not None
-                            ):
+                            if response.ok:
                                 ready_probe_generation += 1
-                                ready_probe = response.ready_probe
+                                ready_probe = None
                                 ready_latched = False
-                                next_ready_probe_at = time.monotonic()
+                                next_ready_probe_at = 0.0
+                                if (
+                                    response.direction == "local-to-remote"
+                                    and response.ready_probe is not None
+                                ):
+                                    ready_probe = response.ready_probe
+                                    next_ready_probe_at = time.monotonic()
                 if stdin_fd in readable:
                     data = os.read(stdin_fd, 4096)
                     if not data:
