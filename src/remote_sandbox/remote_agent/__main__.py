@@ -376,6 +376,9 @@ def _fingerprint_requested_path(
             "mode": mode,
             "link_target": None,
             "content_hash": None,
+            "ctime_ns": metadata.st_ctime_ns,
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
         }
         if stat.S_ISLNK(mode):
             try:
@@ -407,15 +410,50 @@ def _fingerprint_requested_path(
             return _missing_fingerprint(path)
         try:
             opened_metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(opened_metadata.st_mode):
+            if not stat.S_ISREG(opened_metadata.st_mode) or (
+                opened_metadata.st_dev,
+                opened_metadata.st_ino,
+                opened_metadata.st_mode,
+                opened_metadata.st_size,
+                opened_metadata.st_mtime_ns,
+                opened_metadata.st_ctime_ns,
+            ) != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            ):
                 raise RuntimeError("requested file changed type while hashing")
+            digest = _sha256_descriptor(descriptor)
+            after_metadata = os.fstat(descriptor)
+            if (
+                after_metadata.st_dev,
+                after_metadata.st_ino,
+                after_metadata.st_mode,
+                after_metadata.st_size,
+                after_metadata.st_mtime_ns,
+                after_metadata.st_ctime_ns,
+            ) != (
+                opened_metadata.st_dev,
+                opened_metadata.st_ino,
+                opened_metadata.st_mode,
+                opened_metadata.st_size,
+                opened_metadata.st_mtime_ns,
+                opened_metadata.st_ctime_ns,
+            ):
+                raise RuntimeError("requested file changed while hashing")
             result.update(
                 {
                     "kind": "file",
                     "size": opened_metadata.st_size,
                     "mtime_ns": opened_metadata.st_mtime_ns,
                     "mode": opened_metadata.st_mode,
-                    "content_hash": _sha256_descriptor(descriptor),
+                    "content_hash": digest,
+                    "ctime_ns": opened_metadata.st_ctime_ns,
+                    "device": opened_metadata.st_dev,
+                    "inode": opened_metadata.st_ino,
                 }
             )
             return result

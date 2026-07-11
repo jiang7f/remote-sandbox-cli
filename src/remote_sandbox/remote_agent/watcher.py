@@ -20,6 +20,9 @@ class RemoteSignature:
     mtime_ns: int
     mode: int
     link_target: str | None = None
+    ctime_ns: int = 0
+    device: int = 0
+    inode: int = 0
 
     def to_payload(self, path: str) -> dict[str, object]:
         return {
@@ -29,6 +32,9 @@ class RemoteSignature:
             "mtime_ns": self.mtime_ns,
             "mode": self.mode,
             "link_target": self.link_target,
+            "ctime_ns": self.ctime_ns,
+            "device": self.device,
+            "inode": self.inode,
         }
 
 
@@ -226,9 +232,21 @@ def _scan_directory_descriptor(
                 metadata.st_mtime_ns,
                 mode,
                 target,
+                metadata.st_ctime_ns,
+                metadata.st_dev,
+                metadata.st_ino,
             )
         elif stat.S_ISDIR(mode):
-            snapshot[relative] = RemoteSignature("dir", None, metadata.st_mtime_ns, mode)
+            snapshot[relative] = RemoteSignature(
+                "dir",
+                None,
+                metadata.st_mtime_ns,
+                mode,
+                None,
+                metadata.st_ctime_ns,
+                metadata.st_dev,
+                metadata.st_ino,
+            )
             try:
                 child = os.open(
                     entry.name,
@@ -247,9 +265,22 @@ def _scan_directory_descriptor(
                 metadata.st_size,
                 metadata.st_mtime_ns,
                 mode,
+                None,
+                metadata.st_ctime_ns,
+                metadata.st_dev,
+                metadata.st_ino,
             )
         else:
-            snapshot[relative] = RemoteSignature("special", None, metadata.st_mtime_ns, mode)
+            snapshot[relative] = RemoteSignature(
+                "special",
+                None,
+                metadata.st_mtime_ns,
+                mode,
+                None,
+                metadata.st_ctime_ns,
+                metadata.st_dev,
+                metadata.st_ino,
+            )
 
 
 def _snapshot_events(

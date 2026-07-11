@@ -1,4 +1,6 @@
+import os
 import shutil
+from pathlib import Path
 
 from helpers.sync_harness import SyncPair
 
@@ -38,6 +40,65 @@ def test_noop_audit_does_not_hash_regular_file_contents(sync_pair: SyncPair) -> 
 
     assert result == type(result)()
     assert sync_pair.remote_client.hash_calls == []
+
+
+def test_missing_audit_signature_hashes_once_then_restores_noop_fast_path(
+    sync_pair: SyncPair,
+) -> None:
+    path = "stable.txt"
+    (sync_pair.local / path).write_bytes(b"stable")
+    shutil.copy2(sync_pair.local / path, sync_pair.remote / path)
+    sync_pair.seed_current_base()
+    sync_pair.store.replace_audit_signatures("local", {})
+    sync_pair.store.replace_audit_signatures("remote", {})
+    sync_pair.remote_client.hash_calls.clear()
+
+    first = sync_pair.engine.audit()
+    first_hashes = tuple(sync_pair.remote_client.hash_calls)
+    sync_pair.remote_client.hash_calls.clear()
+    second = sync_pair.engine.audit()
+
+    assert first == type(first)()
+    assert second == type(second)()
+    assert first_hashes == ((path,),)
+    assert sync_pair.remote_client.hash_calls == []
+
+
+def _replace_bytes_preserving_quick_metadata(path: Path, content: bytes) -> None:
+    metadata = path.stat(follow_symlinks=False)
+    path.write_bytes(content)
+    path.chmod(metadata.st_mode)
+    os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+
+
+def test_audit_recovers_lost_local_modification_with_unchanged_quick_metadata(
+    sync_pair: SyncPair,
+) -> None:
+    path = "same-quick.txt"
+    (sync_pair.local / path).write_bytes(b"base")
+    shutil.copy2(sync_pair.local / path, sync_pair.remote / path)
+    sync_pair.seed_current_base()
+    _replace_bytes_preserving_quick_metadata(sync_pair.local / path, b"evil")
+
+    result = sync_pair.engine.audit()
+
+    assert result.completed == (path,)
+    assert (sync_pair.remote / path).read_bytes() == b"evil"
+
+
+def test_audit_recovers_lost_remote_modification_with_unchanged_quick_metadata(
+    sync_pair: SyncPair,
+) -> None:
+    path = "same-quick.txt"
+    (sync_pair.local / path).write_bytes(b"base")
+    shutil.copy2(sync_pair.local / path, sync_pair.remote / path)
+    sync_pair.seed_current_base()
+    _replace_bytes_preserving_quick_metadata(sync_pair.remote / path, b"evil")
+
+    result = sync_pair.engine.audit()
+
+    assert result.completed == (path,)
+    assert (sync_pair.local / path).read_bytes() == b"evil"
 
 
 def test_rescan_event_audits_kind_change_and_persists_conflict(sync_pair: SyncPair) -> None:

@@ -6,7 +6,7 @@ import json
 import subprocess
 import threading
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, BinaryIO, Protocol, cast
 
 from remote_sandbox.agent import AgentInstall, RemoteAgentManager
@@ -19,6 +19,7 @@ from remote_sandbox.manifest import (
 )
 from remote_sandbox.remote_protocol import AgentRequest, decode_response, encode_request
 from remote_sandbox.ssh import SshRunner
+from remote_sandbox.state import AuditSignature
 
 
 class RemoteProtocolError(RuntimeError):
@@ -29,6 +30,7 @@ class RemoteProtocolError(RuntimeError):
 class RemoteSnapshot:
     entries: dict[str, EntryFingerprint | MissingEntry]
     latest_sequence: int
+    signatures: dict[str, AuditSignature] = field(default_factory=dict)
 
 
 class _StreamProcess(Protocol):
@@ -137,12 +139,16 @@ class RemoteWorkspaceClient:
         if not isinstance(raw_entries, list) or type(latest_sequence) is not int:
             raise RemoteProtocolError("remote snapshot payload is malformed")
         entries: dict[str, EntryFingerprint | MissingEntry] = {}
+        signatures: dict[str, AuditSignature] = {}
         for raw_entry in raw_entries:
             entry = _parse_fingerprint(raw_entry)
             if isinstance(entry, MissingEntry) or entry.path in entries:
                 raise RemoteProtocolError("remote snapshot contains an invalid entry")
             entries[entry.path] = entry
-        return RemoteSnapshot(entries, latest_sequence)
+            signature = _parse_audit_signature(raw_entry)
+            if signature is not None:
+                signatures[entry.path] = signature
+        return RemoteSnapshot(entries, latest_sequence, signatures)
 
     def hash_paths(
         self,
@@ -163,6 +169,52 @@ class RemoteWorkspaceClient:
         ):
             raise RemoteProtocolError("remote metadata payload contains a regular file hash")
         return entries
+
+    def audit_signatures(
+        self,
+        paths: Iterable[str],
+    ) -> dict[str, AuditSignature | None]:
+        requested = [normalize_relative_path(path) for path in paths]
+        payload = self._call("metadata-paths", {"paths": requested})
+        raw_entries = payload.get("entries")
+        if not isinstance(raw_entries, list):
+            raise RemoteProtocolError("remote audit signature payload is malformed")
+        result: dict[str, AuditSignature | None] = {}
+        for raw in raw_entries:
+            entry = _parse_fingerprint(raw)
+            if entry.path is None or entry.path in result:
+                raise RemoteProtocolError("remote audit signature payload is malformed")
+            result[entry.path] = _parse_audit_signature(raw)
+        if set(result) != set(requested):
+            raise RemoteProtocolError("remote audit signature payload does not match paths")
+        return result
+
+    def observations(
+        self,
+        paths: Iterable[str],
+        *,
+        with_hash: bool,
+    ) -> tuple[
+        dict[str, EntryFingerprint | MissingEntry],
+        dict[str, AuditSignature | None],
+    ]:
+        requested = [normalize_relative_path(path) for path in paths]
+        command = "hash-paths" if with_hash else "metadata-paths"
+        payload = self._call(command, {"paths": requested})
+        raw_entries = payload.get("entries")
+        if not isinstance(raw_entries, list):
+            raise RemoteProtocolError("remote observation payload is malformed")
+        entries: dict[str, EntryFingerprint | MissingEntry] = {}
+        signatures: dict[str, AuditSignature | None] = {}
+        for raw in raw_entries:
+            entry = _parse_fingerprint(raw)
+            if entry.path is None or entry.path in entries:
+                raise RemoteProtocolError("remote observation payload is malformed")
+            entries[entry.path] = entry
+            signatures[entry.path] = _parse_audit_signature(raw)
+        if set(entries) != set(requested):
+            raise RemoteProtocolError("remote observation payload does not match paths")
+        return entries, signatures
 
     def events_after(self, after_sequence: int) -> list[JournalEvent]:
         if type(after_sequence) is not int or after_sequence < 0:
@@ -490,6 +542,30 @@ def _parse_fingerprint(raw: object) -> EntryFingerprint | MissingEntry:
         )
     except ValueError as exc:
         raise RemoteProtocolError(f"invalid remote fingerprint: {exc}") from exc
+
+
+def _parse_audit_signature(raw: object) -> AuditSignature | None:
+    if not isinstance(raw, dict) or raw.get("kind") == "missing":
+        return None
+    path = raw.get("path")
+    kind = raw.get("kind")
+    ctime_ns = raw.get("ctime_ns")
+    device = raw.get("device")
+    inode = raw.get("inode")
+    if ctime_ns is None and device is None and inode is None:
+        return None
+    if (
+        not isinstance(path, str)
+        or not isinstance(kind, str)
+        or type(ctime_ns) is not int
+        or type(device) is not int
+        or type(inode) is not int
+    ):
+        raise RemoteProtocolError("remote audit signature is malformed")
+    try:
+        return AuditSignature(path, EntryKind(kind), ctime_ns, device, inode)
+    except ValueError as exc:
+        raise RemoteProtocolError(f"invalid remote audit signature: {exc}") from exc
 
 
 def _close_process_pipes(process: _StreamProcess) -> None:

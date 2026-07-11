@@ -24,7 +24,7 @@ from remote_sandbox.manifest import (
 )
 from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _JSON_SCHEMA_VERSION = 1
 _SIDES = frozenset({"local", "remote"})
 
@@ -40,6 +40,23 @@ class ConflictRecord:
     remote_fingerprint: EntryFingerprint | None
     created_at: float
     resolved_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AuditSignature:
+    path: str
+    kind: EntryKind
+    ctime_ns: int
+    device: int
+    inode: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", normalize_relative_path(self.path))
+        if type(self.kind) is not EntryKind:
+            raise ValueError("audit signature kind must be an EntryKind")
+        for value in (self.ctime_ns, self.device, self.inode):
+            if type(value) is not int or value < 0:
+                raise ValueError("audit signature identity values must be non-negative integers")
 
 
 class WorkspaceStore:
@@ -444,6 +461,95 @@ class WorkspaceStore:
                 ((path,) for path in normalized),
             )
 
+    def list_audit_signatures(self, side: str) -> dict[str, AuditSignature]:
+        _validate_side(side)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT path, kind, ctime_ns, device, inode
+                FROM audit_signatures WHERE side = ? ORDER BY path
+                """,
+                (side,),
+            ).fetchall()
+        return {
+            _expect_str(row["path"], "audit signature path"): AuditSignature(
+                _expect_str(row["path"], "audit signature path"),
+                EntryKind(_expect_str(row["kind"], "audit signature kind")),
+                _expect_int(row["ctime_ns"], "audit signature ctime"),
+                _expect_int(row["device"], "audit signature device"),
+                _expect_int(row["inode"], "audit signature inode"),
+            )
+            for row in rows
+        }
+
+    def replace_audit_signatures(
+        self,
+        side: str,
+        signatures: Mapping[str, AuditSignature],
+    ) -> None:
+        _validate_side(side)
+        rows = []
+        for path, signature in signatures.items():
+            normalized = normalize_relative_path(path)
+            if signature.path != normalized:
+                raise ValueError("audit signature key does not match path")
+            rows.append(
+                (
+                    side,
+                    normalized,
+                    signature.kind.value,
+                    signature.ctime_ns,
+                    signature.device,
+                    signature.inode,
+                )
+            )
+        with self.transaction():
+            self._connection.execute("DELETE FROM audit_signatures WHERE side = ?", (side,))
+            self._connection.executemany(
+                """
+                INSERT INTO audit_signatures(side, path, kind, ctime_ns, device, inode)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    def update_audit_signatures(
+        self,
+        side: str,
+        signatures: Mapping[str, AuditSignature | None],
+    ) -> None:
+        _validate_side(side)
+        with self.transaction():
+            for path, signature in signatures.items():
+                normalized = normalize_relative_path(path)
+                if signature is None:
+                    self._connection.execute(
+                        "DELETE FROM audit_signatures WHERE side = ? AND path = ?",
+                        (side, normalized),
+                    )
+                    continue
+                if signature.path != normalized:
+                    raise ValueError("audit signature key does not match path")
+                self._connection.execute(
+                    """
+                    INSERT INTO audit_signatures(side, path, kind, ctime_ns, device, inode)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(side, path) DO UPDATE SET
+                        kind = excluded.kind,
+                        ctime_ns = excluded.ctime_ns,
+                        device = excluded.device,
+                        inode = excluded.inode
+                    """,
+                    (
+                        side,
+                        normalized,
+                        signature.kind.value,
+                        signature.ctime_ns,
+                        signature.device,
+                        signature.inode,
+                    ),
+                )
+
     def create_conflict(
         self,
         *,
@@ -547,7 +653,7 @@ class WorkspaceStore:
             elif version == 1:
                 self._migrate_legacy_base_entries()
                 self._create_current_schema()
-            elif version == 2:
+            elif version in {2, 3}:
                 self._create_current_schema()
             self._connection.execute(
                 """
@@ -690,6 +796,17 @@ class WorkspaceStore:
                 path TEXT PRIMARY KEY,
                 reason TEXT NOT NULL,
                 created_at REAL NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS audit_signatures (
+                side TEXT NOT NULL CHECK(side IN ('local', 'remote')),
+                path TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                ctime_ns INTEGER NOT NULL CHECK(ctime_ns >= 0),
+                device INTEGER NOT NULL CHECK(device >= 0),
+                inode INTEGER NOT NULL CHECK(inode >= 0),
+                PRIMARY KEY(side, path)
             )
             """,
         )

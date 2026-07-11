@@ -9,8 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TypeAlias
 
+from remote_sandbox._engine_audit import AuditCoordinator
 from remote_sandbox._engine_events import acknowledge_pending, contains_rescan, dirty_sources
-from remote_sandbox._engine_metadata import LocalMetadata, quick_matches_base
+from remote_sandbox._engine_metadata import LocalMetadata
+from remote_sandbox._engine_planning import (
+    satisfy_hash_requests,
+    strengthen_deletion_targets,
+    strengthen_requeued_files,
+)
 from remote_sandbox._transport_fingerprint import ProtectedLocalRoot
 from remote_sandbox.journal import EventKind, JournalEvent, coalesce_events
 from remote_sandbox.manifest import (
@@ -28,7 +34,7 @@ from remote_sandbox.reconcile import (
     build_incremental_plan,
 )
 from remote_sandbox.remote_client import RemoteSnapshot
-from remote_sandbox.state import ConflictRecord, WorkspaceStore
+from remote_sandbox.state import AuditSignature, ConflictRecord, WorkspaceStore
 from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
 from remote_sandbox.transport import (
     TransferBatch,
@@ -52,6 +58,21 @@ class RemoteReplica(Protocol):
     def read_path(self, path: str) -> bytes | None: ...
 
     def acknowledge(self, sequence: int) -> int: ...
+
+    def audit_signatures(
+        self,
+        paths: Iterable[str],
+    ) -> dict[str, AuditSignature | None]: ...
+
+    def observations(
+        self,
+        paths: Iterable[str],
+        *,
+        with_hash: bool,
+    ) -> tuple[
+        dict[str, FingerprintState],
+        dict[str, AuditSignature | None],
+    ]: ...
 
 
 class SyncTransport(Protocol):
@@ -105,6 +126,12 @@ class SyncEngine:
         self.transport = transport
         self.policy = policy
         self.local_metadata = LocalMetadata(self.local_root, policy)
+        self.audit_coordinator = AuditCoordinator(
+            store=store,
+            local=self.local_metadata,
+            remote=remote,
+            policy=policy,
+        )
         self._cycle_lock = threading.RLock()
 
     def run_once(self, reason: str) -> EngineResult:
@@ -157,8 +184,35 @@ class SyncEngine:
 
         local = {path: local[path] for path in dirty}
         remote = {path: remote[path] for path in dirty}
+        local, remote = strengthen_requeued_files(
+            base,
+            local,
+            remote,
+            tuple(path for path in dirty if path in requeued_before),
+            local_hasher=self.local_metadata,
+            remote_hasher=self.remote,
+        )
         plan = build_incremental_plan(base, local, remote, dirty, self.policy)
-        plan, local, remote = self._satisfy_hash_requests(plan, base, local, remote, dirty)
+        plan, local, remote = satisfy_hash_requests(
+            plan,
+            base,
+            local,
+            remote,
+            dirty,
+            local_hasher=self.local_metadata,
+            remote_hasher=self.remote,
+            policy=self.policy,
+        )
+        plan, local, remote = strengthen_deletion_targets(
+            plan,
+            base,
+            local,
+            remote,
+            dirty,
+            local_hasher=self.local_metadata,
+            remote_hasher=self.remote,
+            policy=self.policy,
+        )
         return self._execute_and_commit(
             plan,
             local_events,
@@ -190,6 +244,7 @@ class SyncEngine:
                     raise RuntimeError(f"completed transfer destination is missing: {path}")
                 self.store.upsert_base(fingerprint)
                 self.store.set_expected_echo(destination_side, fingerprint)
+        self.audit_coordinator.refresh(completed)
 
     def requeue_paths(self, paths: Iterable[str], reason: str) -> None:
         self.store.requeue_paths(paths, reason)
@@ -212,30 +267,7 @@ class SyncEngine:
             for entry in sorted(entries, key=lambda item: item.path):
                 self.store.upsert_base(entry)
                 self.store.set_expected_echo("local", entry)
-
-    def _satisfy_hash_requests(
-        self,
-        plan: SyncPlan,
-        base: Mapping[str, EntryFingerprint],
-        local: dict[str, FingerprintState],
-        remote: dict[str, FingerprintState],
-        dirty: tuple[str, ...],
-    ) -> tuple[SyncPlan, dict[str, FingerprintState], dict[str, FingerprintState]]:
-        local_paths = tuple(
-            request.path for request in plan.hash_requests if request.side == "local"
-        )
-        remote_paths = tuple(
-            request.path for request in plan.hash_requests if request.side == "remote"
-        )
-        if local_paths:
-            local.update(self.local_metadata.paths(local_paths, with_hash=True, base=base))
-        if remote_paths:
-            remote.update(self.remote.hash_paths(remote_paths))
-        if plan.hash_requests:
-            plan = build_incremental_plan(base, local, remote, dirty, self.policy)
-        if plan.hash_requests:
-            raise RuntimeError("incremental planner requested unresolved hashes")
-        return plan, local, remote
+        self.audit_coordinator.refresh(entry.path for entry in entries)
 
     def _execute_and_commit(
         self,
@@ -427,6 +459,7 @@ class SyncEngine:
             self._clear_unused_echo_intents(intents, successful_mutations)
             raise
 
+        self.audit_coordinator.refresh(completed)
         if acknowledge_events and remote_events:
             self.remote.acknowledge(remote_events[-1].sequence)
         return EngineResult(
@@ -617,22 +650,7 @@ class SyncEngine:
         )
 
     def _record_audit_drift(self) -> None:
-        base = self.store.list_base()
-        local = self.local_metadata.snapshot(base)
-        remote_snapshot = self.remote.snapshot()
-        remote = remote_snapshot.entries
-        paths = sorted(set(base) | set(local) | set(remote))
-        dirty = [
-            path
-            for path in paths
-            if not self.policy.is_ignored(path)
-            and (
-                not quick_matches_base(local.get(path, MissingEntry(path)), base.get(path))
-                or not quick_matches_base(remote.get(path, MissingEntry(path)), base.get(path))
-            )
-        ]
-        if dirty:
-            self.store.requeue_paths(dirty, "audit-drift")
+        self.audit_coordinator.record_drift()
 
     def _set_status(self, phase: WorkspacePhase, stage: str) -> None:
         pending = len(self.store.pending_events("local", 0))

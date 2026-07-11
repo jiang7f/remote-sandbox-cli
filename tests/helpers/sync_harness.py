@@ -16,7 +16,7 @@ from remote_sandbox.manifest import (
 from remote_sandbox.policy import StaticPolicyEngine
 from remote_sandbox.remote_agent.store import RemoteStore
 from remote_sandbox.remote_client import RemoteSnapshot
-from remote_sandbox.state import WorkspaceStore
+from remote_sandbox.state import AuditSignature, WorkspaceStore
 from remote_sandbox.transport import (
     TransferBatch,
     TransferDirection,
@@ -80,7 +80,37 @@ class LocalReplicaClient:
     def snapshot(self) -> RemoteSnapshot:
         self.snapshot_calls += 1
         entries = snapshot_tree(self.root, with_hash=False)
-        return RemoteSnapshot(entries, self._store.latest_sequence())
+        signatures = {
+            path: signature
+            for path in entries
+            if (signature := _audit_signature(self.root, path)) is not None
+        }
+        return RemoteSnapshot(entries, self._store.latest_sequence(), signatures)
+
+    def audit_signatures(
+        self,
+        paths: Iterable[str],
+    ) -> dict[str, AuditSignature | None]:
+        return {path: _audit_signature(self.root, path) for path in paths}
+
+    def observations(
+        self,
+        paths: Iterable[str],
+        *,
+        with_hash: bool,
+    ) -> tuple[dict[str, FingerprintState], dict[str, AuditSignature | None]]:
+        requested = tuple(paths)
+        if with_hash:
+            self.hash_calls.append(requested)
+        else:
+            self.metadata_calls.append(requested)
+        return (
+            {
+                path: fingerprint_local(self.root, path, with_hash=with_hash)
+                for path in requested
+            },
+            {path: _audit_signature(self.root, path) for path in requested},
+        )
 
     def read_path(self, path: str) -> bytes | None:
         entry = fingerprint_local(self.root, path, with_hash=False)
@@ -178,7 +208,7 @@ class ControllableLocalPairTransport:
                 candidate.parent.mkdir(parents=True, exist_ok=True)
                 candidate.write_bytes(replacement)
             observed = fingerprint_local(root, path, with_hash=True)
-            if not _matches_expected(expected_entry, observed):
+            if observed != expected_entry:
                 changed.append(path)
                 continue
             if self.before_destination_change is not None:
@@ -219,6 +249,7 @@ class SyncPair:
     def seed_current_base(self) -> None:
         entries = snapshot_matching_replicas(self.local, self.remote, with_hash=True)
         self.store.replace_base(entries)
+        self.engine.audit_coordinator.refresh(entries)
 
     def append_local_modify(self, path: str, content: bytes) -> None:
         destination = self.local / path
@@ -329,4 +360,22 @@ def _matches_expected(expected: FingerprintState | None, observed: FingerprintSt
         and expected.size == observed.size
         and expected.mtime_ns == observed.mtime_ns
         and expected.mode == observed.mode
+    )
+
+
+def _audit_signature(root: Path, path: str) -> AuditSignature | None:
+    candidate = root / path
+    try:
+        metadata = candidate.lstat()
+    except FileNotFoundError:
+        return None
+    entry = fingerprint_local(root, path, with_hash=False)
+    if not isinstance(entry, EntryFingerprint):
+        return None
+    return AuditSignature(
+        path,
+        entry.kind,
+        metadata.st_ctime_ns,
+        metadata.st_dev,
+        metadata.st_ino,
     )

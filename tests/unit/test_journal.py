@@ -8,7 +8,7 @@ import pytest
 
 from remote_sandbox.journal import EventKind, JournalEvent, coalesce_events
 from remote_sandbox.manifest import EntryFingerprint, EntryKind, MissingEntry
-from remote_sandbox.state import WorkspaceStore
+from remote_sandbox.state import AuditSignature, WorkspaceStore
 
 
 def _fingerprint(path: str, digest: str = "abc") -> EntryFingerprint:
@@ -255,3 +255,14 @@ def test_other_thread_cannot_read_partial_reconciliation_state(tmp_path: Path) -
         reader.join(timeout=1)
         assert not reader.is_alive()
         assert observed == {}
+
+
+def test_audit_signatures_are_durable_per_side(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    signature = AuditSignature("a.py", EntryKind.FILE, 10, 20, 30)
+    with WorkspaceStore.open(database) as store:
+        store.update_audit_signatures("local", {"a.py": signature})
+
+    with WorkspaceStore.open(database) as reopened:
+        assert reopened.list_audit_signatures("local") == {"a.py": signature}
+        assert reopened.list_audit_signatures("remote") == {}

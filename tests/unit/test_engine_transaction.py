@@ -375,6 +375,96 @@ def test_local_delete_does_not_remove_concurrent_remote_replacement(
     assert engine_fixture.store.get_expected_echo("remote", path) is None
 
 
+@pytest.mark.parametrize("destination_side", ["local", "remote"])
+def test_delete_requires_strong_identity_when_replacement_preserves_quick_metadata(
+    engine_fixture: EngineHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    destination_side: str,
+) -> None:
+    path = "same-quick.txt"
+    (engine_fixture.local / path).write_bytes(b"base")
+    shutil.copy2(engine_fixture.local / path, engine_fixture.remote / path)
+    engine_fixture.store.replace_base(engine_fixture.remote_client.hash_paths([path]))  # type: ignore[arg-type]
+    if destination_side == "local":
+        (engine_fixture.remote / path).unlink()
+        engine_fixture.remote_client.append_event(EventKind.DELETE, path)
+        method_name = "delete_local"
+        destination = engine_fixture.local / path
+    else:
+        (engine_fixture.local / path).unlink()
+        engine_fixture.store.append_event("local", EventKind.DELETE, path)
+        method_name = "delete_remote"
+        destination = engine_fixture.remote / path
+    original = getattr(engine_fixture.transport, method_name)
+
+    def replace_then_delete(expected: object) -> object:
+        expected_entry = expected[path]  # type: ignore[index]
+        assert isinstance(expected_entry, EntryFingerprint)
+        assert expected_entry.content_hash is not None
+        metadata = destination.stat(follow_symlinks=False)
+        destination.write_bytes(b"evil")
+        destination.chmod(metadata.st_mode)
+        os.utime(destination, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+        return original(expected)
+
+    monkeypatch.setattr(engine_fixture.transport, method_name, replace_then_delete)
+
+    result = engine_fixture.engine.run_once("same-quick-delete")
+
+    assert destination.read_bytes() == b"evil"
+    assert result.requeued == (path,)
+    source_side = "remote" if destination_side == "local" else "local"
+    assert engine_fixture.store.acknowledged_sequence(source_side) == 0
+    assert engine_fixture.store.get_expected_echo(destination_side, path) is None
+
+
+def test_unchanged_remote_regular_delete_completes_with_strong_expected_identity(
+    engine_fixture: EngineHarness,
+) -> None:
+    path = "delete.txt"
+    (engine_fixture.local / path).write_bytes(b"base")
+    shutil.copy2(engine_fixture.local / path, engine_fixture.remote / path)
+    engine_fixture.store.replace_base(engine_fixture.remote_client.hash_paths([path]))  # type: ignore[arg-type]
+    (engine_fixture.local / path).unlink()
+    engine_fixture.store.append_event("local", EventKind.DELETE, path)
+
+    result = engine_fixture.engine.run_once("strong-delete")
+
+    assert result.completed == (path,)
+    assert not (engine_fixture.remote / path).exists()
+    assert engine_fixture.store.list_requeued_paths() == ()
+
+
+def test_signature_refresh_requeues_same_quick_change_after_base_commit(
+    engine_fixture: EngineHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = "refresh-race.txt"
+    engine_fixture.append_local_modify(path, b"new")
+    original_refresh = engine_fixture.engine.audit_coordinator.refresh
+
+    def mutate_then_refresh(paths: object) -> None:
+        candidate = engine_fixture.local / path
+        metadata = candidate.stat(follow_symlinks=False)
+        candidate.write_bytes(b"bad")
+        candidate.chmod(metadata.st_mode)
+        os.utime(candidate, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+        original_refresh(paths)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(engine_fixture.engine.audit_coordinator, "refresh", mutate_then_refresh)
+
+    first = engine_fixture.engine.run_once("watcher")
+
+    assert first.completed == (path,)
+    assert engine_fixture.store.list_requeued_paths() == (path,)
+    monkeypatch.setattr(engine_fixture.engine.audit_coordinator, "refresh", original_refresh)
+
+    recovered = engine_fixture.engine.audit()
+
+    assert recovered.completed == (path,)
+    assert (engine_fixture.remote / path).read_bytes() == b"bad"
+
+
 def test_expected_echo_is_committed_before_delete_destination_changes(
     engine_fixture: EngineHarness,
 ) -> None:

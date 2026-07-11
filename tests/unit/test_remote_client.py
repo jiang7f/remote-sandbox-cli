@@ -334,6 +334,40 @@ def test_remote_snapshot_parses_metadata_fingerprints_and_sequence() -> None:
     assert snapshot.entries["socket"].kind is EntryKind.SPECIAL
 
 
+def test_remote_snapshot_parses_audit_identity_fields() -> None:
+    runner = RecordingRunner(
+        {
+            "snapshot": {
+                "latest_sequence": 1,
+                "entries": [
+                    {
+                        "path": "a.py",
+                        "kind": "file",
+                        "size": 1,
+                        "mtime_ns": 2,
+                        "mode": 33188,
+                        "link_target": None,
+                        "ctime_ns": 3,
+                        "device": 4,
+                        "inode": 5,
+                    }
+                ],
+            }
+        }
+    )
+    client = RemoteWorkspaceClient(
+        runner,
+        target="host",
+        workspace_id="w1",
+        agent_path="~/.codex-remote-sandbox/agents/test/agent.pyz",
+    )
+
+    snapshot = client.snapshot()
+
+    signature = snapshot.signatures["a.py"]
+    assert (signature.ctime_ns, signature.device, signature.inode) == (3, 4, 5)
+
+
 def test_remote_hash_paths_requests_and_returns_only_selected_paths() -> None:
     runner = RecordingRunner(
         {

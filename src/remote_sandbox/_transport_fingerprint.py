@@ -5,7 +5,7 @@ import hashlib
 import os
 import secrets
 import stat
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from remote_sandbox._transport_paths import (
@@ -19,6 +19,7 @@ from remote_sandbox.manifest import (
     MissingEntry,
     normalize_relative_path,
 )
+from remote_sandbox.state import AuditSignature
 
 
 class LocalPathChanged(ValueError):
@@ -48,17 +49,26 @@ class ProtectedLocalRoot:
         *,
         with_hash: bool,
     ) -> EntryFingerprint | MissingEntry:
+        fingerprint, _signature = self.observe(relative_path, with_hash=with_hash)
+        return fingerprint
+
+    def observe(
+        self,
+        relative_path: str,
+        *,
+        with_hash: bool,
+    ) -> tuple[EntryFingerprint | MissingEntry, AuditSignature | None]:
         normalized = normalize_relative_path(relative_path)
         parts = normalized.split("/")
         try:
             parent_fd, chain = _open_verified_parent(self._descriptor, parts[:-1])
         except FileNotFoundError:
-            return MissingEntry(normalized)
+            return MissingEntry(normalized), None
         try:
             try:
                 entry = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError:
-                return MissingEntry(normalized)
+                return MissingEntry(normalized), None
             result = _fingerprint_leaf(
                 parent_fd,
                 parts[-1],
@@ -68,7 +78,14 @@ class ProtectedLocalRoot:
             )
             _verify_leaf(parent_fd, parts[-1], entry, normalized)
             _verify_parent_chain(chain, normalized)
-            return result
+            signature = AuditSignature(
+                normalized,
+                _entry_kind(entry.st_mode),
+                entry.st_ctime_ns,
+                entry.st_dev,
+                entry.st_ino,
+            )
+            return result, signature
         finally:
             os.close(parent_fd)
             for descriptor, _name, _identity in chain:
@@ -148,6 +165,15 @@ class ProtectedLocalRoot:
             os.close(parent_fd)
             for descriptor, _name, _identity in chain:
                 os.close(descriptor)
+
+    def audit_signature(self, relative_path: str) -> AuditSignature | None:
+        _fingerprint, signature = self.observe(relative_path, with_hash=False)
+        return signature
+
+    def walk_paths(self, is_ignored: Callable[[str], bool]) -> tuple[str, ...]:
+        paths: list[str] = []
+        _walk_descriptor(self._descriptor, "", is_ignored, paths)
+        return tuple(paths)
 
     def _quarantine_delete(
         self,
@@ -240,6 +266,45 @@ def _open_verified_parent(root_fd: int, parts: list[str]) -> tuple[int, ParentCh
         for parent_fd, _name, _identity in chain:
             os.close(parent_fd)
         raise
+
+
+def _walk_descriptor(
+    descriptor: int,
+    prefix: str,
+    is_ignored: Callable[[str], bool],
+    paths: list[str],
+) -> None:
+    with os.scandir(descriptor) as iterator:
+        names = sorted(entry.name for entry in iterator)
+    for name in names:
+        path = name if not prefix else f"{prefix}/{name}"
+        if is_ignored(path):
+            continue
+        try:
+            metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        paths.append(path)
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            continue
+        try:
+            child = _open_directory(name, dir_fd=descriptor)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        try:
+            _walk_descriptor(child, path, is_ignored, paths)
+        finally:
+            os.close(child)
+
+
+def _entry_kind(mode: int) -> EntryKind:
+    if stat.S_ISLNK(mode):
+        return EntryKind.SYMLINK
+    if stat.S_ISDIR(mode):
+        return EntryKind.DIR
+    if stat.S_ISREG(mode):
+        return EntryKind.FILE
+    return EntryKind.SPECIAL
 
 
 def _fingerprint_leaf(
@@ -389,22 +454,11 @@ def _matches_expected(
 ) -> bool:
     if expected == observed:
         return True
-    if (
+    return (
         isinstance(expected, EntryFingerprint)
         and isinstance(observed, EntryFingerprint)
         and expected.kind is EntryKind.DIR
         and observed.kind is EntryKind.DIR
-        and expected.mode == observed.mode
-    ):
-        return True
-    return (
-        isinstance(expected, EntryFingerprint)
-        and isinstance(observed, EntryFingerprint)
-        and expected.kind is EntryKind.FILE
-        and observed.kind is EntryKind.FILE
-        and expected.content_hash is None
-        and expected.size == observed.size
-        and expected.mtime_ns == observed.mtime_ns
         and expected.mode == observed.mode
     )
 
@@ -441,12 +495,20 @@ def _verify_leaf(
         after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError as exc:
         raise LocalPathChanged(f"fingerprint leaf changed: {path}") from exc
-    if (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns) != (
+    if (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) != (
         before.st_dev,
         before.st_ino,
         before.st_mode,
         before.st_size,
         before.st_mtime_ns,
+        before.st_ctime_ns,
     ):
         raise LocalPathChanged(f"fingerprint leaf changed: {path}")
 
