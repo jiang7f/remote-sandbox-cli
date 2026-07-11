@@ -25,6 +25,27 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy src
       - run: uv run python -m compileall -q src tests
+      - name: Check generated shell syntax
+        run: uv run pytest -q tests/unit/test_release_quality.py -k test_generated_shell_syntax
+      - name: Install Python 3.10 for agent compatibility
+        run: uv python install 3.10
+      - name: Check Python 3.10 packaged agent
+        run: >-
+          CODEX_PYTHON_310="$(uv python find 3.10)"
+          uv run pytest -q tests/integration/test_agent_zipapp.py
+          -k test_agent_zipapp_runs_on_python_310
+      - name: Check legacy imports
+        run: uv run pytest -q tests/unit/test_release_quality.py -k test_no_legacy_module_imports
+      - name: Check in-tree metadata
+        run: >-
+          uv run pytest -q tests/integration/test_bind_validation.py
+          -k test_bind_writes_only_external_metadata
+      - name: Check generated artifacts
+        run: >-
+          uv run pytest -q tests/unit/test_release_quality.py
+          -k test_no_tracked_generated_artifacts
+      - name: Check git diff
+        run: git diff --check
 
   unit-integration:
     strategy:

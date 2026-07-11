@@ -7,7 +7,6 @@
 ## 开发状态
 
 - 开发命令是 `codex-rsb`。
-- 长命令是 `codex-remote-sandbox`。
 - 本仓库不提供 `rsb` 命令别名。
 - 当前验证入口是 `uv run codex-rsb`。
 - 不要把本 README 中的命令当作已发布包的安装说明。

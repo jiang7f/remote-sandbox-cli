@@ -12,7 +12,7 @@ import remote_sandbox._transport_local as local_transport_module
 import remote_sandbox._transport_paths as transport_paths
 from remote_sandbox._transport_fingerprint import ProtectedLocalRoot
 from remote_sandbox._transport_local import LocalPairTransport
-from remote_sandbox.manifest import fingerprint_local
+from remote_sandbox.manifest import EntryFingerprint, fingerprint_local
 from remote_sandbox.transport import (
     TransferBatch,
     TransferDirection,
@@ -48,6 +48,48 @@ def test_regular_file_staging_uses_hardlink_on_same_filesystem(tmp_path: Path) -
     assert staged.read_bytes() == b"original"
     assert staged.stat().st_ino == source.stat().st_ino
     assert staged.stat().st_dev == source.stat().st_dev
+
+
+def test_source_verification_cleans_stage_and_reports_changed_entries(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / "stable.py").write_bytes(b"stable")
+    (source_root / "changed.py").write_bytes(b"before")
+    staging = tmp_path / "staging"
+    paths = ("stable.py", "changed.py")
+
+    with ProtectedLocalRoot(source_root) as protected:
+        observations = protected.observations(paths, with_hash=True)
+        expected_entries = {
+            path: entry for path, (entry, _signature) in observations.items()
+        }
+        assert all(isinstance(entry, EntryFingerprint) for entry in expected_entries.values())
+        expected_signatures = {
+            path: signature for path, (_entry, signature) in observations.items()
+        }
+        staged_signatures = protected.stage(
+            paths,
+            staging,
+            expected_entries=expected_entries,
+            expected_signatures=expected_signatures,
+            error_type=TransferError,
+        )
+        (source_root / "changed.py").write_bytes(b"after!")
+        cleanup = getattr(protected, "verify_and_cleanup_stage", None)
+        assert cleanup is not None
+        changed = cleanup(
+            paths,
+            staging,
+            expected_entries=expected_entries,
+            expected_signatures=staged_signatures,
+            error_type=TransferError,
+        )
+
+    assert changed == {"changed.py"}
+    assert staging.exists()
+    assert list(staging.iterdir()) == []
 
 
 def test_in_place_source_mutation_is_reported_and_destination_is_not_hardlinked(

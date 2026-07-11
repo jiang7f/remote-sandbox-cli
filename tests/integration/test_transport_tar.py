@@ -199,15 +199,27 @@ def test_parent_symlink_swap_after_preflight_never_reads_outside_root(
         original(*args)
 
     monkeypatch.setattr(transport, method_name, swap_then_transfer)
-    with pytest.raises((ValueError, TransferError, OSError)):
-        transport.transfer(
+    if engine == "rsync":
+        result = transport.transfer(
             TransferBatch(
                 TransferDirection.PUSH,
                 (TransferItem("safe/value.txt", None, None),),
             ),
             lambda _progress: None,
         )
-    assert not (destination / "safe" / "value.txt").exists()
+        assert result.completed == ()
+        assert result.changed_during_transfer == ("safe/value.txt",)
+        assert (destination / "safe/value.txt").read_text(encoding="utf-8") == "inside"
+    else:
+        with pytest.raises((ValueError, TransferError, OSError)):
+            transport.transfer(
+                TransferBatch(
+                    TransferDirection.PUSH,
+                    (TransferItem("safe/value.txt", None, None),),
+                ),
+                lambda _progress: None,
+            )
+        assert not (destination / "safe" / "value.txt").exists()
 
 
 @pytest.mark.parametrize("engine", ["rsync", "tar"])

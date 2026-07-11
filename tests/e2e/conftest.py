@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import fcntl
 import os
 import pty
@@ -27,17 +28,21 @@ _PASSWORD = "test-password"
 _PROMPT = b":enter]"
 
 
+@dataclass(frozen=True, slots=True)
+class TerminalState:
+    visible_input: str
+    cursor_offset: int
+    remote_shell_pid: int
+
+
 class PtyShell:
     """Small deadline-based PTY driver for one real `codex-rsb enter` session."""
 
     def __init__(self, fixture: SshFixture, *, password: bool = False) -> None:
         self._fixture = fixture
         self._output = bytearray()
-        self._cursor = 0
-        self._visible_input = ""
         self._foreground_start = 0
         self._foreground_result: bytes | None = None
-        self._cached_remote_pid: int | None = None
         self.first_sync_status_at = float("inf")
         target = fixture.password_host if password else fixture.host
         self._pid, self._fd = _spawn_pty(
@@ -49,6 +54,7 @@ class PtyShell:
             self._wait_for(b"password:", timeout=10.0)
             self._send((_PASSWORD + "\n").encode())
         self._wait_for(_PROMPT, timeout=15.0)
+        self._install_terminal_probe()
 
     def __enter__(self) -> PtyShell:
         return self
@@ -76,8 +82,9 @@ class PtyShell:
             )
         )
         started = time.monotonic()
+        output_start = len(self._output)
         self._send(command.encode() + b"\n")
-        self._wait_for(b"[codex:", timeout=20.0)
+        self._wait_for(b"[codex:", timeout=20.0, start=output_start)
         if self.first_sync_status_at == float("inf"):
             self.first_sync_status_at = time.monotonic()
         if self.first_sync_status_at < started:
@@ -98,63 +105,99 @@ class PtyShell:
                 name,
             )
         )
+        output_start = len(self._output)
         self._send(command.encode() + b"\n")
-        self._wait_for(b"[y/N]", timeout=10.0)
+        self._wait_for(b"[y/N]", timeout=10.0, start=output_start)
 
     def reject_binding(self) -> None:
+        output_start = len(self._output)
         self._send(b"n\n")
-        self._wait_for(_PROMPT, timeout=10.0)
+        self._wait_for(_PROMPT, timeout=10.0, start=output_start)
 
-    def wait_for_prompt(self, text: str, timeout: float = 10.0) -> None:
-        self._wait_for(text.encode(), timeout=timeout)
+    def wait_for_prompt(
+        self,
+        text: str,
+        timeout: float = 10.0,
+        *,
+        start: int | None = None,
+    ) -> None:
+        self._wait_for(
+            text.encode(),
+            timeout=timeout,
+            start=len(self._output) if start is None else start,
+        )
 
-    def wait_for_prompt_text(self, text: str, timeout: float = 10.0) -> None:
-        self._wait_for(text.encode(), timeout=timeout)
+    def wait_for_prompt_text(
+        self,
+        text: str,
+        timeout: float = 10.0,
+        *,
+        start: int | None = None,
+    ) -> None:
+        self._wait_for(
+            text.encode(),
+            timeout=timeout,
+            start=len(self._output) if start is None else start,
+        )
 
-    def wait_for_prompt_change(self, timeout: float = 10.0) -> None:
-        start = len(self._output)
+    def wait_for_prompt_change(self, timeout: float = 10.0, *, start: int | None = None) -> None:
+        output_start = len(self._output) if start is None else start
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self._read_available(deadline)
-            current = bytes(self._output[start:])
+            current = bytes(self._output[output_start:])
             if b"planning" in current or b"sync " in current or b"]" in current:
                 return
-        self._fail("prompt did not change", start=start)
+        self._fail("prompt did not change", start=output_start)
+
+    def output_position(self) -> int:
+        return len(self._output)
 
     def type_without_enter(self, text: str) -> None:
-        self._visible_input = text
-        self._cursor = len(text)
         self._send(text.encode())
 
     def visible_input(self) -> str:
-        return self._visible_input
+        return self.terminal_state().visible_input
 
     def cursor_offset(self) -> int:
-        return self._cursor
+        return self.terminal_state().cursor_offset
 
     def remote_shell_pid(self) -> int:
-        if self._visible_input and self._cached_remote_pid is not None:
-            return self._cached_remote_pid
-        marker = f"__E2E_PID_{uuid.uuid4().hex}__"
+        return self.terminal_state().remote_shell_pid
+
+    def terminal_state(self) -> TerminalState:
         start = len(self._output)
-        self._send(f"printf '{marker}%s\\n' \"$$\"\n".encode())
-        self._wait_for(marker.encode(), timeout=5.0, start=start)
-        match = re.search(re.escape(marker).encode() + rb"(\d+)", bytes(self._output[start:]))
+        marker = b"__E2E_TERMINAL__"
+        self._send(b"\x18\x0f")
+        self._wait_for(marker, timeout=5.0, start=start)
+        match = re.search(
+            marker + rb"([A-Za-z0-9+/=]*):(\d+):(\d+)",
+            bytes(self._output[start:]),
+        )
         if match is None:
-            self._fail("remote shell PID was not printed", start=start)
-        self._cached_remote_pid = int(match.group(1))
-        return self._cached_remote_pid
+            self._fail("terminal state probe was not printed", start=start)
+        try:
+            visible = base64.b64decode(match.group(1), validate=True).decode("utf-8")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise AssertionError("terminal state probe contained invalid input") from exc
+        return TerminalState(visible, int(match.group(2)), int(match.group(3)))
 
     def run_foreground_probe(self, seconds: float) -> None:
         self._foreground_start = len(self._output)
         code = (
-            "import os,select,time; end=time.monotonic()+float(os.environ['D']); data=b''; "
+            "import os,select,time; print('__E2E_FOREGROUND_'+'READY__',flush=True); "
+            "end=time.monotonic()+float(os.environ['D']); data=b''; "
             "[(lambda r: None)(select.select([0],[],[],max(0,end-time.monotonic())))]; "
             "r,_,_=select.select([0],[],[],0); data=os.read(0,4096) if r else b''; "
             "print('__E2E_FOREGROUND__'+data.hex())"
         )
         command = f"D={shlex.quote(str(seconds))} python3 -c {shlex.quote(code)}"
         self._send(command.encode() + b"\n")
+        self._wait_for(
+            b"__E2E_FOREGROUND_READY__",
+            timeout=5.0,
+            start=self._foreground_start,
+        )
 
     def trigger_remote_change(self, path: str, content: bytes) -> None:
         remote = self._fixture.remote_for_shell(self)
@@ -198,6 +241,17 @@ class PtyShell:
 
     def _send(self, data: bytes) -> None:
         os.write(self._fd, data)
+
+    def _install_terminal_probe(self) -> None:
+        binding = (
+            '"\\C-x\\C-o":'
+            '__codex_e2e_line=$(printf %s "$READLINE_LINE" | base64 | tr -d "\\n"); '
+            'printf "\\n__E2E_TERMINAL__%s:%s:%s\\n" '
+            '"$__codex_e2e_line" "$READLINE_POINT" "$$"'
+        )
+        start = len(self._output)
+        self._send(f"bind -x {shlex.quote(binding)}\n".encode())
+        self._wait_for(_PROMPT, timeout=5.0, start=start)
 
     def _wait_for(
         self,
@@ -449,42 +503,89 @@ class SshFixture:
         if self._closed:
             return
         self._closed = True
+        failures: list[str] = []
         for shell in reversed(self._shells):
-            shell.close()
-        for record in self._binding_records():
+            _record_cleanup_failure(failures, "close PTY shell", shell.close)
+        records: list[dict[str, object]] = []
+        try:
+            records = self._binding_records()
+        except Exception as exc:
+            failures.append(f"read binding records: {exc}")
+        process_ids = _fixture_process_ids(self.state_home, self.runtime_dir)
+        for record in records:
             name = record.get("name")
             if isinstance(name, str):
-                self.cli("forget", name, "--local-only")
-        subprocess.run(
-            ["docker", "rm", "-f", self.container_id],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30.0,
+                try:
+                    result = self.cli("forget", name)
+                    if result.returncode != 0:
+                        raise AssertionError(result.stdout + result.stderr)
+                except Exception as exc:
+                    failures.append(f"forget {name}: {exc}")
+                    _record_cleanup_failure(
+                        failures,
+                        f"local-only forget {name}",
+                        lambda value=name: self.cli("forget", value, "--local-only"),
+                    )
+            target = record.get("target")
+            if isinstance(target, str):
+                _record_cleanup_failure(
+                    failures,
+                    f"close SSH ControlMaster for {target}",
+                    lambda value=target: _close_control_master(self, value),
+                )
+        _record_cleanup_failure(
+            failures,
+            "terminate local fixture processes",
+            lambda: _terminate_processes(process_ids),
         )
-        subprocess.run(
-            ["docker", "image", "rm", "-f", self.image],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30.0,
+        for path, label in (
+            (self.key_file, "private key"),
+            (self.key_file.with_suffix(".pub"), "public key"),
+            (self.state_home, "state directory"),
+            (self.runtime_dir, "runtime directory"),
+            (self.home, "fixture home"),
+        ):
+            _record_cleanup_failure(
+                failures,
+                f"remove {label}",
+                lambda value=path: _remove_path(value),
+            )
+        _record_cleanup_failure(
+            failures,
+            "remove Docker container",
+            lambda: _run_cleanup_command(["docker", "rm", "-f", self.container_id], 30.0),
         )
-        container = subprocess.run(
+        _record_cleanup_failure(
+            failures,
+            "remove Docker image",
+            lambda: _run_cleanup_command(["docker", "image", "rm", "-f", self.image], 30.0),
+        )
+        container = _inspect_cleanup_resource(
+            failures,
+            "Docker container",
             ["docker", "container", "inspect", self.container_id],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10.0,
         )
-        image = subprocess.run(
+        image = _inspect_cleanup_resource(
+            failures,
+            "Docker image",
             ["docker", "image", "inspect", self.image],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10.0,
         )
         if container.returncode == 0 or image.returncode == 0:
-            raise AssertionError("Docker E2E fixture left container or image residue")
+            failures.append("Docker E2E fixture left container or image residue")
+        for path, label in (
+            (self.key_file, "private key"),
+            (self.key_file.with_suffix(".pub"), "public key"),
+            (self.state_home, "state directory"),
+            (self.runtime_dir, "runtime directory"),
+            (self.home, "fixture home"),
+        ):
+            if path.exists():
+                failures.append(f"fixture left {label} residue at {path}")
+        surviving = tuple(pid for pid in process_ids if _process_exists(pid))
+        if surviving:
+            failures.append(f"fixture left local processes running: {surviving}")
+        if failures:
+            raise AssertionError("E2E cleanup failures\n" + "\n".join(failures))
 
     def _workspace_id(self, name: str) -> str:
         for record in self._binding_records():
@@ -542,12 +643,169 @@ class SshFixture:
         )
 
 
+def _write_isolated_ssh_wrapper(wrapper: Path, executable: Path, config: Path) -> None:
+    wrapper.parent.mkdir(parents=True, mode=0o700)
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(str(executable))} -F {shlex.quote(str(config))} "
+        '-o IdentityAgent=none "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o700)
+
+
+def _isolated_ssh_environment(base: Mapping[str, str], wrapper: Path) -> dict[str, str]:
+    env = dict(base)
+    inherited_path = env.get("PATH", "")
+    env["PATH"] = str(wrapper.parent) + (os.pathsep + inherited_path if inherited_path else "")
+    env["RSYNC_RSH"] = str(wrapper)
+    return env
+
+
+def _record_cleanup_failure(
+    failures: list[str],
+    label: str,
+    operation: Callable[[], object],
+) -> None:
+    try:
+        operation()
+    except Exception as exc:
+        failures.append(f"{label}: {exc}")
+
+
+def _close_control_master(fixture: SshFixture, target: str) -> None:
+    result = subprocess.run(
+        [
+            "ssh",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            f"ControlPath={fixture.runtime_dir}/cm/%C",
+            "-O",
+            "exit",
+            target,
+        ],
+        check=False,
+        env=fixture.env,
+        capture_output=True,
+        text=True,
+        timeout=20.0,
+    )
+    if result.returncode not in {0, 255}:
+        raise AssertionError(result.stderr or result.stdout or "ControlMaster exit failed")
+
+
+def _fixture_process_ids(state_home: Path, runtime_dir: Path) -> tuple[int, ...]:
+    process_ids: set[int] = set()
+    for pidfile in (state_home / "workspaces").glob("*/daemon.pid"):
+        try:
+            pid = int(pidfile.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        if pid > 1 and pid != os.getpid():
+            process_ids.add(pid)
+    result = subprocess.run(
+        ["ps", "-axo", "pid=,command="],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+    )
+    if result.returncode == 0:
+        marker = str(runtime_dir)
+        for line in result.stdout.splitlines():
+            if marker not in line:
+                continue
+            raw_pid, _separator, _command = line.strip().partition(" ")
+            try:
+                pid = int(raw_pid)
+            except ValueError:
+                continue
+            if pid > 1 and pid != os.getpid():
+                process_ids.add(pid)
+    return tuple(sorted(process_ids))
+
+
+def _process_exists(pid: int) -> bool:
+    try:
+        waited, _status = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        waited = 0
+    if waited == pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_processes(process_ids: tuple[int, ...]) -> None:
+    for pid in process_ids:
+        if _process_exists(pid):
+            os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and any(_process_exists(pid) for pid in process_ids):
+        time.sleep(0.02)
+    for pid in process_ids:
+        if _process_exists(pid):
+            os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and any(_process_exists(pid) for pid in process_ids):
+        time.sleep(0.02)
+    surviving = tuple(pid for pid in process_ids if _process_exists(pid))
+    if surviving:
+        raise AssertionError(f"local fixture processes did not stop: {surviving}")
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _run_cleanup_command(argv: list[str], timeout: float) -> None:
+    result = subprocess.run(
+        argv,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr or result.stdout or f"cleanup command failed: {argv}")
+
+
+def _inspect_cleanup_resource(
+    failures: list[str],
+    label: str,
+    argv: list[str],
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except Exception as exc:
+        failures.append(f"inspect {label}: {exc}")
+        return subprocess.CompletedProcess(argv, 0, "", str(exc))
+
+
 def start_ssh_fixture(tmp_path: Path) -> SshFixture:
     docker = shutil.which("docker")
     if docker is None:
         if os.environ.get("CODEX_E2E_REQUIRED") == "1":
             raise RuntimeError("Docker is required because CODEX_E2E_REQUIRED=1")
         pytest.skip("Docker is unavailable. SSH E2E requires the disposable Ubuntu fixture")
+    ssh_executable = shutil.which("ssh")
+    if ssh_executable is None:
+        raise RuntimeError("OpenSSH is required for SSH E2E")
     image = f"codex-rsb-e2e:{uuid.uuid4().hex}"
     key_file = tmp_path / "client-key"
     subprocess.run(
@@ -603,18 +861,23 @@ def start_ssh_fixture(tmp_path: Path) -> SshFixture:
             encoding="utf-8",
         )
         config.chmod(0o600)
+        ssh_wrapper = home / "isolated-bin" / "ssh"
+        _write_isolated_ssh_wrapper(ssh_wrapper, Path(ssh_executable), config)
         state_home = tmp_path / "codex-state"
         runtime = tmp_path / "codex-runtime"
         production_home = tmp_path / "production-state"
-        env = {
-            **os.environ,
-            "HOME": str(home),
-            "CODEX_REMOTE_SANDBOX_HOME": str(state_home),
-            "CODEX_REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
-            "REMOTE_SANDBOX_HOME": str(production_home / ".remote-sandbox"),
-            "REMOTE_SANDBOX_RUNTIME_DIR": str(production_home / "runtime"),
-            "REMOTE_SANDBOX_CONTROL_DIR": str(production_home / "control"),
-        }
+        env = _isolated_ssh_environment(
+            {
+                **os.environ,
+                "HOME": str(home),
+                "CODEX_REMOTE_SANDBOX_HOME": str(state_home),
+                "CODEX_REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
+                "REMOTE_SANDBOX_HOME": str(production_home / ".remote-sandbox"),
+                "REMOTE_SANDBOX_RUNTIME_DIR": str(production_home / "runtime"),
+                "REMOTE_SANDBOX_CONTROL_DIR": str(production_home / "control"),
+            },
+            ssh_wrapper,
+        )
         executable = Path(sys.executable).with_name("codex-rsb")
         if not executable.is_file():
             raise RuntimeError(f"development CLI is unavailable at {executable}")
@@ -688,16 +951,19 @@ def _ssh_config(*, port: int, key_file: Path) -> str:
         f"  Port {port}\n"
         "  StrictHostKeyChecking no\n"
         "  UserKnownHostsFile /dev/null\n"
+        "  GlobalKnownHostsFile /dev/null\n"
         "  LogLevel ERROR\n"
         "  ConnectTimeout 5\n"
+        "  IdentityAgent none\n"
+        "  IdentitiesOnly yes\n"
     )
     return (
         "Host codex-e2e-key\n"
         + common
         + f"  IdentityFile {key_file}\n"
-        + "  IdentitiesOnly yes\n"
         + "Host codex-e2e-password\n"
         + common
+        + "  IdentityFile none\n"
         + "  PubkeyAuthentication no\n"
         + "  PreferredAuthentications password\n"
     )

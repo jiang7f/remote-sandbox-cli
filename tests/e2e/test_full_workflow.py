@@ -15,7 +15,6 @@ def test_connect_sync_run_and_forget_without_workspace_metadata(ssh_fixture) -> 
 
     shell = ssh_fixture.enter()
     shell.connect(remote=remote, local=local, name="dq")
-    shell.wait_for_prompt("[codex:")
     ssh_fixture.wait_for_remote_file(remote / "train.py")
 
     result = ssh_fixture.cli("run", "dq", "--", "python3", "train.py")

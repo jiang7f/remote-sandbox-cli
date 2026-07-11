@@ -15,6 +15,7 @@ from remote_sandbox._transport_remote import (
 from remote_sandbox.manifest import EntryFingerprint, EntryKind, MissingEntry, fingerprint_local
 from remote_sandbox.reconcile import ActionType, SyncAction
 from remote_sandbox.ssh import SubprocessSshRunner, ssh_control_opts
+from remote_sandbox.state import AuditSignature
 from remote_sandbox.transport import (
     BatchTransport,
     RsyncCapabilities,
@@ -31,17 +32,82 @@ from remote_sandbox.transport import (
 
 
 class _RemoteFingerprinter:
-    def __init__(self, responses: Iterable[dict[str, EntryFingerprint | MissingEntry]]) -> None:
-        self._responses = iter(responses)
-        self.calls: list[tuple[str, ...]] = []
+    def __init__(
+        self,
+        responses: Iterable[dict[str, EntryFingerprint | MissingEntry]],
+        *,
+        signatures: Iterable[dict[str, AuditSignature | None]] | None = None,
+        audit_response: dict[str, AuditSignature | None] | None = None,
+    ) -> None:
+        self._responses = list(responses)
+        self._signatures = (
+            list(signatures)
+            if signatures is not None
+            else [
+                self._default_signatures(response, index)
+                for index, response in enumerate(self._responses)
+            ]
+        )
+        self._audit_response = audit_response
+        self._index = 0
+        self.calls: list[tuple[tuple[str, ...], bool]] = []
+        self.audit_calls: list[tuple[str, ...]] = []
 
     def hash_paths(
         self,
         paths: Iterable[str],
     ) -> dict[str, EntryFingerprint | MissingEntry]:
+        entries, _signatures = self.observations(paths, with_hash=True)
+        return entries
+
+    def observations(
+        self,
+        paths: Iterable[str],
+        *,
+        with_hash: bool,
+    ) -> tuple[
+        dict[str, EntryFingerprint | MissingEntry],
+        dict[str, AuditSignature | None],
+    ]:
         normalized = tuple(paths)
-        self.calls.append(normalized)
-        return next(self._responses)
+        self.calls.append((normalized, with_hash))
+        response = self._responses[self._index]
+        signatures = self._signatures[self._index]
+        self._index += 1
+        if with_hash:
+            return response, signatures
+        return {
+            path: (
+                dataclasses.replace(entry, content_hash=None)
+                if isinstance(entry, EntryFingerprint) and entry.kind is EntryKind.FILE
+                else entry
+            )
+            for path, entry in response.items()
+        }, signatures
+
+    def audit_signatures(
+        self,
+        paths: Iterable[str],
+    ) -> dict[str, AuditSignature | None]:
+        normalized = tuple(paths)
+        self.audit_calls.append(normalized)
+        if self._audit_response is not None:
+            return self._audit_response
+        return self._signatures[self._index]
+
+    @staticmethod
+    def _default_signatures(
+        response: dict[str, EntryFingerprint | MissingEntry],
+        index: int,
+    ) -> dict[str, AuditSignature | None]:
+        return {
+            path: (
+                AuditSignature(path, entry.kind, 100 + index, 1, position + 1)
+                if isinstance(entry, EntryFingerprint)
+                else None
+            )
+            for position, (path, entry) in enumerate(response.items())
+        }
 
 
 class _TransportRunner:
@@ -297,7 +363,9 @@ def test_batch_transport_runs_one_verified_rsync_session(
     assert result.completed == ("a.txt",)
     assert len(calls) == 1
     assert calls[0][1] == b"a.txt\n"
-    assert remote.calls == [("a.txt",), ("a.txt",)]
+    assert remote.calls == [(("a.txt",), True), (("a.txt",), False)]
+    assert remote.audit_calls == []
+    assert result.verified_fingerprints == (source,)
 
 
 def test_batch_transport_uses_tar_for_unsafe_unprotected_remote_root(

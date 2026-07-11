@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, TypeAlias, cast
@@ -45,6 +45,7 @@ from remote_sandbox.ssh import (
     validate_remote_path,
     validate_target,
 )
+from remote_sandbox.state import AuditSignature
 
 FingerprintState: TypeAlias = EntryFingerprint | MissingEntry
 LocalFingerprintState: TypeAlias = FingerprintState | LocalPathChanged
@@ -281,10 +282,15 @@ def probe_rsync_capabilities(*, executable: str = "rsync") -> RsyncCapabilities:
 
 
 class _RemoteFingerprinter(Protocol):
-    def hash_paths(
+    def observations(
         self,
         paths: Iterable[str],
-    ) -> dict[str, FingerprintState]: ...
+        *,
+        with_hash: bool,
+    ) -> tuple[
+        dict[str, FingerprintState],
+        dict[str, AuditSignature | None],
+    ]: ...
 
 
 class _WorkspaceRunner(Protocol):
@@ -298,6 +304,16 @@ class _WorkspaceRunner(Protocol):
     ) -> subprocess.CompletedProcess[bytes]: ...
 
     def delete_workspace_path(self, target: str, root: str, path: str) -> None: ...
+
+
+@dataclass(slots=True)
+class _RsyncAudit:
+    source_signatures: dict[str, AuditSignature | None]
+    destination_observations: dict[
+        str,
+        tuple[FingerprintState, AuditSignature | None],
+    ]
+    changed_paths: set[str] = field(default_factory=set)
 
 
 class BatchTransport:
@@ -327,23 +343,80 @@ class BatchTransport:
             raise ValueError("on_progress must be callable")
         paths = tuple(item.path for item in batch.items)
         with ProtectedLocalRoot(self._local_root) as local:
+            local_observations = local.observations(paths, with_hash=True)
             local_before = {
-                path: local.fingerprint(path, with_hash=True) for path in paths
+                path: entry for path, (entry, _signature) in local_observations.items()
             }
-            remote_before = self._remote_snapshot(paths)
+            local_signatures = {
+                path: signature for path, (_entry, signature) in local_observations.items()
+            }
+            remote_before, remote_signatures = self._remote_observations(
+                paths,
+                with_hash=True,
+            )
             source_before = self._preflight(batch, local_before, remote_before)
+            source_signatures = (
+                remote_signatures
+                if batch.direction is TransferDirection.PULL
+                else local_signatures
+            )
 
             use_tar = self._needs_tar(batch, source_before)
             if use_tar:
                 self._transfer_tar(batch, local)
             else:
-                try:
-                    self._transfer_rsync(batch, source_before, local)
-                except _RsyncUnavailable:
-                    self._transfer_tar(batch, local)
+                with tempfile.TemporaryDirectory(prefix="remote-sandbox-rsync-") as raw:
+                    try:
+                        rsync_audit = self._transfer_rsync(
+                            batch,
+                            source_before,
+                            source_signatures,
+                            local,
+                            Path(raw),
+                        )
+                    except _RsyncUnavailable:
+                        pass
+                    else:
+                        if batch.direction is TransferDirection.PUSH:
+                            rsync_audit.changed_paths = local.verify_and_cleanup_stage(
+                                paths,
+                                Path(raw) / "local",
+                                expected_entries=source_before,
+                                expected_signatures=rsync_audit.source_signatures,
+                                error_type=TransferError,
+                            )
+                            source_after = {
+                                path: (
+                                    source_before[path],
+                                    rsync_audit.source_signatures[path],
+                                )
+                                for path in paths
+                            }
+                        else:
+                            remote_entries, remote_signatures_after = (
+                                self._remote_observations(
+                                    paths,
+                                    with_hash=False,
+                                )
+                            )
+                            source_after = {
+                                path: (remote_entries[path], remote_signatures_after[path])
+                                for path in paths
+                            }
+                        return self._verified_protocol_result(
+                            batch,
+                            source_before,
+                            rsync_audit,
+                            source_after,
+                            on_progress,
+                        )
+                self._transfer_tar(batch, local)
 
             local_after = self._local_postflight(local, paths)
-            remote_after = self._remote_snapshot(paths)
+            remote_after, _remote_after_signatures = self._remote_observations(
+                paths,
+                with_hash=True,
+            )
             return self._verified_result(
                 batch,
                 source_before,
@@ -399,17 +472,34 @@ class BatchTransport:
             raise TransferError("verified remote delete returned incomplete paths")
         return response
 
-    def _remote_snapshot(self, paths: tuple[str, ...]) -> dict[str, FingerprintState]:
-        observed = self._remote.hash_paths(paths)
+    def _remote_observations(
+        self,
+        paths: tuple[str, ...],
+        *,
+        with_hash: bool,
+    ) -> tuple[
+        dict[str, FingerprintState],
+        dict[str, AuditSignature | None],
+    ]:
+        observed, signatures = self._remote.observations(paths, with_hash=with_hash)
         if not isinstance(observed, Mapping) or set(observed) != set(paths):
             raise TransferError("remote fingerprint response does not match transfer paths")
+        if not isinstance(signatures, Mapping) or set(signatures) != set(paths):
+            raise TransferError("remote signature response does not match transfer paths")
         result: dict[str, FingerprintState] = {}
+        audited: dict[str, AuditSignature | None] = {}
         for path in paths:
             entry = observed[path]
             if type(entry) not in {EntryFingerprint, MissingEntry} or entry.path != path:
                 raise TransferError(f"invalid remote fingerprint: {path}")
+            signature = signatures[path]
+            if signature is not None and (
+                type(signature) is not AuditSignature or signature.path != path
+            ):
+                raise TransferError(f"invalid remote audit signature: {path}")
             result[path] = entry
-        return result
+            audited[path] = signature
+        return result, audited
 
     @staticmethod
     def _preflight(
@@ -478,83 +568,100 @@ class BatchTransport:
         self,
         batch: TransferBatch,
         source_before: Mapping[str, FingerprintState],
+        source_signatures: Mapping[str, AuditSignature | None],
         local: ProtectedLocalRoot,
-    ) -> None:
+        temporary: Path,
+    ) -> _RsyncAudit:
         paths = tuple(item.path for item in batch.items)
-        with tempfile.TemporaryDirectory(prefix="remote-sandbox-rsync-") as raw:
-            local_stage = Path(raw) / "local"
-            remote_stage: str | None = None
-            if batch.direction is TransferDirection.PUSH:
-                local.stage(
-                    paths,
+        verified_source_signatures = dict(source_signatures)
+        destination_observations: dict[
+            str,
+            tuple[FingerprintState, AuditSignature | None],
+        ] = {}
+        local_stage = temporary / "local"
+        remote_stage: str | None = None
+        if batch.direction is TransferDirection.PUSH:
+            verified_source_signatures = local.stage(
+                paths,
+                local_stage,
+                expected_entries=source_before,
+                expected_signatures=source_signatures,
+                error_type=TransferError,
+            )
+            remote_stage = self._remote_rsync_stage(
+                REMOTE_PREPARE_RSYNC_CODE,
+                (),
+            )
+        else:
+            local_stage.mkdir()
+            remote_stage = self._remote_rsync_stage(
+                REMOTE_STAGE_RSYNC_CODE,
+                paths,
+            )
+        try:
+            argv = build_rsync_argv(
+                batch,
+                local_stage,
+                self._target,
+                remote_stage,
+                capabilities=self._capabilities,
+            )
+            try:
+                result = subprocess.run(
+                    argv,
+                    check=False,
+                    input=_path_input(batch, source_before),
+                    capture_output=True,
+                )
+            except OSError as exc:
+                if exc.errno in {errno.ENOENT, errno.EACCES, errno.ENOEXEC}:
+                    raise _RsyncUnavailable(
+                        f"rsync transfer could not start: {exc}"
+                    ) from exc
+                raise TransferError(f"rsync transfer could not start: {exc}") from exc
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).decode(
+                    "utf-8", errors="replace"
+                ).strip()
+                raise TransferError(
+                    f"rsync transfer failed: {detail}"
+                    if detail
+                    else "rsync transfer failed"
+                )
+            if batch.direction is TransferDirection.PULL:
+                destination_observations = local.finalize(
                     local_stage,
+                    paths,
                     error_type=TransferError,
                 )
-                remote_stage = self._remote_rsync_stage(
-                    REMOTE_PREPARE_RSYNC_CODE,
-                    (),
-                )
             else:
-                local_stage.mkdir()
-                remote_stage = self._remote_rsync_stage(
-                    REMOTE_STAGE_RSYNC_CODE,
-                    paths,
-                )
-            try:
-                argv = build_rsync_argv(
-                    batch,
-                    local_stage,
+                finalized = self._runner.run_workspace_python_bytes(
                     self._target,
-                    remote_stage,
-                    capabilities=self._capabilities,
+                    self._remote_root,
+                    REMOTE_FINALIZE_RSYNC_CODE,
+                    b"",
+                    (remote_stage, *paths),
                 )
-                try:
-                    result = subprocess.run(
-                        argv,
-                        check=False,
-                        input=_path_input(batch, source_before),
-                        capture_output=True,
-                    )
-                except OSError as exc:
-                    if exc.errno in {errno.ENOENT, errno.EACCES, errno.ENOEXEC}:
-                        raise _RsyncUnavailable(
-                            f"rsync transfer could not start: {exc}"
-                        ) from exc
-                    raise TransferError(f"rsync transfer could not start: {exc}") from exc
-                if result.returncode != 0:
-                    detail = (result.stderr or result.stdout).decode(
-                        "utf-8", errors="replace"
-                    ).strip()
-                    raise TransferError(
-                        f"rsync transfer failed: {detail}"
-                        if detail
-                        else "rsync transfer failed"
-                    )
-                if batch.direction is TransferDirection.PULL:
-                    local.finalize(
-                        local_stage,
-                        paths,
-                        error_type=TransferError,
-                    )
-                else:
-                    finalized = self._runner.run_workspace_python_bytes(
-                        self._target,
-                        self._remote_root,
-                        REMOTE_FINALIZE_RSYNC_CODE,
-                        b"",
-                        (remote_stage, *paths),
-                    )
-                    self._check_remote_stage_result(finalized, "remote rsync finalization")
-                    remote_stage = None
-            finally:
-                if remote_stage is not None:
-                    self._runner.run_workspace_python_bytes(
-                        self._target,
-                        self._remote_root,
-                        REMOTE_CLEANUP_RSYNC_CODE,
-                        b"",
-                        (remote_stage,),
-                    )
+                self._check_remote_stage_result(finalized, "remote rsync finalization")
+                remote_stage = None
+                remote_entries, remote_signatures_after = self._remote_observations(
+                    paths,
+                    with_hash=False,
+                )
+                destination_observations = {
+                    path: (remote_entries[path], remote_signatures_after[path])
+                    for path in paths
+                }
+        finally:
+            if remote_stage is not None:
+                self._runner.run_workspace_python_bytes(
+                    self._target,
+                    self._remote_root,
+                    REMOTE_CLEANUP_RSYNC_CODE,
+                    b"",
+                    (remote_stage,),
+                )
+        return _RsyncAudit(verified_source_signatures, destination_observations)
 
     def _remote_rsync_stage(self, code: str, paths: tuple[str, ...]) -> str:
         result = self._runner.run_workspace_python_bytes(
@@ -626,6 +733,57 @@ class BatchTransport:
             )
 
     @staticmethod
+    def _verified_protocol_result(
+        batch: TransferBatch,
+        source_before: Mapping[str, FingerprintState],
+        audit: _RsyncAudit,
+        source_after: Mapping[
+            str,
+            tuple[LocalFingerprintState, AuditSignature | None],
+        ],
+        on_progress: ProgressCallback,
+    ) -> TransferResult:
+        completed: list[str] = []
+        verified: list[EntryFingerprint] = []
+        changed: list[str] = []
+        progress = _VerifiedProgressBatcher(on_progress)
+        try:
+            for item in batch.items:
+                if item.path in audit.changed_paths:
+                    changed.append(item.path)
+                    continue
+                source_entry, source_signature = source_after[item.path]
+                destination_observation = audit.destination_observations.get(item.path)
+                if destination_observation is None:
+                    raise TransferError(
+                        f"post-transfer verification failed: {item.path}"
+                    )
+                destination_entry, _destination_signature = destination_observation
+                if isinstance(source_entry, LocalPathChanged):
+                    changed.append(item.path)
+                    continue
+                if not _same_audited_observation(
+                    source_before[item.path],
+                    audit.source_signatures[item.path],
+                    source_entry,
+                    source_signature,
+                ):
+                    changed.append(item.path)
+                    continue
+                verified_entry = _protocol_verified_destination(
+                    source_before[item.path],
+                    destination_entry,
+                )
+                if verified_entry is None:
+                    raise TransferError(f"post-transfer verification failed: {item.path}")
+                completed.append(item.path)
+                verified.append(verified_entry)
+                progress.add(verified_entry)
+        finally:
+            progress.flush()
+        return TransferResult(tuple(completed), tuple(changed), tuple(verified))
+
+    @staticmethod
     def _verified_result(
         batch: TransferBatch,
         source_before: Mapping[str, FingerprintState],
@@ -674,6 +832,32 @@ class BatchTransport:
             except LocalPathChanged as exc:
                 observed[path] = exc
         return observed
+
+    @staticmethod
+    def _local_observations(
+        local: ProtectedLocalRoot,
+        paths: tuple[str, ...],
+        *,
+        with_hash: bool,
+    ) -> dict[str, tuple[LocalFingerprintState, AuditSignature | None]]:
+        try:
+            bulk: dict[
+                str,
+                tuple[LocalFingerprintState, AuditSignature | None],
+            ] = {}
+            bulk.update(local.observations(paths, with_hash=with_hash))
+            return bulk
+        except LocalPathChanged:
+            observed: dict[
+                str,
+                tuple[LocalFingerprintState, AuditSignature | None],
+            ] = {}
+            for path in paths:
+                try:
+                    observed[path] = local.observe(path, with_hash=with_hash)
+                except LocalPathChanged as exc:
+                    observed[path] = (exc, None)
+            return observed
 
 
 def _validate_expected(value: object, path: str, side: str) -> None:
@@ -754,6 +938,44 @@ def _same_content(source: FingerprintState, destination: FingerprintState) -> bo
     if isinstance(source, MissingEntry) or isinstance(destination, MissingEntry):
         return isinstance(source, MissingEntry) and isinstance(destination, MissingEntry)
     return content_identity(source) == content_identity(destination)
+
+
+def _same_audited_observation(
+    before: FingerprintState,
+    before_signature: AuditSignature | None,
+    after: FingerprintState,
+    after_signature: AuditSignature | None,
+) -> bool:
+    if isinstance(before, MissingEntry) or isinstance(after, MissingEntry):
+        return before == after and before_signature is None and after_signature is None
+    return (
+        before_signature is not None
+        and before_signature == after_signature
+        and before.path == after.path
+        and before.kind is after.kind
+        and before.size == after.size
+        and before.mtime_ns == after.mtime_ns
+        and before.mode == after.mode
+        and before.link_target == after.link_target
+    )
+
+
+def _protocol_verified_destination(
+    source: FingerprintState,
+    destination: FingerprintState,
+) -> EntryFingerprint | None:
+    if not isinstance(source, EntryFingerprint) or not isinstance(
+        destination,
+        EntryFingerprint,
+    ):
+        return None
+    if source.kind is EntryKind.FILE and destination.kind is EntryKind.FILE:
+        if source.content_hash is None:
+            return None
+        return replace(destination, content_hash=source.content_hash)
+    if not _same_content(source, destination):
+        return None
+    return destination
 
 
 def _target_present_in_stage(

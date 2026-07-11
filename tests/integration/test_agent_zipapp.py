@@ -50,6 +50,24 @@ def test_agent_zipapp_self_check(tmp_path: Path) -> None:
     assert result.stdout == f"codex-remote-sandbox-agent {AGENT_VERSION} {digest}\n"
 
 
+def test_agent_zipapp_runs_on_python_310(tmp_path: Path) -> None:
+    python_310 = os.environ.get("CODEX_PYTHON_310")
+    if not python_310:
+        pytest.skip("the explicit quality gate supplies CODEX_PYTHON_310")
+    archive = build_agent_zipapp(tmp_path / "agent.pyz")
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+
+    result = subprocess.run(
+        [python_310, str(archive), "self-check"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"codex-remote-sandbox-agent {AGENT_VERSION} {digest}\n"
+
+
 def test_agent_zipapp_returns_structured_error_for_unsupported_request(tmp_path: Path) -> None:
     archive = build_agent_zipapp(tmp_path / "agent.pyz")
     request = AgentRequest("not-a-command", {"root": "/home/u/算法测试"})

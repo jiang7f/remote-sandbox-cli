@@ -13,8 +13,10 @@ from dataclasses import dataclass
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Literal
+from unittest.mock import patch
 
-from remote_sandbox._transport_fingerprint import ProtectedLocalRoot
+import remote_sandbox._transport_fingerprint as transport_fingerprint_module
+import remote_sandbox.manifest as manifest_module
 from remote_sandbox.cli import (
     CapturedCliResult,
     CliServices,
@@ -554,35 +556,26 @@ class SyncPair:
 class CountingLocalPairTransport(LocalPairTransport):
     def __init__(self, local: Path, remote: Path) -> None:
         super().__init__(local, remote, engine="rsync")
-        self.ssh_process_count = 0
+        self.process_count = 0
         self.progress_payload_sizes: list[int] = []
-        self.transfer_seconds = 0.0
 
     def transfer(
         self,
         batch: TransferBatch,
         on_progress: Callable[[TransferResult], None],
     ) -> TransferResult:
-        self.ssh_process_count += 1
-
         def record_progress(progress: TransferResult) -> None:
             self.progress_payload_sizes.append(len(progress.completed))
             on_progress(progress)
 
-        return super().transfer(batch, record_progress)
+        real_popen = subprocess.Popen
 
-    def _transfer_rsync(
-        self,
-        batch: TransferBatch,
-        source: ProtectedLocalRoot,
-        destination: ProtectedLocalRoot,
-        source_before: Mapping[str, FingerprintState],
-    ) -> None:
-        started = time.monotonic()
-        try:
-            super()._transfer_rsync(batch, source, destination, source_before)
-        finally:
-            self.transfer_seconds += time.monotonic() - started
+        def counted_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            self.process_count += 1
+            return real_popen(*args, **kwargs)
+
+        with patch.object(subprocess, "Popen", side_effect=counted_popen):
+            return super().transfer(batch, record_progress)
 
 
 @dataclass(slots=True)
@@ -607,17 +600,49 @@ class SqlTransactionCounter:
         self.first_progress_seconds = None
 
 
-@dataclass(slots=True)
 class CountingHashProvider:
-    client: LocalReplicaClient
-    _baseline: int = 0
+    def __init__(self) -> None:
+        self._local_total = 0
+        self._remote_total = 0
+        self._local_baseline = 0
+        self._remote_baseline = 0
+        self._original_local = transport_fingerprint_module._hash_descriptor
+        self._original_remote = manifest_module._sha256_file
+
+        def count_local(descriptor: int) -> str:
+            self._local_total += 1
+            return self._original_local(descriptor)
+
+        def count_remote(path: Path) -> str:
+            self._remote_total += 1
+            return self._original_remote(path)
+
+        self._local_wrapper = count_local
+        self._remote_wrapper = count_remote
+        transport_fingerprint_module._hash_descriptor = count_local
+        manifest_module._sha256_file = count_remote
+
+    @property
+    def local_count(self) -> int:
+        return self._local_total - self._local_baseline
+
+    @property
+    def remote_count(self) -> int:
+        return self._remote_total - self._remote_baseline
 
     @property
     def count(self) -> int:
-        return sum(len(call) for call in self.client.hash_calls[self._baseline :])
+        return self.local_count + self.remote_count
 
     def reset(self) -> None:
-        self._baseline = len(self.client.hash_calls)
+        self._local_baseline = self._local_total
+        self._remote_baseline = self._remote_total
+
+    def close(self) -> None:
+        if transport_fingerprint_module._hash_descriptor is self._local_wrapper:
+            transport_fingerprint_module._hash_descriptor = self._original_local
+        if manifest_module._sha256_file is self._remote_wrapper:
+            manifest_module._sha256_file = self._original_remote
 
 
 @dataclass(slots=True)
@@ -630,6 +655,7 @@ class PerformancePair(SyncPair):
 
     def close(self) -> None:
         self.store._connection.set_trace_callback(None)
+        self.hash_counter.close()
         self.remote_client.close()
         self.store.close()
 
@@ -676,11 +702,13 @@ class PerformancePair(SyncPair):
         shutil.rmtree(destination, ignore_errors=True)
         destination.mkdir(parents=True)
         transport = CountingLocalPairTransport(self.local, destination)
+        started = time.monotonic()
         result = transport.transfer(batch, lambda _progress: None)
+        elapsed = time.monotonic() - started
         assert result.completed == tuple(item.path for item in batch.items)
         return (
-            transport.transfer_seconds,
-            transport.ssh_process_count,
+            elapsed,
+            transport.process_count,
             max(transport.progress_payload_sizes),
         )
 
@@ -1574,7 +1602,7 @@ def make_performance_pair(tmp_path: Path) -> PerformancePair:
         transport,
         engine,
         coordinator,
-        CountingHashProvider(remote_client),
+        CountingHashProvider(),
         direct,
         transaction_counter,
     )

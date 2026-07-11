@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import subprocess
 from collections.abc import Iterable
@@ -9,7 +10,8 @@ import pytest
 
 import remote_sandbox._transport_fingerprint as fingerprint_module
 from remote_sandbox._transport_fingerprint import LocalPathChanged, ProtectedLocalRoot
-from remote_sandbox.manifest import EntryFingerprint, MissingEntry, fingerprint_local
+from remote_sandbox.manifest import EntryFingerprint, EntryKind, MissingEntry, fingerprint_local
+from remote_sandbox.state import AuditSignature
 from remote_sandbox.transport import (
     BatchTransport,
     LocalPairTransport,
@@ -23,13 +25,59 @@ from remote_sandbox.transport import (
 
 class _RemoteFingerprinter:
     def __init__(self, responses: Iterable[dict[str, EntryFingerprint | MissingEntry]]) -> None:
-        self._responses = iter(responses)
+        self._responses = list(responses)
+        self._index = 0
 
     def hash_paths(
         self,
-        _paths: Iterable[str],
+        paths: Iterable[str],
     ) -> dict[str, EntryFingerprint | MissingEntry]:
-        return next(self._responses)
+        entries, _signatures = self.observations(paths, with_hash=True)
+        return entries
+
+    def observations(
+        self,
+        _paths: Iterable[str],
+        *,
+        with_hash: bool,
+    ) -> tuple[
+        dict[str, EntryFingerprint | MissingEntry],
+        dict[str, AuditSignature | None],
+    ]:
+        response = self._responses[self._index]
+        signatures = {
+            path: (
+                AuditSignature(path, entry.kind, 100 + self._index, 1, position + 1)
+                if isinstance(entry, EntryFingerprint)
+                else None
+            )
+            for position, (path, entry) in enumerate(response.items())
+        }
+        self._index += 1
+        if with_hash:
+            return response, signatures
+        return {
+            path: (
+                dataclasses.replace(entry, content_hash=None)
+                if isinstance(entry, EntryFingerprint) and entry.kind is EntryKind.FILE
+                else entry
+            )
+            for path, entry in response.items()
+        }, signatures
+
+    def audit_signatures(
+        self,
+        _paths: Iterable[str],
+    ) -> dict[str, AuditSignature | None]:
+        response = self._responses[self._index]
+        return {
+            path: (
+                AuditSignature(path, entry.kind, 100 + self._index, 1, position + 1)
+                if isinstance(entry, EntryFingerprint)
+                else None
+            )
+            for position, (path, entry) in enumerate(response.items())
+        }
 
 
 class _Runner:

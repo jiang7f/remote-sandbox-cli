@@ -29,7 +29,11 @@ def test_noop_cycle_hashes_no_unchanged_files(performance_pair) -> None:
 
     performance_pair.engine.run_once("noop")
 
-    print(f"noop_hash_count={performance_pair.hash_counter.count}")
+    print(f"noop_local_hash_count={performance_pair.hash_counter.local_count}")
+    print(f"noop_remote_hash_count={performance_pair.hash_counter.remote_count}")
+    print(f"noop_total_hash_count={performance_pair.hash_counter.count}")
+    assert performance_pair.hash_counter.local_count == 0
+    assert performance_pair.hash_counter.remote_count == 0
     assert performance_pair.hash_counter.count == 0
 
 
@@ -45,25 +49,25 @@ def test_batch_transport_is_close_to_direct_rsync_and_uses_one_session(
 
     direct_samples: list[float] = []
     codex_samples: list[float] = []
-    sessions: list[int] = []
+    process_counts: list[int] = []
     payload_sizes: list[int] = []
     for index in range(5):
         direct_destination = benchmark_root / f"direct-{index}"
         codex_destination = benchmark_root / f"codex-{index}"
         if index % 2 == 0:
             direct_samples.append(performance_pair.measure_direct_rsync(direct_destination))
-            codex, session_count, payload_size = performance_pair.measure_batch_transport(
+            codex, process_count, payload_size = performance_pair.measure_batch_transport(
                 batch,
                 codex_destination,
             )
         else:
-            codex, session_count, payload_size = performance_pair.measure_batch_transport(
+            codex, process_count, payload_size = performance_pair.measure_batch_transport(
                 batch,
                 codex_destination,
             )
             direct_samples.append(performance_pair.measure_direct_rsync(direct_destination))
         codex_samples.append(codex)
-        sessions.append(session_count)
+        process_counts.append(process_count)
         payload_sizes.append(payload_size)
 
     direct_median = median(direct_samples)
@@ -75,10 +79,10 @@ def test_batch_transport_is_close_to_direct_rsync_and_uses_one_session(
     print(f"codex_batch_transport_median={codex_median:.6f}")
     print(f"direct_rsync_range={max(direct_samples) - min(direct_samples):.6f}")
     print(f"codex_batch_transport_range={max(codex_samples) - min(codex_samples):.6f}")
-    print(f"transport_sessions={sessions}")
+    print(f"transport_processes={process_counts}")
     print(f"transport_progress_payloads={payload_sizes}")
     assert codex_median <= threshold
-    assert sessions == [1] * 5
+    assert process_counts == [1] * 5
     assert max(payload_sizes) <= 256
 
 

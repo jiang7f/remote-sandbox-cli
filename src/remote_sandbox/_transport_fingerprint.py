@@ -12,6 +12,7 @@ from remote_sandbox._transport_paths import (
     delete_entries_from_fd,
     finalize_entries_from_fd,
     stage_entries_from_fd,
+    verify_and_cleanup_stage_from_fd,
 )
 from remote_sandbox.manifest import (
     EntryFingerprint,
@@ -51,6 +52,77 @@ class ProtectedLocalRoot:
     ) -> EntryFingerprint | MissingEntry:
         fingerprint, _signature = self.observe(relative_path, with_hash=with_hash)
         return fingerprint
+
+    def fingerprints(
+        self,
+        relative_paths: tuple[str, ...],
+        *,
+        with_hash: bool,
+    ) -> dict[str, EntryFingerprint | MissingEntry]:
+        return {
+            path: fingerprint
+            for path, (fingerprint, _signature) in self.observations(
+                relative_paths,
+                with_hash=with_hash,
+            ).items()
+        }
+
+    def observations(
+        self,
+        relative_paths: tuple[str, ...],
+        *,
+        with_hash: bool,
+    ) -> dict[str, tuple[EntryFingerprint | MissingEntry, AuditSignature | None]]:
+        grouped: dict[tuple[str, ...], list[tuple[str, str]]] = {}
+        ordered: list[str] = []
+        for relative_path in relative_paths:
+            normalized = normalize_relative_path(relative_path)
+            ordered.append(normalized)
+            parts = normalized.split("/")
+            grouped.setdefault(tuple(parts[:-1]), []).append((parts[-1], normalized))
+        observed: dict[
+            str,
+            tuple[EntryFingerprint | MissingEntry, AuditSignature | None],
+        ] = {}
+        for parent_parts, leaves in grouped.items():
+            try:
+                parent_fd, chain = _open_verified_parent(self._descriptor, list(parent_parts))
+            except FileNotFoundError:
+                observed.update(
+                    (path, (MissingEntry(path), None)) for _leaf, path in leaves
+                )
+                continue
+            try:
+                for leaf, path in leaves:
+                    try:
+                        entry = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        observed[path] = (MissingEntry(path), None)
+                        continue
+                    fingerprint = _fingerprint_leaf(
+                        parent_fd,
+                        leaf,
+                        path,
+                        entry,
+                        with_hash=with_hash,
+                    )
+                    _verify_leaf(parent_fd, leaf, entry, path)
+                    observed[path] = (
+                        fingerprint,
+                        AuditSignature(
+                            path,
+                            _entry_kind(entry.st_mode),
+                            entry.st_ctime_ns,
+                            entry.st_dev,
+                            entry.st_ino,
+                        ),
+                    )
+                _verify_parent_chain(chain, leaves[-1][1])
+            finally:
+                os.close(parent_fd)
+                for descriptor, _name, _identity in chain:
+                    os.close(descriptor)
+        return {path: observed[path] for path in ordered}
 
     def observe(
         self,
@@ -96,13 +168,61 @@ class ProtectedLocalRoot:
         paths: tuple[str, ...],
         staging: Path,
         *,
+        expected_entries: Mapping[str, EntryFingerprint | MissingEntry] | None = None,
+        expected_signatures: Mapping[str, AuditSignature | None] | None = None,
         error_type: type[Exception],
-    ) -> None:
-        stage_entries_from_fd(
+    ) -> dict[str, AuditSignature | None]:
+        return stage_entries_from_fd(
             self._descriptor,
             paths,
             staging,
+            expected_entries=expected_entries,
+            expected_signatures=expected_signatures,
             error_type=error_type,
+        )
+
+    def stage_observations(
+        self,
+        paths: tuple[str, ...],
+        staging: Path,
+        *,
+        error_type: type[Exception],
+    ) -> tuple[
+        dict[str, EntryFingerprint | MissingEntry],
+        dict[str, AuditSignature | None],
+    ]:
+        observed: dict[str, EntryFingerprint | MissingEntry] = {}
+
+        def observe_entry(
+            parent_fd: int,
+            leaf: str,
+            relative: str,
+            entry: os.stat_result,
+        ) -> EntryFingerprint:
+            return _fingerprint_leaf(
+                parent_fd,
+                leaf,
+                relative,
+                entry,
+                with_hash=True,
+            )
+
+        try:
+            signatures = stage_entries_from_fd(
+                self._descriptor,
+                paths,
+                staging,
+                observed_entries=observed,
+                observe_entry=observe_entry,
+                error_type=error_type,
+            )
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ValueError("symlink parent escapes workspace") from exc
+            raise
+        return (
+            {path: observed[path] for path in paths},
+            {path: signatures[path] for path in paths},
         )
 
     def finalize(
@@ -111,11 +231,32 @@ class ProtectedLocalRoot:
         paths: tuple[str, ...],
         *,
         error_type: type[Exception],
-    ) -> None:
-        finalize_entries_from_fd(
+    ) -> dict[
+        str,
+        tuple[EntryFingerprint | MissingEntry, AuditSignature | None],
+    ]:
+        return finalize_entries_from_fd(
             self._descriptor,
             staging,
             paths,
+            error_type=error_type,
+        )
+
+    def verify_and_cleanup_stage(
+        self,
+        paths: tuple[str, ...],
+        staging: Path,
+        *,
+        expected_entries: Mapping[str, EntryFingerprint | MissingEntry],
+        expected_signatures: Mapping[str, AuditSignature | None],
+        error_type: type[Exception],
+    ) -> set[str]:
+        return verify_and_cleanup_stage_from_fd(
+            self._descriptor,
+            paths,
+            staging,
+            expected_entries=expected_entries,
+            expected_signatures=expected_signatures,
             error_type=error_type,
         )
 
