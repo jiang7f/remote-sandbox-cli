@@ -50,10 +50,11 @@ def test_sync_progress_formats_totals_and_current_path() -> None:
         bytes_done=8_400_000,
         bytes_total=47_000_000,
         current_path="src/model.py",
+        elapsed_seconds=1.25,
     )
 
     assert format_progress(progress) == (
-        "syncing 421/3626 files 8.4/47.0 MB src/model.py"
+        "syncing 421/3626 files 8.4/47.0 MB src/model.py 1.2s"
     )
 
 

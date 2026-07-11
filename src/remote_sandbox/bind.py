@@ -1,28 +1,33 @@
 from __future__ import annotations
 
-import posixpath
+import contextlib
+import shutil
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any, Protocol, cast
 
-from remote_sandbox.agent import bootstrap_agent
-from remote_sandbox.lock import WorkspaceLockError
-from remote_sandbox.marker import (
-    METADATA_DIR,
-    WorkspaceMarker,
-    marker_to_toml,
-    read_local_marker,
-    write_local_marker,
-)
+from remote_sandbox.agent import RemoteAgentManager
 from remote_sandbox.policy import POLICY_FILE_NAME, PolicyEngine, StaticPolicyEngine
 from remote_sandbox.registry import (
     BindingRecord,
     ensure_connection_name_available,
-    record_binding_from_marker,
+    generate_connection_name,
+    list_binding_records,
+    register_workspace,
 )
-from remote_sandbox.ssh import SshRunner, remote_marker_path, validate_remote_path, validate_target
-from remote_sandbox.syncsession import SyncSession
+from remote_sandbox.remote_client import RemoteWorkspaceClient
+from remote_sandbox.ssh import SshRunner, validate_remote_path, validate_target
+from remote_sandbox.state import WorkspaceStore
+from remote_sandbox.workspace import (
+    WorkspacePaths,
+    WorkspaceSpec,
+    new_workspace_spec,
+    read_workspace_spec,
+    workspace_paths,
+    write_workspace_spec,
+)
 
 
 class BindError(RuntimeError):
@@ -31,9 +36,15 @@ class BindError(RuntimeError):
 
 @dataclass(frozen=True)
 class BindResult:
-    workspace: WorkspaceMarker
+    workspace: WorkspaceSpec
     connection: BindingRecord
     created: bool
+
+
+class _RemoteRegistration(Protocol):
+    def forget(self) -> dict[str, object]: ...
+
+    def close(self) -> None: ...
 
 
 ConfirmCallback = Callable[[str], bool]
@@ -66,176 +77,163 @@ def bind_workspace(
         )
     if _has_control_char(str(local_root)):
         raise BindError("Invalid local path")
-    if connection_name is not None:
-        ensure_connection_name_available(
-            name=connection_name,
+    try:
+        if connection_name is not None:
+            ensure_connection_name_available(
+                name=connection_name,
+                target=safe_target,
+                remote_path=safe_remote,
+                local_path=str(local_root),
+            )
+        existing = _existing_workspace(
             target=safe_target,
-            remote_path=safe_remote,
-            local_path=str(local_root),
+            remote=safe_remote,
+            local=local_root,
+            connection_name=connection_name,
         )
+    except Exception as exc:
+        raise BindError(str(exc)) from exc
+
     local_root.mkdir(parents=True, exist_ok=True)
-    if (local_root / METADATA_DIR).is_symlink():
-        raise BindError("Local metadata path is a symlink")
-    remote_exists = runner.exists(safe_target, safe_remote)
     if runner.is_symlink(safe_target, safe_remote):
         raise BindError(f"Remote path is a symlink: {safe_remote}")
+    remote_exists = runner.exists(safe_target, safe_remote)
     if remote_exists and not runner.is_dir(safe_target, safe_remote):
         raise BindError(f"Remote path is not a directory: {safe_remote}")
-    if runner.is_symlink(safe_target, posixpath.dirname(remote_marker_path(safe_remote))):
-        raise BindError("Remote metadata path is a symlink")
     runner.mkdir_p(safe_target, safe_remote)
 
-    local_marker = _read_local_marker_checked(local_root)
-    remote_marker = _read_remote_marker_checked(runner, safe_target, safe_remote)
+    is_same_binding = existing is not None and Path(existing.local_root) == local_root
+    if not is_same_binding:
+        _guard_new_pairing(runner, safe_target, safe_remote, local_root, confirm)
 
-    if local_marker is None and remote_marker is None:
-        _guard_new_pairing(
-            runner,
-            safe_target,
-            safe_remote,
-            local_root,
-            confirm,
-        )
-        marker = WorkspaceMarker.new(
+    records = list_binding_records()
+    if existing is None:
+        name = connection_name or generate_connection_name(
             target=safe_target,
             local_path=str(local_root),
-            remote_path=safe_remote,
+            records=records,
+        )
+        spec = new_workspace_spec(
+            name=name,
+            target=safe_target,
+            local_root=local_root,
+            remote_root=safe_remote,
         )
         created = True
-        _write_remote_marker(runner, safe_target, safe_remote, marker)
-        write_local_marker(local_root, marker)
-    elif local_marker is not None and remote_marker is None:
-        if (
-            local_marker.binding.target != safe_target
-            or local_marker.binding.remote_path != safe_remote
-        ):
-            raise BindError(
-                "Local workspace is already bound to "
-                f"{local_marker.binding.target}:{local_marker.binding.remote_path}"
-            )
-        marker = local_marker.with_binding(
-            target=safe_target,
-            local_path=str(local_root),
-            remote_path=safe_remote,
-        )
-        created = False
-        _guard_new_pairing(
-            runner,
-            safe_target,
-            safe_remote,
-            local_root,
-            confirm,
-        )
-        _write_remote_marker(runner, safe_target, safe_remote, marker)
-        write_local_marker(local_root, marker)
-    elif local_marker is None and remote_marker is not None:
-        if not _same_remote_binding(remote_marker, safe_target, safe_remote):
-            raise BindError("Remote workspace marker points to a different binding")
-        _guard_new_pairing(
-            runner,
-            safe_target,
-            safe_remote,
-            local_root,
-            confirm,
-        )
-        marker = remote_marker.with_binding(
-            target=safe_target,
-            local_path=str(local_root),
-            remote_path=safe_remote,
-        )
-        created = False
-        write_local_marker(local_root, marker)
     else:
-        assert local_marker is not None
-        assert remote_marker is not None
-        if local_marker.workspace_id != remote_marker.workspace_id:
-            raise BindError(
-                "Local and remote are bound to different workspace ids: "
-                f"local={local_marker.workspace_id} remote={remote_marker.workspace_id}"
-            )
-        if not _same_identity(local_marker, remote_marker):
-            raise BindError("Local and remote have inconsistent workspace metadata")
-        if not _same_remote_binding(remote_marker, safe_target, safe_remote):
-            raise BindError("Remote workspace marker points to a different binding")
-        marker = local_marker.with_binding(
+        spec = replace(
+            existing,
+            name=connection_name or existing.name,
             target=safe_target,
-            local_path=str(local_root),
-            remote_path=safe_remote,
+            local_root=str(local_root),
+            remote_root=safe_remote,
         )
         created = False
-        _write_remote_marker(runner, safe_target, safe_remote, marker)
-        write_local_marker(local_root, marker)
 
-    session = SyncSession(
-        local_root=local_root,
-        runner=runner,
-        target=safe_target,
-        remote=safe_remote,
-    )
-    bootstrap_agent(runner, safe_target, safe_remote)
-    _sync_once_as_bind(session)
-    connection = record_binding_from_marker(
-        workspace_id=marker.workspace_id,
-        target=safe_target,
-        remote_path=safe_remote,
-        local_path=str(local_root),
-        name=connection_name,
-    )
-    return BindResult(
-        workspace=marker,
-        connection=connection,
-        created=created,
-    )
-
-
-def _read_local_marker_checked(local_root: Path) -> WorkspaceMarker | None:
+    paths = workspace_paths(spec.workspace_id)
+    prior_workspace = paths.workspace_file.read_bytes() if paths.workspace_file.exists() else None
+    metadata_existed = paths.root.exists()
+    remote_registration: _RemoteRegistration | None = None
     try:
-        return read_local_marker(local_root)
-    except Exception as exc:
-        raise BindError(f"Invalid local workspace marker: {exc}") from exc
+        remote_registration = _register_remote_workspace(
+            runner,
+            target=safe_target,
+            remote=safe_remote,
+            workspace_id=spec.workspace_id,
+        )
+        write_workspace_spec(paths.workspace_file, spec)
+        with WorkspaceStore.open(paths.state_db):
+            pass
+        connection = register_workspace(spec)
+    except BaseException as exc:
+        _rollback_local_metadata(paths, metadata_existed, prior_workspace)
+        if remote_registration is not None:
+            with contextlib.suppress(BaseException):
+                remote_registration.forget()
+        if isinstance(exc, BindError):
+            raise
+        raise BindError(f"Failed to create workspace binding: {exc}") from exc
+    finally:
+        if remote_registration is not None:
+            remote_registration.close()
+
+    return BindResult(workspace=spec, connection=connection, created=created)
 
 
-def _read_remote_marker_checked(
+def _register_remote_workspace(
     runner: SshRunner,
+    *,
     target: str,
     remote: str,
-) -> WorkspaceMarker | None:
-    marker_path = remote_marker_path(remote)
-    if not runner.exists(target, marker_path):
+    workspace_id: str,
+) -> _RemoteRegistration:
+    manager = RemoteAgentManager(runner)
+    install = manager.ensure(target)
+    client = RemoteWorkspaceClient(
+        cast(Any, runner),
+        target=target,
+        workspace_id=workspace_id,
+        agent_path=install.remote_path,
+    )
+    try:
+        client.register(remote)
+    except BaseException:
+        client.close()
+        raise
+    return client
+
+
+def _existing_workspace(
+    *,
+    target: str,
+    remote: str,
+    local: Path,
+    connection_name: str | None,
+) -> WorkspaceSpec | None:
+    candidates = []
+    for record in list_binding_records():
+        same_name = connection_name is not None and record.name == connection_name
+        same_endpoint = record.target == target and record.remote_path == remote
+        same_local = Path(record.local_path).expanduser().resolve(strict=False) == local
+        if same_name or (same_endpoint and same_local):
+            candidates.append(record)
+    if not candidates:
         return None
+    if len({record.workspace_id for record in candidates}) != 1:
+        raise BindError("binding registry contains inconsistent workspace identities")
+    paths = workspace_paths(candidates[0].workspace_id)
     try:
-        from remote_sandbox.marker import marker_from_toml
-
-        return marker_from_toml(runner.read_text(target, marker_path))
+        spec = read_workspace_spec(paths.workspace_file)
     except Exception as exc:
-        raise BindError(f"Invalid remote workspace marker: {exc}") from exc
+        raise BindError(f"Invalid external workspace metadata: {exc}") from exc
+    if spec.target != target or spec.remote_root != remote:
+        raise BindError("existing workspace metadata points to a different remote binding")
+    return spec
 
 
-def _write_remote_marker(
-    runner: SshRunner,
-    target: str,
-    remote: str,
-    marker: WorkspaceMarker,
+def _rollback_local_metadata(
+    paths: WorkspacePaths,
+    metadata_existed: bool,
+    prior_workspace: bytes | None,
 ) -> None:
-    try:
-        runner.write_text_atomic(target, remote_marker_path(remote), marker_to_toml(marker))
-    except Exception as exc:
-        raise BindError(f"Failed to write remote workspace marker: {exc}") from exc
+    if not metadata_existed:
+        shutil.rmtree(paths.root, ignore_errors=True)
+        for directory in (paths.root.parent, paths.root.parent.parent):
+            with contextlib.suppress(OSError):
+                directory.rmdir()
+        return
+    if prior_workspace is not None:
+        paths.workspace_file.parent.mkdir(parents=True, exist_ok=True)
+        paths.workspace_file.write_bytes(prior_workspace)
 
 
 def _remote_user_content(
     runner: SshRunner, target: str, remote: str, policy: PolicyEngine
 ) -> list[str]:
-    """Top-level remote names that would actually sync (ignored/junk excluded)."""
     return sorted(name for name in runner.listdir(target, remote) if not policy.is_ignored(name))
 
 
 def _local_user_content(local_root: Path, policy: PolicyEngine) -> list[str]:
-    """Top-level local names that would actually sync (ignored/junk excluded).
-
-    A directory that is empty, or holds only ignored entries (`.remote-sandbox`, OS
-    cruft like `.DS_Store`), counts as empty for binding purposes.
-    """
     try:
         return sorted(
             entry.name for entry in local_root.iterdir() if not policy.is_ignored(entry.name)
@@ -251,14 +249,6 @@ def _guard_new_pairing(
     local_root: Path,
     confirm: ConfirmCallback | None,
 ) -> None:
-    """Gate a *new* local<->remote pairing on directory emptiness.
-
-    Binding runs a bidirectional merge, so pairing two independent non-empty
-    directories would silently union them (or fail mid-sync on conflicts). Require
-    at least one empty side; when exactly one side has content, confirm the sync
-    direction first. Files the policy ignores (`.remote-sandbox`, OS cruft) don't count.
-    Not called for an already-bound same-workspace reconnect.
-    """
     policy = StaticPolicyEngine.from_file(local_root / POLICY_FILE_NAME)
     local_names = _local_user_content(local_root, policy)
     remote_names = _remote_user_content(runner, target, remote, policy)
@@ -289,29 +279,6 @@ def _guard_new_pairing(
     )
     if not confirm(prompt):
         raise BindError(f"Binding cancelled: {target}:{remote} -> {local_root}")
-
-
-def _same_identity(left: WorkspaceMarker, right: WorkspaceMarker) -> bool:
-    return (
-        left.workspace_id == right.workspace_id
-        and left.binding_id == right.binding_id
-        and left.local_replica_id == right.local_replica_id
-        and left.remote_replica_id == right.remote_replica_id
-        and left.created_at == right.created_at
-        and left.sync_state == right.sync_state
-    )
-
-
-def _same_remote_binding(marker: WorkspaceMarker, target: str, remote_path: str) -> bool:
-    return marker.binding.target == target and marker.binding.remote_path == remote_path
-
-
-def _sync_once_as_bind(session: SyncSession) -> None:
-    try:
-        session.sync_once()
-    except WorkspaceLockError as exc:
-        raise BindError(str(exc)) from exc
-
 
 
 def _has_control_char(value: str) -> bool:

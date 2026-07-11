@@ -155,35 +155,6 @@ def register_workspace(
     return record
 
 
-def record_binding_from_marker(
-    *,
-    workspace_id: str,
-    target: str,
-    remote_path: str,
-    local_path: str,
-    name: str | None = None,
-    path: Path | None = None,
-) -> BindingRecord:
-    registry = path or registry_path()
-    records = list_binding_records(registry)
-    connection_name = name or existing_or_generated_name(
-        records,
-        workspace_id=workspace_id,
-        target=target,
-        local_path=local_path,
-    )
-    spec = WorkspaceSpec(
-        schema_version=1,
-        workspace_id=workspace_id,
-        name=connection_name,
-        target=target,
-        local_root=local_path,
-        remote_root=remote_path,
-        created_at=now_iso(),
-    )
-    return register_workspace(spec, registry=registry)
-
-
 def validate_connection_name(name: str) -> str:
     if not name:
         raise RegistryError("Connection name cannot be empty")

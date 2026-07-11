@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import shutil
+import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from remote_sandbox.engine import SyncEngine
+from remote_sandbox.initial_sync import InitialSyncCoordinator
 from remote_sandbox.journal import EventKind, JournalEvent
 from remote_sandbox.manifest import (
     EntryFingerprint,
@@ -22,6 +24,7 @@ from remote_sandbox.transport import (
     TransferDirection,
     TransferResult,
 )
+from remote_sandbox.watch import PollingLocalWatcher
 
 FingerprintState = EntryFingerprint | MissingEntry
 
@@ -35,6 +38,7 @@ class LocalReplicaClient:
         self.hash_calls: list[tuple[str, ...]] = []
         self.snapshot_calls = 0
         self.acknowledge_calls: list[int] = []
+        self.on_before_snapshot: Callable[[], object] | None = None
 
     def close(self) -> None:
         self._store.close()
@@ -79,6 +83,10 @@ class LocalReplicaClient:
 
     def snapshot(self) -> RemoteSnapshot:
         self.snapshot_calls += 1
+        if self.on_before_snapshot is not None:
+            callback = self.on_before_snapshot
+            self.on_before_snapshot = None
+            callback()
         entries = snapshot_tree(self.root, with_hash=False)
         signatures = {
             path: signature
@@ -86,6 +94,9 @@ class LocalReplicaClient:
             if (signature := _audit_signature(self.root, path)) is not None
         }
         return RemoteSnapshot(entries, self._store.latest_sequence(), signatures)
+
+    def latest_sequence(self) -> int:
+        return self._store.latest_sequence()
 
     def audit_signatures(
         self,
@@ -133,6 +144,11 @@ class ControllableLocalPairTransport:
         self._mutate_before_commit: set[str] = set()
         self._mutate_before_delete: dict[tuple[str, str], bytes] = {}
         self.before_destination_change: Callable[[str, str], None] | None = None
+        self.on_first_progress: Callable[[], object] | None = None
+        self.operation_order: OperationOrder | None = None
+        self.transfer_call_number: int | None = None
+        self._progress_triggered = False
+        self.fail_after_first_progress = False
 
     def change_source_before_commit(self, path: str) -> None:
         self._mutate_before_commit.add(path)
@@ -142,6 +158,8 @@ class ControllableLocalPairTransport:
 
     def transfer(self, batch: TransferBatch, on_progress: object) -> TransferResult:
         self.transfer_calls += 1
+        if self.operation_order is not None:
+            self.transfer_call_number = self.operation_order.record("transfer")
         self.batches.append(batch)
         source, destination = (
             (self.local, self.remote)
@@ -178,6 +196,12 @@ class ControllableLocalPairTransport:
                 raise RuntimeError(f"verification failed for {item.path}")
             completed.append(item.path)
             on_progress(TransferResult(tuple(completed), ()))  # type: ignore[operator]
+            if not self._progress_triggered and self.on_first_progress is not None:
+                self._progress_triggered = True
+                self.on_first_progress()
+            if self.fail_after_first_progress:
+                self.fail_after_first_progress = False
+                raise RuntimeError("injected transfer interruption")
         return TransferResult(tuple(completed), tuple(changed))
 
     def delete_local(
@@ -262,6 +286,86 @@ class SyncPair:
         self.remote_client.append_event(EventKind.DELETE, path)
 
 
+class OperationOrder:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sequence = 0
+        self.calls: list[tuple[int, str]] = []
+
+    def record(self, label: str) -> int:
+        with self._lock:
+            self._sequence += 1
+            self.calls.append((self._sequence, label))
+            return self._sequence
+
+
+class RecordingWatcher:
+    def __init__(
+        self,
+        order: OperationOrder,
+        label: str,
+        root: Path,
+        on_event: Callable[[EventKind, str, str | None], None],
+        latest_sequence: Callable[[], int],
+        transport: ControllableLocalPairTransport,
+    ) -> None:
+        self.order = order
+        self.label = label
+        self.transport = transport
+        self._root = root
+        self._on_event = on_event
+        self._latest_sequence = latest_sequence
+        self._watcher: PollingLocalWatcher | None = None
+        self.start_call_number: int | None = None
+
+    def start(self) -> int:
+        self.start_call_number = self.order.record(self.label)
+        sequence = self._latest_sequence()
+        if self._watcher is None:
+            self._watcher = PollingLocalWatcher(
+                self._root,
+                StaticPolicyEngine(),
+                self._on_event,
+                interval=0.001,
+            )
+        self._watcher.start()
+        return sequence
+
+    def stop(self) -> None:
+        if self._watcher is not None:
+            self._watcher.stop()
+
+    @property
+    def started_before_transfer(self) -> bool:
+        return (
+            self.start_call_number is not None
+            and self.transport.transfer_call_number is not None
+            and self.start_call_number < self.transport.transfer_call_number
+        )
+
+
+@dataclass(slots=True)
+class InitialPairHarness:
+    local: Path
+    remote: Path
+    store: WorkspaceStore
+    local_watcher: RecordingWatcher
+    remote_watcher: RecordingWatcher
+    remote_client: LocalReplicaClient
+    transport: ControllableLocalPairTransport
+    engine: SyncEngine
+    coordinator: InitialSyncCoordinator
+
+    def set_placeholder_limit(self, value: int) -> None:
+        self.coordinator.placeholder_limit = value
+
+    def close(self) -> None:
+        self.local_watcher.stop()
+        self.remote_watcher.stop()
+        self.remote_client.close()
+        self.store.close()
+
+
 def make_engine_harness(tmp_path: Path) -> EngineHarness:
     pair = make_sync_pair(tmp_path)
     return EngineHarness(
@@ -290,6 +394,54 @@ def make_sync_pair(tmp_path: Path) -> SyncPair:
         policy=StaticPolicyEngine(),
     )
     return SyncPair(local, remote, store, remote_client, transport, engine)
+
+
+def make_initial_pair(tmp_path: Path) -> InitialPairHarness:
+    pair = make_sync_pair(tmp_path)
+    order = OperationOrder()
+    pair.transport.operation_order = order
+    local_watcher = RecordingWatcher(
+        order,
+        "local-watcher",
+        pair.local,
+        lambda kind, path, destination: pair.store.append_event(
+            "local", kind, path, destination
+        ),
+        lambda: pair.store.latest_sequence("local"),
+        pair.transport,
+    )
+    remote_watcher = RecordingWatcher(
+        order,
+        "remote-watcher",
+        pair.remote,
+        lambda kind, path, destination: pair.remote_client.append_event(
+            kind, path, destination
+        ),
+        pair.remote_client.latest_sequence,
+        pair.transport,
+    )
+    coordinator = InitialSyncCoordinator(
+        store=pair.store,
+        local_root=pair.local,
+        remote=pair.remote_client,
+        transport=pair.transport,
+        engine=pair.engine,
+        start_local_watcher=local_watcher.start,
+        start_remote_watcher=remote_watcher.start,
+        quiet_seconds=0.05,
+        poll_interval=0.005,
+    )
+    return InitialPairHarness(
+        pair.local,
+        pair.remote,
+        pair.store,
+        local_watcher,
+        remote_watcher,
+        pair.remote_client,
+        pair.transport,
+        pair.engine,
+        coordinator,
+    )
 
 
 def snapshot_tree(root: Path, *, with_hash: bool) -> dict[str, EntryFingerprint]:

@@ -23,6 +23,7 @@ class SyncProgress:
     bytes_done: int = 0
     bytes_total: int = 0
     current_path: str | None = None
+    elapsed_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.stage, str) or not self.stage:
@@ -36,6 +37,12 @@ class SyncProgress:
             raise ValueError("bytes_done must not exceed bytes_total")
         if self.current_path is not None and not isinstance(self.current_path, str):
             raise ValueError("progress current_path must be a string or None")
+        if (
+            isinstance(self.elapsed_seconds, bool)
+            or not isinstance(self.elapsed_seconds, (int, float))
+            or self.elapsed_seconds < 0
+        ):
+            raise ValueError("progress elapsed_seconds must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +74,8 @@ def format_progress(progress: SyncProgress) -> str:
         parts.append(f"{_format_megabytes(progress.bytes_done)} MB")
     if progress.current_path:
         parts.append(progress.current_path)
+    if progress.elapsed_seconds:
+        parts.append(f"{progress.elapsed_seconds:.1f}s")
     return " ".join(parts)
 
 

@@ -299,6 +299,11 @@ class WorkspaceStore:
             raise RuntimeError("could not read the last allocated journal sequence")
         return _expect_int(row["last_sequence"], "last allocated event sequence")
 
+    def latest_sequence(self, side: str) -> int:
+        _validate_side(side)
+        with self._lock:
+            return self._last_allocated_sequence(side)
+
     def acknowledged_sequence(self, side: str) -> int:
         _validate_side(side)
         with self._lock:
@@ -997,6 +1002,7 @@ def _encode_progress(progress: SyncProgress) -> str:
         "bytes_done": progress.bytes_done,
         "bytes_total": progress.bytes_total,
         "current_path": progress.current_path,
+        "elapsed_seconds": progress.elapsed_seconds,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -1011,7 +1017,15 @@ def _decode_progress(raw: object) -> SyncProgress:
         bytes_done=_required_json_int(payload, "bytes_done", "progress"),
         bytes_total=_required_json_int(payload, "bytes_total", "progress"),
         current_path=_optional_json_string(payload, "current_path", "progress"),
+        elapsed_seconds=_progress_elapsed(payload),
     )
+
+
+def _progress_elapsed(payload: Mapping[str, Any]) -> float:
+    value = payload.get("elapsed_seconds", 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError("invalid progress JSON field: elapsed_seconds")
+    return float(value)
 
 
 def _decode_json_object(raw: object, label: str) -> dict[str, Any]:
