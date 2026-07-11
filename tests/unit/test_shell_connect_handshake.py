@@ -1,6 +1,8 @@
 import base64
 import json
 import shlex
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -182,6 +184,34 @@ def test_success_response_can_retain_a_local_ready_probe() -> None:
 
     assert response.ready_probe is probe
     assert response.encode() == "ok\tw1\tdq\t/work/dq\tlocal-to-remote"
+
+
+def test_ready_probe_worker_allows_only_one_in_flight_callback() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[int] = []
+    worker = shell_module._ReadyProbeWorker()
+
+    def blocked_probe() -> str:
+        calls.append(1)
+        started.set()
+        release.wait(timeout=1.0)
+        return "pending"
+
+    assert worker.launch(blocked_probe, generation=7) is True
+    assert started.wait(timeout=0.5)
+    assert worker.launch(blocked_probe, generation=7) is False
+    assert worker.launch(blocked_probe, generation=8) is False
+    assert calls == [1]
+
+    release.set()
+    deadline = time.monotonic() + 0.5
+    result = None
+    while result is None and time.monotonic() < deadline:
+        result = worker.take_result(generation=7)
+        time.sleep(0.01)
+    assert result == "pending"
+    assert calls == [1]
 
 
 @pytest.mark.parametrize(
@@ -443,6 +473,114 @@ def test_enter_and_bind_rejects_durable_status_without_control_response(
     assert captured == [
         ConnectResponse(ok=False, error="supervisor control endpoint is unresponsive")
     ]
+
+
+def test_ready_probe_uses_durable_status_only_to_detect_terminal_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    selected_local = tmp_path / "local"
+    selected_local.mkdir()
+    (selected_local / "source.txt").write_text("local", encoding="utf-8")
+    connection = BindingRecord(
+        name="dq",
+        workspace_id="00000000-0000-4000-8000-000000000014",
+        target="host",
+        remote_path="/work/dq",
+        local_path=str(selected_local),
+        updated_at="2026-07-11T00:00:00+00:00",
+    )
+    captured: list[ConnectResponse] = []
+
+    class FakeRunner:
+        def listdir(self, target: str, remote: str) -> list[str]:
+            assert (target, remote) == ("host", "/work/dq")
+            return []
+
+    running_status = SimpleNamespace(
+        running=True,
+        pid=1234,
+        phase=SimpleNamespace(value="initial-syncing"),
+        last_error=None,
+        conn_state="ok",
+    )
+    monkeypatch.setattr(
+        cli,
+        "bind_workspace",
+        lambda **_kwargs: SimpleNamespace(
+            workspace=SimpleNamespace(workspace_id=connection.workspace_id),
+            connection=connection,
+        ),
+    )
+    monkeypatch.setattr(cli, "SubprocessSshRunner", FakeRunner)
+    monkeypatch.setattr(cli, "ensure_daemon", lambda *_args, **_kwargs: running_status)
+    monkeypatch.setattr(cli, "wait_for_daemon_control", lambda *_args: running_status)
+    monkeypatch.setattr(
+        cli,
+        "daemon_control_status",
+        lambda _root: (_ for _ in ()).throw(cli.DaemonError("unresponsive")),
+    )
+    monkeypatch.setattr(cli, "_print_connection", lambda _record: None)
+
+    def fake_enter_shell_loop(
+        _target: str,
+        _cwd: str,
+        *,
+        nonce: str,
+        on_connect_request: Any,
+    ) -> EnterShellResult:
+        assert nonce
+        captured.append(
+            on_connect_request(
+                ConnectRequestEvent(remote="/work/dq", local=str(selected_local), name="dq")
+            )
+        )
+        return EnterShellResult(0, "/work/dq", str(selected_local), "dq")
+
+    monkeypatch.setattr(cli, "enter_shell_loop", fake_enter_shell_loop)
+
+    assert cli.enter_and_bind(target="host", remote="~", local=tmp_path, open_shell=True) == 0
+    probe = captured[0].ready_probe
+    assert probe is not None
+
+    terminal_statuses = (
+        SimpleNamespace(
+            running=False,
+            pid=None,
+            phase=SimpleNamespace(value="stopped"),
+            conn_state="ok",
+        ),
+        SimpleNamespace(
+            running=True,
+            pid=None,
+            phase=SimpleNamespace(value="initial-syncing"),
+            conn_state="ok",
+        ),
+        SimpleNamespace(
+            running=True,
+            pid=1234,
+            phase=SimpleNamespace(value="failed"),
+            conn_state="failed",
+        ),
+        SimpleNamespace(
+            running=True,
+            pid=1234,
+            phase=SimpleNamespace(value="degraded"),
+            conn_state="disconnected",
+        ),
+    )
+    for status in terminal_statuses:
+        monkeypatch.setattr(cli, "daemon_status", lambda _root, value=status: value)
+        assert probe() == "stop"
+
+    live_status = SimpleNamespace(
+        running=True,
+        pid=1234,
+        phase=SimpleNamespace(value="degraded"),
+        conn_state="degraded",
+    )
+    monkeypatch.setattr(cli, "daemon_status", lambda _root: live_status)
+    assert probe() == "pending"
 
 
 def _enter_rcfile() -> str:

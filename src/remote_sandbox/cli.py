@@ -487,6 +487,14 @@ def enter_and_bind(*, target: str, remote: str, local: Path, open_shell: bool) -
             try:
                 current = daemon_control_status(bound_local)
             except DaemonError:
+                current = daemon_status(bound_local)
+                if (
+                    not current.running
+                    or current.pid is None
+                    or current.phase.value in {"failed", "stopped"}
+                    or current.conn_state == "disconnected"
+                ):
+                    return "stop"
                 return "pending"
             if current.phase.value == "ready":
                 return "ready"

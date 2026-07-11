@@ -297,6 +297,87 @@ def test_real_pty_ready_preserves_partial_readline_buffer_and_shell_process(
         os.close(frontend_master)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded, use of fork\\(\\) may lead to "
+    "deadlocks in the child\\.:DeprecationWarning"
+)
+@pytest.mark.timeout(8)
+def test_blocked_ready_probe_does_not_block_pty_passthrough(tmp_path: Path) -> None:
+    nonce = "nonblocking14"
+    workspace = tmp_path / "remote"
+    workspace.mkdir()
+    probe_started = tmp_path / "probe-started"
+    release_probe = tmp_path / "release-probe"
+    rcfile = tmp_path / "bashrc"
+    rcfile.write_text(
+        "CODEX_RSB_DISPLAY_LABEL=host\n"
+        f"__codex_nonce={shlex.quote(nonce)}\n{_enter_rcfile(nonce)}\n",
+        encoding="utf-8",
+    )
+    frontend_master, frontend_slave = pty.openpty()
+    pid = os.fork()
+    if pid == 0:
+        os.close(frontend_master)
+        os.login_tty(frontend_slave)
+        sys.stdin = os.fdopen(os.dup(0), "r", encoding="utf-8")
+        sys.stdout = os.fdopen(os.dup(1), "w", encoding="utf-8")
+        probe_calls = 0
+
+        def connect(_event: ConnectRequestEvent) -> ConnectResponse:
+            def ready_probe() -> str:
+                nonlocal probe_calls
+                probe_calls += 1
+                if probe_calls == 1:
+                    return "pending"
+                probe_started.touch()
+                deadline = time.monotonic() + 2.0
+                while not release_probe.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                return "pending"
+
+            return ConnectResponse(
+                ok=True,
+                workspace_id="w1",
+                name="dq",
+                remote_root=str(workspace),
+                direction="local-to-remote",
+                ready_probe=ready_probe,
+            )
+
+        try:
+            status = shell_module._pty_enter_shell_backend(
+                ["bash", "--noprofile", "--rcfile", str(rcfile), "-i"],
+                nonce,
+                connect,
+            )
+        except BaseException:
+            traceback.print_exc()
+            status = 1
+        os._exit(status)
+
+    os.close(frontend_slave)
+    output = bytearray()
+    try:
+        _read_pty_until(frontend_master, output, b":enter]", timeout=2.0)
+        _connect_remote(frontend_master, output, workspace)
+        _wait_for_path(probe_started, timeout=1.0)
+        command_start = len(output)
+        os.write(frontend_master, b"printf 'FLOW:%s\\n' \"$$\"\n")
+        _read_pty_until(
+            frontend_master,
+            output,
+            b"\r\nFLOW:",
+            timeout=0.5,
+            start=command_start,
+        )
+    finally:
+        release_probe.touch()
+        with suppress(OSError):
+            os.write(frontend_master, b"\nexit\n")
+        _terminate_child(pid)
+        os.close(frontend_master)
+
+
 def _enter_rcfile(nonce: str) -> str:
     remote_command = shell_module.build_enter_remote_shell_command(
         "host",
@@ -345,6 +426,13 @@ def _wait_for_line_count(path: Path, expected: int, *, timeout: float) -> None:
     while _line_count(path) < expected and time.monotonic() < deadline:
         time.sleep(0.01)
     assert _line_count(path) >= expected
+
+
+def _wait_for_path(path: Path, *, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert path.exists()
 
 
 def _read_pty_until(

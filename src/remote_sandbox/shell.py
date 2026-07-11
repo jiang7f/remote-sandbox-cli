@@ -6,12 +6,14 @@ import json
 import os
 import posixpath
 import pty
+import queue
 import re
 import select
 import shlex
 import struct
 import sys
 import termios
+import threading
 import time
 import tty
 from collections.abc import Callable, Iterable
@@ -49,7 +51,41 @@ class PromptEvent:
 
 InitialShellDirection = Literal["local-to-remote", "remote-to-local", "empty"]
 ReadyProbeResult = Literal["pending", "ready", "stop"]
+ReadyProbe = Callable[[], ReadyProbeResult | bool]
 _READY_PROBE_INTERVAL_S = 0.25
+_READY_RESULT_POLL_S = 0.05
+
+
+class _ReadyProbeWorker:
+    def __init__(self) -> None:
+        self._results: queue.SimpleQueue[
+            tuple[int, ReadyProbeResult | bool]
+        ] = queue.SimpleQueue()
+        self._thread: threading.Thread | None = None
+
+    def launch(self, probe: ReadyProbe, *, generation: int) -> bool:
+        if self._thread is not None and self._thread.is_alive():
+            return False
+
+        def run() -> None:
+            try:
+                result = probe()
+            except Exception:
+                result = "pending"
+            self._results.put((generation, result))
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+        return True
+
+    def take_result(self, *, generation: int) -> ReadyProbeResult | bool | None:
+        while True:
+            try:
+                result_generation, result = self._results.get_nowait()
+            except queue.Empty:
+                return None
+            if result_generation == generation:
+                return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -644,7 +680,9 @@ def _pty_enter_shell_backend(
     if pid == 0:
         os.execvp(argv[0], argv)
     parser = ShellOutputParser(nonce)
-    ready_probe: Callable[[], ReadyProbeResult | bool] | None = None
+    ready_probe: ReadyProbe | None = None
+    ready_probe_generation = 0
+    ready_probe_worker = _ReadyProbeWorker()
     ready_latched = False
     at_prompt = False
     next_ready_probe_at = 0.0
@@ -660,7 +698,7 @@ def _pty_enter_shell_backend(
             while True:
                 timeout: float | None = None
                 if ready_probe is not None:
-                    timeout = max(0.0, next_ready_probe_at - time.monotonic())
+                    timeout = _READY_RESULT_POLL_S
                 readable, _, _ = select.select([master_fd, stdin_fd], [], [], timeout)
                 if master_fd in readable:
                     try:
@@ -698,6 +736,7 @@ def _pty_enter_shell_backend(
                                 and response.direction == "local-to-remote"
                                 and response.ready_probe is not None
                             ):
+                                ready_probe_generation += 1
                                 ready_probe = response.ready_probe
                                 ready_latched = False
                                 next_ready_probe_at = time.monotonic()
@@ -708,18 +747,27 @@ def _pty_enter_shell_backend(
                     if any(char in data for char in b"\r\n\x03\x04\x1a"):
                         at_prompt = False
                     os.write(master_fd, data)
-                now = time.monotonic()
-                if ready_probe is not None and now >= next_ready_probe_at:
-                    next_ready_probe_at = now + _READY_PROBE_INTERVAL_S
-                    try:
-                        probe_result = ready_probe()
-                    except Exception:
-                        probe_result = "pending"
+                probe_result = ready_probe_worker.take_result(
+                    generation=ready_probe_generation
+                )
+                if ready_probe is not None and probe_result is not None:
                     if probe_result is True or probe_result == "ready":
+                        ready_probe_generation += 1
                         ready_probe = None
                         ready_latched = True
                     elif probe_result == "stop":
+                        ready_probe_generation += 1
                         ready_probe = None
+                now = time.monotonic()
+                if (
+                    ready_probe is not None
+                    and now >= next_ready_probe_at
+                    and ready_probe_worker.launch(
+                        ready_probe,
+                        generation=ready_probe_generation,
+                    )
+                ):
+                    next_ready_probe_at = now + _READY_PROBE_INTERVAL_S
                 if ready_latched and at_prompt:
                     os.write(master_fd, _ready_key_sequence())
                     ready_latched = False
