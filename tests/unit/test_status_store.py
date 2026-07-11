@@ -5,8 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from remote_sandbox.manifest import MISSING, EntryKind, FileEntry
-from remote_sandbox.state import StateStore, WorkspaceStore
+from remote_sandbox.state import WorkspaceStore
 from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus, format_progress
 
 
@@ -247,16 +246,6 @@ def test_legacy_v1_database_is_migrated_without_losing_base_entries(tmp_path: Pa
         assert legacy.size == 3
         assert legacy.content_hash == "abc"
         assert store.get_status().phase is WorkspacePhase.STOPPED
-
-
-def test_legacy_state_store_adapter_keeps_file_entry_behavior(tmp_path: Path) -> None:
-    entry = FileEntry(EntryKind.FILE, "legacy.txt", 3, 1.5, "abc")
-
-    with StateStore.open(tmp_path / "state.sqlite3") as store:
-        store.upsert_base(entry)
-        assert store.get_base("legacy.txt") == entry
-        assert store.get_base("missing.txt") is MISSING
-        assert store.list_base() == {"legacy.txt": entry}
 
 
 def test_newer_database_schema_is_rejected(tmp_path: Path) -> None:

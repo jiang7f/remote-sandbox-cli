@@ -330,6 +330,20 @@ def test_zipapp_manages_detached_watcher_journal_and_safe_forget(tmp_path: Path)
 
     forgotten = _agent_call(archive, AgentRequest("forget", {"workspace_id": workspace_id}), env)
     assert forgotten.returncode == 0
+
+    stopped_again = _agent_call(
+        archive,
+        AgentRequest("stop", {"workspace_id": workspace_id}),
+        env,
+    )
+    forgotten_again = _agent_call(
+        archive,
+        AgentRequest("forget", {"workspace_id": workspace_id}),
+        env,
+    )
+    assert stopped_again.returncode == 0
+    assert forgotten_again.returncode == 0
+    assert decode_response(forgotten_again.stdout).payload["already_forgotten"] is True
     assert not (control / "workspaces" / workspace_id).exists()
     assert not (runtime_workspace / "watcher.log").exists()
     assert root.exists()

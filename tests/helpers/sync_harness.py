@@ -6,18 +6,27 @@ import os
 import shutil
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Literal
 
+from remote_sandbox.cli import (
+    CapturedCliResult,
+    CliServices,
+    RemoteCommandResult,
+    invoke_cli,
+)
+from remote_sandbox.conflicts import resolve_conflict_transaction
 from remote_sandbox.daemon import (
     SupervisorClient,
     SupervisorRuntime,
     WorkspaceSupervisor,
 )
 from remote_sandbox.engine import SyncEngine
+from remote_sandbox.fetch import fetch_placeholders as fetch_placeholder_transaction
 from remote_sandbox.initial_sync import InitialSyncCoordinator
 from remote_sandbox.journal import EventKind, JournalEvent
 from remote_sandbox.manifest import (
@@ -25,8 +34,20 @@ from remote_sandbox.manifest import (
     EntryKind,
     MissingEntry,
     fingerprint_local,
+    normalize_relative_path,
+    workspace_path,
 )
+from remote_sandbox.peek import peek_placeholder as peek_placeholder_transaction
+from remote_sandbox.placeholder import PlaceholderMetadata, encode_placeholder
 from remote_sandbox.policy import StaticPolicyEngine
+from remote_sandbox.registry import (
+    BindingRecord,
+    delete_binding_record,
+    find_binding_record,
+    list_binding_records,
+    now_iso,
+    upsert_binding_record,
+)
 from remote_sandbox.remote_agent.store import RemoteStore
 from remote_sandbox.remote_client import RemoteSnapshot
 from remote_sandbox.shell import ConnectResponse, ManagedShellSession
@@ -507,6 +528,275 @@ class SyncPair:
         self.remote_client.append_event(EventKind.DELETE, path)
 
 
+@dataclass(slots=True)
+class CliHarness:
+    pair: SyncPair
+    store: WorkspaceStore
+    registry: Path
+    services: CliServices
+    record: BindingRecord
+    cleanup_calls: list[str]
+    _command_result: RemoteCommandResult
+    _followup_error: str | None = None
+    _remote_forget_error: str | None = None
+    _registry_delete_failures: int = 0
+
+    def run(self, argv: list[str]) -> CapturedCliResult:
+        return invoke_cli(argv, services=self.services)
+
+    def create_conflict(
+        self,
+        *,
+        path: str,
+        base: bytes,
+        local: bytes,
+        remote: bytes,
+    ) -> object:
+        normalized = normalize_relative_path(path)
+        for root, content in ((self.pair.local, base), (self.pair.remote, base)):
+            target = workspace_path(root, normalized)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        self.pair.seed_current_base()
+        workspace_path(self.pair.local, normalized).write_bytes(local)
+        workspace_path(self.pair.remote, normalized).write_bytes(remote)
+        return self.store.create_conflict(
+            path=normalized,
+            reason="both-modified",
+            local_blob=local,
+            remote_blob=remote,
+            local_fingerprint=fingerprint_local(self.pair.local, normalized, with_hash=True),
+            remote_fingerprint=fingerprint_local(self.pair.remote, normalized, with_hash=True),
+        )
+
+    def local_bytes(self, path: str) -> bytes:
+        return workspace_path(self.pair.local, path).read_bytes()
+
+    def remote_bytes(self, path: str) -> bytes:
+        return workspace_path(self.pair.remote, path).read_bytes()
+
+    def remote_command_result(
+        self,
+        *,
+        returncode: int,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> None:
+        self._command_result = RemoteCommandResult(returncode, stdout, stderr)
+
+    def followup_sync_fails(self, message: str) -> None:
+        self._followup_error = message
+
+    def remote_forget_fails(self, message: str) -> None:
+        self._remote_forget_error = message
+
+    def registry_delete_fails_once(self) -> None:
+        self._registry_delete_failures = 1
+
+    def registry_has(self, name: str) -> bool:
+        return find_binding_record(name, self.registry) is not None
+
+    def set_workspace_state(self, name: str, phase: str, *, error: str | None = None) -> None:
+        assert name == self.record.name
+        self.store.set_status(
+            WorkspaceStatus(
+                WorkspacePhase(phase),
+                SyncProgress(phase),
+                last_error=error,
+            )
+        )
+
+    def create_remote_placeholder(self, path: str, content: bytes) -> None:
+        normalized = normalize_relative_path(path)
+        remote_path = workspace_path(self.pair.remote, normalized)
+        remote_path.parent.mkdir(parents=True, exist_ok=True)
+        remote_path.write_bytes(content)
+        remote = fingerprint_local(self.pair.remote, normalized, with_hash=True)
+        assert isinstance(remote, EntryFingerprint)
+        assert remote.size is not None
+        assert remote.mtime_ns is not None
+        assert remote.content_hash is not None
+        local_path = workspace_path(self.pair.local, normalized)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(
+            encode_placeholder(
+                PlaceholderMetadata(
+                    normalized,
+                    remote.size,
+                    remote.mtime_ns,
+                    remote.content_hash,
+                )
+            )
+        )
+        self.store.upsert_base(
+            EntryFingerprint(
+                normalized,
+                EntryKind.FILE,
+                remote.size,
+                remote.mtime_ns,
+                remote.mode,
+                content_hash=remote.content_hash,
+                is_placeholder=True,
+            )
+        )
+
+    def block_initial_sync(self) -> None:
+        return
+
+    def change_selected_source_before_transfer(self, path: str) -> None:
+        self.pair.transport.change_source_before_commit(path)
+
+
+def make_cli_harness(tmp_path: Path) -> CliHarness:
+    pair = make_sync_pair(tmp_path)
+    registry = tmp_path / "home" / "connections.toml"
+    record = BindingRecord(
+        name="dq",
+        workspace_id=str(uuid.uuid4()),
+        target="host",
+        remote_path="/work/dq",
+        local_path=str(pair.local),
+        updated_at=now_iso(),
+    )
+    upsert_binding_record(registry, record)
+    cleanup_calls: list[str] = []
+    command_result = RemoteCommandResult(0)
+
+    harness: CliHarness
+
+    def request_sync(_record: BindingRecord) -> bool:
+        if harness._followup_error is not None:
+            raise RuntimeError(harness._followup_error)
+        return True
+
+    def run_remote(_record: BindingRecord, _argv: tuple[str, ...]) -> RemoteCommandResult:
+        return harness._command_result
+
+    def connect_workspace(
+        target: str,
+        remote: str,
+        local: Path,
+        name: str | None,
+    ) -> BindingRecord:
+        assert target == "host"
+        assert remote == "/work/dq"
+        assert local.resolve() == pair.local.resolve()
+        assert name in {None, "dq"}
+        pair.store.set_status(
+            WorkspaceStatus(
+                WorkspacePhase.INITIAL_SYNCING,
+                SyncProgress("initial-syncing"),
+            )
+        )
+        return record
+
+    def fetch_registered(
+        _record: BindingRecord,
+        path: str | None,
+        fetch_all: bool,
+        confirm: Callable[[str], bool],
+    ) -> tuple[int, bool]:
+        return fetch_placeholder_transaction(
+            local_root=pair.local,
+            store=pair.store,
+            remote=pair.remote_client,
+            transport=pair.transport,
+            path=path,
+            fetch_all=fetch_all,
+            confirm=confirm,
+        )
+
+    def peek_registered(
+        _record: BindingRecord,
+        path: str,
+        lines: int,
+        tail: bool,
+    ) -> bytes:
+        return peek_placeholder_transaction(
+            local_root=pair.local,
+            store=pair.store,
+            remote=pair.remote_client,
+            path=path,
+            lines=lines,
+            tail=tail,
+        )
+
+    def resolve_registered(_record: BindingRecord, path: str, use_local: bool) -> None:
+        resolve_conflict_transaction(
+            store=pair.store,
+            local_root=pair.local,
+            remote=pair.remote_client,
+            transport=pair.transport,
+            path=path,
+            use_local=use_local,
+        )
+
+    def stop_local(_record: BindingRecord) -> None:
+        cleanup_calls.append("stop-local-supervisor")
+
+    def stop_remote(_record: BindingRecord) -> None:
+        cleanup_calls.append("stop-remote-watcher")
+        if harness._remote_forget_error is not None:
+            raise RuntimeError(harness._remote_forget_error)
+
+    def delete_remote(_record: BindingRecord) -> None:
+        cleanup_calls.append("delete-remote-workspace")
+
+    def prune_remote(_record: BindingRecord) -> None:
+        cleanup_calls.append("prune-unused-remote-agent")
+
+    def delete_local(_record: BindingRecord) -> None:
+        cleanup_calls.append("delete-local-workspace")
+
+    def delete_registry(record_to_delete: BindingRecord) -> None:
+        cleanup_calls.append("delete-registry-record")
+        if harness._registry_delete_failures:
+            harness._registry_delete_failures -= 1
+            raise RuntimeError("registry busy")
+        delete_binding_record(record_to_delete.name, registry)
+
+    services = CliServices(
+        registry=registry,
+        cwd=lambda: pair.local,
+        list_records=lambda path: list_binding_records(path),
+        find_record=lambda name, path: find_binding_record(name, path),
+        current_record=lambda path, cwd: next(
+            (
+                candidate
+                for candidate in list_binding_records(path)
+                if cwd.resolve().is_relative_to(Path(candidate.local_path).resolve())
+            ),
+            None,
+        ),
+        workspace_status=lambda _record: pair.store.get_status(),
+        daemon_status=lambda _record: pair.store.get_status(),
+        ensure_supervisor=lambda _record: pair.store.get_status(),
+        request_sync=request_sync,
+        run_remote=run_remote,
+        connect_workspace=connect_workspace,
+        fetch_placeholders=fetch_registered,
+        peek_placeholder=peek_registered,
+        list_conflicts=lambda _record: pair.store.list_conflicts(unresolved_only=True),
+        resolve_conflict=resolve_registered,
+        stop_local_supervisor=stop_local,
+        stop_remote_watcher=stop_remote,
+        delete_remote_workspace=delete_remote,
+        prune_remote_agent=prune_remote,
+        delete_local_workspace=delete_local,
+        delete_registry_record=delete_registry,
+    )
+    harness = CliHarness(
+        pair,
+        pair.store,
+        registry,
+        services,
+        record,
+        cleanup_calls,
+        command_result,
+    )
+    return harness
+
+
 class OperationOrder:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -606,19 +896,23 @@ class ControllableRemoteClient:
         self.probe_result: Literal["ok", "auth", "network"] = "ok"
         self.failure = RuntimeError("subscription failed")
         self.clear_master_calls = 0
+        self.start_watcher_calls = 0
+        self.subscribe_calls = 0
+        self.closed = False
 
     def ensure_agent(self) -> None:
         return
 
     def start_watcher(self) -> None:
-        return
+        self.start_watcher_calls += 1
 
     def subscribe(self, after_sequence: int) -> Iterator[JournalEvent]:
         del after_sequence
+        self.subscribe_calls += 1
         return iter(())
 
     def close(self) -> None:
-        return
+        self.closed = True
 
     def raise_auth_failure(self) -> None:
         self.probe_result = "auth"
@@ -671,10 +965,18 @@ class RecordingEngine:
     def __init__(self, store: WorkspaceStore) -> None:
         self.store = store
         self.reasons: list[str] = []
+        self.active = threading.Event()
+        self.release = threading.Event()
+        self.release.set()
 
     def run_once(self, reason: str) -> None:
         self.reasons.append(reason)
-        self.store.set_status(WorkspaceStatus(WorkspacePhase.READY, SyncProgress("idle")))
+        self.active.set()
+        try:
+            self.release.wait(timeout=2.0)
+            self.store.set_status(WorkspaceStatus(WorkspacePhase.READY, SyncProgress("idle")))
+        finally:
+            self.active.clear()
 
 
 @dataclass(frozen=True, slots=True)
@@ -753,6 +1055,24 @@ def _run_daemon_pair_process(config: DaemonProcessConfig) -> None:
         transport=transport,
         policy=StaticPolicyEngine(),
     )
+
+    def mutate(kind: str, payload: dict[str, object]) -> dict[str, object]:
+        if kind != "resolve":
+            raise ValueError(f"unsupported test mutation: {kind}")
+        path = payload.get("path")
+        use_local = payload.get("use_local")
+        if not isinstance(path, str) or type(use_local) is not bool:
+            raise ValueError("resolve mutation payload is malformed")
+        conflict = resolve_conflict_transaction(
+            store=store,
+            local_root=config.local,
+            remote=remote,
+            transport=transport,
+            path=path,
+            use_local=use_local,
+        )
+        return {"path": conflict.path, "conflict_id": conflict.conflict_id}
+
     supervisor = WorkspaceSupervisor(
         config.runtime,
         store=store,
@@ -760,6 +1080,7 @@ def _run_daemon_pair_process(config: DaemonProcessConfig) -> None:
         remote=remote,
         engine=OrderedEngine(engine, config.order_log),
         local_watcher=ProcessLocalWatcher(config, store),
+        mutation_handler=mutate,
         close_store=True,
     )
     supervisor.run()

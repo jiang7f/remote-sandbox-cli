@@ -183,7 +183,7 @@ def ensure_connection_name_available(
             return
         raise RegistryError(
             f"Connection name already exists: {name}. "
-            "Choose another --name or run rsb reconnect with the existing name."
+            "Choose another --name or run codex-rsb reconnect with the existing name."
         )
 
 

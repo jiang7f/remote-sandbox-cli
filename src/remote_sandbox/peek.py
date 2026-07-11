@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import posixpath
 from pathlib import Path
 
-from remote_sandbox.manifest import normalize_relative_path
-from remote_sandbox.marker import WorkspaceMarker, read_local_marker
-from remote_sandbox.scan import read_placeholder_entry
-from remote_sandbox.ssh import SshRunner
+from remote_sandbox._transport_fingerprint import ProtectedLocalRoot
+from remote_sandbox.engine import RemoteReplica
+from remote_sandbox.manifest import EntryFingerprint, EntryKind, normalize_relative_path
+from remote_sandbox.placeholder import decode_placeholder
+from remote_sandbox.state import WorkspaceStore
 
 
 class PeekError(RuntimeError):
@@ -16,60 +16,38 @@ class PeekError(RuntimeError):
 def peek_placeholder(
     *,
     local_root: Path,
-    runner: SshRunner,
+    store: WorkspaceStore,
+    remote: RemoteReplica,
     path: str,
     lines: int,
     tail: bool,
 ) -> bytes:
     if lines <= 0:
         raise PeekError("lines must be positive")
-    marker = _read_marker(local_root)
-    rel_path = normalize_relative_path(path)
-    local_path = _safe_local_path(local_root, rel_path)
+    normalized = normalize_relative_path(path)
+    with ProtectedLocalRoot(local_root) as protected:
+        physical, placeholder_bytes = protected.read_entry(normalized)
+    if not isinstance(physical, EntryFingerprint) or physical.kind is not EntryKind.FILE:
+        raise PeekError(f"not a placeholder: {normalized}")
     try:
-        entry = read_placeholder_entry(
-            local_path,
-            expected_path=rel_path,
-            raise_on_path_mismatch=True,
-            raise_on_invalid_placeholder=True,
-        )
+        metadata = decode_placeholder(placeholder_bytes or b"", expected_path=normalized)
     except ValueError as exc:
         raise PeekError(str(exc)) from exc
-    if entry is None:
-        raise PeekError(f"not a placeholder: {rel_path}")
-    remote_path = _remote_path(marker, entry.path)
-    if runner.is_symlink(marker.binding.target, remote_path):
-        raise PeekError(f"remote path is a symlink: {entry.path}")
-    try:
-        if tail:
-            return runner.read_tail(marker.binding.target, remote_path, lines)
-        return runner.read_head(marker.binding.target, remote_path, lines)
-    except (FileNotFoundError, OSError, ValueError) as exc:
-        raise PeekError(str(exc)) from exc
-
-
-def _read_marker(local_root: Path) -> WorkspaceMarker:
-    marker = read_local_marker(local_root)
-    if marker is None:
-        raise PeekError("current directory is not bound; run rsb connect first")
-    return marker
-
-
-def _remote_path(marker: WorkspaceMarker, path: str) -> str:
-    return posixpath.join(marker.binding.remote_path.rstrip("/") or "/", path)
-
-
-def _safe_local_path(local_root: Path, relative_path: str) -> Path:
-    candidate = local_root / relative_path
-    resolved_root = local_root.resolve()
-    resolved_parent = candidate.parent.resolve()
-    try:
-        resolved_parent.relative_to(resolved_root)
-    except ValueError as exc:
-        raise PeekError(f"path escapes local workspace: {relative_path}") from exc
-    if candidate.exists() or candidate.is_symlink():
-        try:
-            candidate.resolve().relative_to(resolved_root)
-        except ValueError as exc:
-            raise PeekError(f"path escapes local workspace: {relative_path}") from exc
-    return candidate
+    if metadata is None:
+        raise PeekError(f"not a placeholder: {normalized}")
+    base = store.get_base(normalized)
+    if not isinstance(base, EntryFingerprint) or not base.is_placeholder:
+        raise PeekError(f"placeholder base metadata changed: {normalized}")
+    source = remote.hash_paths((normalized,))[normalized]
+    if (
+        not isinstance(source, EntryFingerprint)
+        or source.kind is not EntryKind.FILE
+        or source.content_hash != metadata.content_hash
+        or source.size != metadata.size
+    ):
+        raise PeekError(f"remote placeholder source changed: {normalized}")
+    content = remote.read_path(normalized)
+    if content is None:
+        raise PeekError(f"remote placeholder source is missing: {normalized}")
+    split = content.splitlines(keepends=True)
+    return b"".join(split[-lines:] if tail else split[:lines])

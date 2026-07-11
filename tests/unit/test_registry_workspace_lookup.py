@@ -2,7 +2,6 @@ from pathlib import Path
 
 import pytest
 
-import remote_sandbox.registry as registry_module
 from remote_sandbox.registry import (
     BindingRecord,
     RegistryError,
@@ -147,16 +146,6 @@ def test_current_workspace_does_not_read_in_tree_marker(
             str(local_root),
             "2026-07-10T00:00:00Z",
         ),
-    )
-
-    def fail_marker_read(_local_root: Path) -> None:
-        raise AssertionError("current workspace lookup read an in-tree marker")
-
-    monkeypatch.setattr(
-        registry_module,
-        "read_local_marker",
-        fail_marker_read,
-        raising=False,
     )
 
     record = current_workspace_record(registry, local_root)

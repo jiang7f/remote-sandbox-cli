@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-import hashlib
-import os
-import posixpath
-import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
-from remote_sandbox.lock import WorkspaceLockError, workspace_lock
-from remote_sandbox.manifest import FileEntry, normalize_relative_path
-from remote_sandbox.marker import METADATA_DIR, WorkspaceMarker, read_local_marker
-from remote_sandbox.scan import read_placeholder_entry
-from remote_sandbox.ssh import SshRunner
-from remote_sandbox.state import StateStore
+from remote_sandbox._transport_fingerprint import ProtectedLocalRoot
+from remote_sandbox.engine import RemoteReplica, SyncTransport
+from remote_sandbox.manifest import (
+    EntryFingerprint,
+    EntryKind,
+    MissingEntry,
+    normalize_relative_path,
+)
+from remote_sandbox.placeholder import PlaceholderMetadata, decode_placeholder
+from remote_sandbox.state import WorkspaceStore
+from remote_sandbox.transport import TransferBatch, TransferDirection, TransferItem
 
 
 class FetchError(RuntimeError):
@@ -25,166 +26,121 @@ ConfirmCallback = Callable[[str], bool]
 def fetch_placeholders(
     *,
     local_root: Path,
-    runner: SshRunner,
+    store: WorkspaceStore,
+    remote: RemoteReplica,
+    transport: SyncTransport,
     path: str | None,
     fetch_all: bool,
     confirm: ConfirmCallback,
 ) -> tuple[int, bool]:
-    marker = _read_marker(local_root)
-    placeholders = _select_placeholders(local_root, path=path, fetch_all=fetch_all)
-    if not placeholders:
+    selected = _select_placeholders(local_root, store, path=path, fetch_all=fetch_all)
+    if not selected:
         return 0, False
-    if fetch_all and not confirm(_fetch_all_prompt(placeholders)):
+    if fetch_all and not confirm(_fetch_all_prompt(selected)):
         return 0, True
-    try:
-        with (
-            workspace_lock(local_root),
-            StateStore.open(local_root / METADATA_DIR / "state.sqlite3") as state,
-        ):
-            for entry in placeholders:
-                _ensure_placeholder_still_matches(local_root, entry)
-                remote_path = _remote_path(marker, entry.path)
-                if runner.is_symlink(marker.binding.target, remote_path):
-                    raise FetchError(f"remote path is a symlink: {entry.path}")
-                content = runner.read_bytes(
-                    marker.binding.target,
-                    remote_path,
-                )
-                if entry.hash is not None and hashlib.sha256(content).hexdigest() != entry.hash:
-                    raise FetchError(f"hash mismatch while fetching {entry.path}")
-                _ensure_placeholder_still_matches(local_root, entry)
-                _write_local_bytes_atomic(_safe_local_path(local_root, entry.path), content)
-                state.upsert_base(
-                    FileEntry(
-                        kind=entry.kind,
-                        path=entry.path,
-                        size=entry.size,
-                        mtime=entry.mtime,
-                        hash=entry.hash,
-                        is_placeholder=False,
-                    )
-                )
-    except WorkspaceLockError as exc:
-        raise FetchError(str(exc)) from exc
-    return len(placeholders), False
+
+    remote_entries = remote.hash_paths(item.path for item in selected)
+    items: list[TransferItem] = []
+    for item in selected:
+        source = remote_entries[item.path]
+        if not isinstance(source, EntryFingerprint) or source.kind is not EntryKind.FILE:
+            raise FetchError(f"remote placeholder source is not a regular file: {item.path}")
+        if source.content_hash != item.metadata.content_hash or source.size != item.metadata.size:
+            raise FetchError(f"remote placeholder source changed: {item.path}")
+        items.append(TransferItem(item.path, source, item.physical))
+
+    result = transport.transfer(
+        TransferBatch(TransferDirection.PULL, tuple(items)),
+        lambda _result: None,
+    )
+    expected_paths = tuple(item.path for item in selected)
+    if result.completed != expected_paths:
+        changed = ", ".join(result.changed_during_transfer or expected_paths)
+        raise FetchError(f"placeholder source changed during fetch: {changed}")
+
+    with ProtectedLocalRoot(local_root) as protected:
+        final = {
+            item.path: protected.fingerprint(item.path, with_hash=True) for item in selected
+        }
+    with store.transaction():
+        for item in selected:
+            fingerprint = final[item.path]
+            if isinstance(fingerprint, MissingEntry):
+                raise FetchError(f"fetched placeholder destination is missing: {item.path}")
+            store.upsert_base(fingerprint)
+            store.set_expected_echo("local", fingerprint)
+    return len(selected), False
 
 
-def _ensure_placeholder_still_matches(local_root: Path, expected: FileEntry) -> None:
-    try:
-        current = read_placeholder_entry(
-            _safe_local_path(local_root, expected.path),
-            expected_path=expected.path,
-            raise_on_path_mismatch=True,
-            raise_on_invalid_placeholder=True,
-        )
-    except ValueError as exc:
-        raise FetchError(str(exc)) from exc
-    if current != expected:
-        raise FetchError(f"placeholder changed before fetch completed: {expected.path}")
+def fetch_all_prompt(local_root: Path, store: WorkspaceStore) -> str | None:
+    selected = _select_placeholders(local_root, store, path=None, fetch_all=True)
+    return _fetch_all_prompt(selected) if selected else None
 
 
-def _read_marker(local_root: Path) -> WorkspaceMarker:
-    marker = read_local_marker(local_root)
-    if marker is None:
-        raise FetchError("current directory is not bound; run rsb connect first")
-    return marker
+class _SelectedPlaceholder:
+    __slots__ = ("path", "metadata", "physical")
+
+    def __init__(
+        self,
+        path: str,
+        metadata: PlaceholderMetadata,
+        physical: EntryFingerprint,
+    ) -> None:
+        self.path = path
+        self.metadata = metadata
+        self.physical = physical
 
 
 def _select_placeholders(
     local_root: Path,
+    store: WorkspaceStore,
     *,
     path: str | None,
     fetch_all: bool,
-) -> list[FileEntry]:
-    if fetch_all:
-        return _find_all_placeholders(local_root)
-    if path is None:
+) -> list[_SelectedPlaceholder]:
+    if fetch_all and path is not None:
+        raise FetchError("use either a path or --all, not both")
+    if not fetch_all and path is None:
         raise FetchError("fetch requires a path or --all")
-    rel_path = normalize_relative_path(path)
-    placeholder_path = _safe_local_path(local_root, rel_path)
-    try:
-        entry = read_placeholder_entry(
-            placeholder_path,
-            expected_path=rel_path,
-            raise_on_path_mismatch=True,
-            raise_on_invalid_placeholder=True,
+    with ProtectedLocalRoot(local_root) as protected:
+        candidates = (
+            protected.walk_paths(lambda _path: False)
+            if fetch_all
+            else (normalize_relative_path(path or ""),)
         )
-    except ValueError as exc:
-        raise FetchError(str(exc)) from exc
-    if entry is None:
-        raise FetchError(f"not a placeholder: {rel_path}")
-    return [entry]
+        selected: list[_SelectedPlaceholder] = []
+        for candidate in sorted(candidates):
+            physical, content = protected.read_entry(candidate)
+            if not isinstance(physical, EntryFingerprint) or physical.kind is not EntryKind.FILE:
+                if fetch_all:
+                    continue
+                raise FetchError(f"not a placeholder: {candidate}")
+            try:
+                metadata = decode_placeholder(content or b"", expected_path=candidate)
+            except ValueError as exc:
+                raise FetchError(str(exc)) from exc
+            if metadata is None:
+                if fetch_all:
+                    continue
+                raise FetchError(f"not a placeholder: {candidate}")
+            base = store.get_base(candidate)
+            if (
+                not isinstance(base, EntryFingerprint)
+                or not base.is_placeholder
+                or base.content_hash != metadata.content_hash
+                or base.size != metadata.size
+            ):
+                raise FetchError(f"placeholder base metadata changed: {candidate}")
+            selected.append(_SelectedPlaceholder(candidate, metadata, physical))
+    return selected
 
 
-def _find_all_placeholders(local_root: Path) -> list[FileEntry]:
-    placeholders: list[FileEntry] = []
-    for candidate in sorted(local_root.rglob("*")):
-        if candidate.is_symlink() or not candidate.is_file():
-            continue
-        rel = candidate.relative_to(local_root).as_posix()
-        if rel == METADATA_DIR or rel.startswith(METADATA_DIR + "/"):
-            continue
-        rel = candidate.relative_to(local_root).as_posix()
-        try:
-            entry = read_placeholder_entry(
-                candidate,
-                expected_path=rel,
-                raise_on_path_mismatch=True,
-                raise_on_invalid_placeholder=True,
-            )
-        except ValueError as exc:
-            raise FetchError(str(exc)) from exc
-        if entry is not None:
-            placeholders.append(entry)
-    return placeholders
-
-
-def _fetch_all_prompt(placeholders: list[FileEntry]) -> str:
-    total = sum(entry.size or 0 for entry in placeholders)
+def _fetch_all_prompt(placeholders: list[_SelectedPlaceholder]) -> str:
+    total = sum(item.metadata.size for item in placeholders)
     return (
-        f"This will fetch {len(placeholders)} placeholder files, "
-        f"total {_format_size(total)}.\n"
+        f"This will fetch {len(placeholders)} placeholder files, total {_format_size(total)}.\n"
         "Continue? [y/N] "
     )
-
-
-def _remote_path(marker: WorkspaceMarker, path: str) -> str:
-    return posixpath.join(marker.binding.remote_path.rstrip("/") or "/", path)
-
-
-def _safe_local_path(local_root: Path, relative_path: str) -> Path:
-    candidate = local_root / relative_path
-    resolved_root = local_root.resolve()
-    resolved_parent = candidate.parent.resolve()
-    try:
-        resolved_parent.relative_to(resolved_root)
-    except ValueError as exc:
-        raise FetchError(f"path escapes local workspace: {relative_path}") from exc
-    if candidate.exists() or candidate.is_symlink():
-        try:
-            candidate.resolve().relative_to(resolved_root)
-        except ValueError as exc:
-            raise FetchError(f"path escapes local workspace: {relative_path}") from exc
-    return candidate
-
-
-def _write_local_bytes_atomic(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".remote-sandbox.tmp",
-        dir=path.parent,
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
 
 
 def _format_size(size: int) -> str:

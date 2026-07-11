@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+from dataclasses import fields
+
+import pytest
+
+import remote_sandbox.cli as cli_module
+from remote_sandbox.cli import build_parser
+
+
+def test_parser_exposes_confirmed_commands_and_debug_flag() -> None:
+    parser = build_parser()
+
+    status = parser.parse_args(["--debug", "status", "dq", "--watch"])
+    assert status.debug is True
+    assert status.name == "dq"
+    assert status.watch is True
+    assert parser.parse_args(["conflicts", "dq"]).command == "conflicts"
+    resolved = parser.parse_args(["resolve", "model.py", "--use-local"])
+    assert resolved.use_local is True
+    forgotten = parser.parse_args(["forget", "dq", "--local-only"])
+    assert forgotten.local_only is True
+    no_shell = parser.parse_args(
+        ["connect", "host", "--remote", "/work/dq", "--name", "dq", "--no-shell"]
+    )
+    assert no_shell.no_shell is True
+
+
+def test_resolve_requires_exactly_one_selected_source() -> None:
+    parser = build_parser()
+
+    assert parser.parse_args(["resolve", "model.py", "--use-local"]).use_local
+    assert parser.parse_args(["resolve", "model.py", "--use-remote"]).use_remote
+    with pytest.raises(SystemExit):
+        parser.parse_args(["resolve", "model.py"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["resolve", "model.py", "--use-local", "--use-remote"]
+        )
+
+
+def test_run_preserves_arguments_after_double_dash() -> None:
+    parsed = build_parser().parse_args(
+        ["run", "dq", "--", "python", "-c", "print('--flag')", "--flag"]
+    )
+
+    assert parsed.items == [
+        "dq",
+        "--",
+        "python",
+        "-c",
+        "print('--flag')",
+        "--flag",
+    ]
+
+
+def test_cli_exposes_in_process_service_harness_types() -> None:
+    service_fields = {field.name for field in fields(cli_module.CliServices)}
+    result_fields = {field.name for field in fields(cli_module.CapturedCliResult)}
+
+    assert {"registry", "cwd", "workspace_status", "run_remote"} <= service_fields
+    assert result_fields == {"exit_code", "stdout", "stderr"}
+    assert callable(cli_module.invoke_cli)
+
+
+@pytest.mark.parametrize(
+    "argv,command",
+    [
+        (["list"], "list"),
+        (["set", "placeholder-limit", "10MB"], "set"),
+        (["enter", "host"], "enter"),
+        (["connect", "host", "--remote", "/work/dq"], "connect"),
+        (["reconnect", "dq"], "reconnect"),
+        (["start", "dq"], "start"),
+        (["stop", "dq"], "stop"),
+        (["shell", "dq"], "shell"),
+        (["run", "dq", "--", "true"], "run"),
+        (["fetch", "weights.bin"], "fetch"),
+        (["peek", "weights.bin"], "peek"),
+    ],
+)
+def test_parser_preserves_existing_command_surface(
+    argv: list[str],
+    command: str,
+) -> None:
+    assert build_parser().parse_args(argv).command == command

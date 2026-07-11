@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
-import json
 import os
 import posixpath
 import secrets
@@ -12,13 +10,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
-from remote_sandbox.marker import (
-    METADATA_DIR,
-    WORKSPACE_FILE,
-    WorkspaceMarker,
-    marker_from_toml,
-    marker_to_toml,
-)
 from remote_sandbox.namespace import ssh_control_dir
 
 
@@ -124,11 +115,6 @@ def validate_remote_path(path: str) -> str:
             raise ValueError("Invalid remote path")
         return normalized
     raise ValueError("Invalid remote path")
-
-
-def remote_marker_path(remote_root: str) -> str:
-    base = remote_root.rstrip("/") or "/"
-    return posixpath.join(base, METADATA_DIR, WORKSPACE_FILE)
 
 
 def _control_dir() -> str:
@@ -313,8 +299,6 @@ class FakeSshRunner:
         self.python_file_calls.append((target, normalized, args))
         if args == ("self-check",):
             return "remote-sandbox-agent 0.1.0\n"
-        if args == ("manifest",):
-            return self._manifest_json(target, normalized)
         return "ok\n"
 
     def run_command(self, target: str, cwd: str, argv: tuple[str, ...]) -> CommandResult:
@@ -377,84 +361,10 @@ class FakeSshRunner:
         self.shell_barrier_callbacks.append(on_barrier)
         return 0
 
-    def read_marker(self, target: str, remote_root: str) -> WorkspaceMarker:
-        return marker_from_toml(self.read_text(target, remote_marker_path(remote_root)))
-
-    def write_marker(
-        self,
-        target: str,
-        remote_root: str,
-        marker: WorkspaceMarker,
-    ) -> None:
-        self.write_text_atomic(target, remote_marker_path(remote_root), marker_to_toml(marker))
-
-    def remove_marker(self, target: str, remote_root: str) -> None:
-        self.files.pop((target, _normalize_remote_path(remote_marker_path(remote_root))), None)
-
     def _maybe_fail(self, operation: str, path: str) -> None:
         key = (operation, _normalize_remote_path(path))
         if operation in self.fail_operations or key in self.fail_on:
             raise SshError(f"Injected failure for {operation} {path}")
-
-    def _manifest_json(self, target: str, agent_path: str) -> str:
-        root = _workspace_root_from_agent_path(agent_path)
-        root_prefix = root.rstrip("/") + "/"
-        paths: set[str] = set()
-        entries: list[dict[str, object]] = []
-        for item_target, item_path in sorted(self.dirs):
-            if item_target != target or item_path == root or not item_path.startswith(root_prefix):
-                continue
-            rel = item_path[len(root_prefix) :]
-            if _fake_manifest_ignored(rel):
-                continue
-            paths.add(rel)
-            entries.append(
-                {
-                    "kind": "dir",
-                    "path": rel,
-                    "size": None,
-                    "mtime": None,
-                    "hash": None,
-                    "is_placeholder": False,
-                }
-            )
-        merged_files: dict[tuple[str, str], bytes] = {}
-        for key, content in self.files.items():
-            merged_files[key] = content.encode("utf-8")
-        merged_files.update(self.binary_files)
-        for (item_target, item_path), file_content in sorted(merged_files.items()):
-            if item_target != target or not item_path.startswith(root_prefix):
-                continue
-            rel = item_path[len(root_prefix) :]
-            if _fake_manifest_ignored(rel):
-                continue
-            parent = posixpath.dirname(rel)
-            while parent and parent not in paths:
-                paths.add(parent)
-                entries.append(
-                    {
-                        "kind": "dir",
-                        "path": parent,
-                        "size": None,
-                        "mtime": None,
-                        "hash": None,
-                        "is_placeholder": False,
-                    }
-                )
-                parent = posixpath.dirname(parent)
-            entries.append(
-                {
-                    "kind": "file",
-                    "path": rel,
-                    "size": len(file_content),
-                    "mtime": None,
-                    "hash": hashlib.sha256(file_content).hexdigest(),
-                    "is_placeholder": False,
-                }
-            )
-        entries.sort(key=lambda item: str(item["path"]))
-        return json.dumps({"entries": entries}, separators=(",", ":")) + "\n"
-
 
 class SubprocessSshRunner:
     timeout_s = 30.0
@@ -964,18 +874,6 @@ def _normalize_workspace_relative(path: str) -> str:
     if normalized in {"", ".", ".."} or normalized.startswith("/") or normalized.startswith("../"):
         raise ValueError("Invalid workspace relative path")
     return normalized
-
-
-def _workspace_root_from_agent_path(agent_path: str) -> str:
-    suffix = "/.remote-sandbox/agent/agent.py"
-    if not agent_path.endswith(suffix):
-        raise SshError(f"Invalid agent path: {agent_path}")
-    root = agent_path[: -len(suffix)]
-    return root or "/"
-
-
-def _fake_manifest_ignored(path: str) -> bool:
-    return path == ".remote-sandbox" or path.startswith(".remote-sandbox/")
 
 
 def _has_control_char(value: str) -> bool:

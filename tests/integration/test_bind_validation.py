@@ -62,7 +62,7 @@ def test_two_unrelated_non_empty_trees_are_rejected_before_metadata_commit(
     assert not any(".remote-sandbox" in path for _target, path in runner.dirs)
 
 
-def test_bind_writes_only_external_metadata_and_never_runs_legacy_sync(
+def test_bind_writes_only_external_metadata(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -76,10 +76,6 @@ def test_bind_writes_only_external_metadata_and_never_runs_legacy_sync(
         lambda *args, **kwargs: None,
     )
 
-    def fail_sync(*args: object, **kwargs: object) -> None:
-        raise AssertionError("legacy sync was called")
-
-    monkeypatch.setattr(bind_module, "SyncSession", fail_sync, raising=False)
     result = bind_workspace(
         target="host",
         remote="/work/remote",

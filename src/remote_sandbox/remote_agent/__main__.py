@@ -173,7 +173,19 @@ def _handle_stop(payload: dict[str, Any]) -> dict[str, object]:
     workspace_id = validate_workspace_id(_expect_string(payload, "workspace_id"))
     home = _remote_home()
     with _exclusive_lock(_workspace_lock_path(workspace_id)):
-        entry = _lookup_workspace(home, workspace_id)
+        try:
+            entry = _lookup_workspace(home, workspace_id)
+        except LookupError:
+            return {
+                "workspace_id": workspace_id,
+                "pid": None,
+                "status": "stopped",
+                "backend": None,
+                "started_at": None,
+                "heartbeat_at": None,
+                "error": None,
+                "already_forgotten": True,
+            }
         with RemoteStore(entry.state_path) as store:
             _require_workspace(store, entry)
             current = store.watcher_state()
@@ -557,7 +569,14 @@ def _handle_forget(payload: dict[str, Any]) -> dict[str, object]:
         _exclusive_lock(_index_lock_path()),
         _exclusive_lock(_workspace_lock_path(workspace_id)),
     ):
-        entry = _lookup_workspace(home, workspace_id)
+        try:
+            entry = _lookup_workspace(home, workspace_id)
+        except LookupError:
+            return {
+                "workspace_id": workspace_id,
+                "forgotten": True,
+                "already_forgotten": True,
+            }
         metadata = entry.state_path.parent
         with RemoteStore(entry.state_path) as store:
             _require_workspace(store, entry)

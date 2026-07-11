@@ -14,10 +14,8 @@ from typing import Any
 
 from remote_sandbox.journal import EventKind, JournalEvent
 from remote_sandbox.manifest import (
-    MISSING,
     EntryFingerprint,
     EntryKind,
-    EntryState,
     FileEntry,
     MissingEntry,
     normalize_relative_path,
@@ -910,51 +908,6 @@ class WorkspaceStore:
         )
 
 
-class StateStore:
-    """Compatibility adapter for the legacy full-scan synchronizer."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._store = WorkspaceStore.open(path)
-
-    @classmethod
-    def open(cls, path: Path) -> StateStore:
-        return cls(path)
-
-    def __enter__(self) -> StateStore:
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        del exc_type, exc, tb
-        self.close()
-
-    def close(self) -> None:
-        self._store.close()
-
-    def get_base(self, path: str) -> EntryState:
-        entry = self._store.get_base(path)
-        if isinstance(entry, MissingEntry):
-            return MISSING
-        return _fingerprint_to_legacy_entry(entry)
-
-    def upsert_base(self, entry: FileEntry) -> None:
-        self._store.upsert_base(_legacy_entry_to_fingerprint(entry))
-
-    def delete_base(self, path: str) -> None:
-        self._store.delete_base(path)
-
-    def list_base(self) -> dict[str, FileEntry]:
-        return {
-            path: _fingerprint_to_legacy_entry(entry)
-            for path, entry in self._store.list_base().items()
-        }
-
-
 def _journal_event_from_row(row: sqlite3.Row) -> JournalEvent:
     destination = _optional_str(row["destination_path"], "event destination")
     return JournalEvent(
@@ -1232,17 +1185,5 @@ def _legacy_entry_to_fingerprint(entry: FileEntry) -> EntryFingerprint:
         mtime_ns,
         modes[entry.kind],
         content_hash=entry.hash,
-        is_placeholder=entry.is_placeholder,
-    )
-
-
-def _fingerprint_to_legacy_entry(entry: EntryFingerprint) -> FileEntry:
-    mtime = None if entry.mtime_ns is None else entry.mtime_ns / 1_000_000_000
-    return FileEntry(
-        kind=entry.kind,
-        path=entry.path,
-        size=entry.size,
-        mtime=mtime,
-        hash=entry.content_hash,
         is_placeholder=entry.is_placeholder,
     )

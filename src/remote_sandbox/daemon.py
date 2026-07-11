@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import socket
 import tempfile
 import threading
@@ -18,7 +19,9 @@ from pathlib import Path
 from typing import BinaryIO, Literal, Protocol, cast
 
 from remote_sandbox.agent import RemoteAgentManager
+from remote_sandbox.conflicts import resolve_conflict_transaction
 from remote_sandbox.engine import SyncEngine
+from remote_sandbox.fetch import fetch_placeholders
 from remote_sandbox.initial_sync import InitialSyncCoordinator
 from remote_sandbox.journal import EventKind, JournalEvent
 from remote_sandbox.namespace import runtime_dir
@@ -43,6 +46,7 @@ _STOP_TIMEOUT_S = 10.0
 _CONTROL_REQUEST_TIMEOUT_S = 2.0
 _CONTROL_MAX_LINE_BYTES = 64 * 1024
 _MAX_BACKOFF_S = 30.0
+_MUTATION_TIMEOUT_S = 3600.0
 
 
 class DaemonError(RuntimeError):
@@ -121,6 +125,16 @@ class _ProductionComponents:
     engine: _IncrementalEngine
     initial_sync: _InitialSync
     local_watcher: LocalEventWatcher
+    mutation_handler: Callable[[str, dict[str, object]], dict[str, object]]
+
+
+@dataclass(slots=True)
+class _MutationRequest:
+    kind: str
+    payload: dict[str, object]
+    completed: threading.Event
+    result: dict[str, object] | None = None
+    error: BaseException | None = None
 
 
 class _SupervisorControlServer:
@@ -131,6 +145,7 @@ class _SupervisorControlServer:
         on_sync: Callable[[], None],
         on_resume: Callable[[], None],
         on_stop: Callable[[], None],
+        on_mutation: Callable[[str, dict[str, object]], dict[str, object]],
         status: Callable[[], DaemonStatus],
         log: logging.Logger,
     ) -> None:
@@ -138,6 +153,7 @@ class _SupervisorControlServer:
         self._on_sync = on_sync
         self._on_resume = on_resume
         self._on_stop = on_stop
+        self._on_mutation = on_mutation
         self._status = status
         self._log = log
         self._sock: socket.socket | None = None
@@ -189,6 +205,22 @@ class _SupervisorControlServer:
                     elif verb == "stop":
                         _send_line(connection, "ok")
                         self._on_stop()
+                    elif verb == "mutate":
+                        raw_payload = request.partition(" ")[2]
+                        decoded = json.loads(raw_payload)
+                        if not isinstance(decoded, dict):
+                            raise ValueError("mutation request must be an object")
+                        kind = decoded.get("kind")
+                        mutation_payload: object = decoded.get("payload")
+                        if not isinstance(kind, str) or not isinstance(mutation_payload, dict):
+                            raise ValueError("mutation request is malformed")
+                        try:
+                            result = self._on_mutation(kind, mutation_payload)
+                        except Exception as exc:
+                            response = {"ok": False, "error": " ".join(str(exc).split())}
+                        else:
+                            response = {"ok": True, "result": result}
+                        _send_line(connection, json.dumps(response, separators=(",", ":")))
                     else:
                         _send_line(connection, "error")
                 except Exception as exc:  # pragma: no cover - defensive boundary
@@ -214,6 +246,7 @@ class WorkspaceSupervisor:
         engine: _IncrementalEngine | None = None,
         local_watcher: LocalEventWatcher | None = None,
         component_factory: Callable[[threading.Event], _ProductionComponents] | None = None,
+        mutation_handler: Callable[[str, dict[str, object]], dict[str, object]] | None = None,
         close_store: bool = False,
     ) -> None:
         self.runtime = runtime
@@ -223,6 +256,8 @@ class WorkspaceSupervisor:
         self.engine = engine
         self.local_watcher = local_watcher
         self._component_factory = component_factory
+        self._mutation_handler = mutation_handler
+        self._mutations: queue.Queue[_MutationRequest] = queue.Queue()
         self._close_store = close_store
         self._stop_event = threading.Event()
         self._sync_requested = threading.Event()
@@ -242,6 +277,7 @@ class WorkspaceSupervisor:
             on_sync=self.request_sync,
             on_resume=self.resume,
             on_stop=self.stop,
+            on_mutation=self.request_mutation,
             status=self._status,
             log=self._log,
         )
@@ -324,6 +360,22 @@ class WorkspaceSupervisor:
     def request_sync(self) -> None:
         self._sync_requested.set()
 
+    def request_mutation(
+        self,
+        kind: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        if not kind or self._mutation_handler is None:
+            raise DaemonError("supervisor mutation is unavailable")
+        request = _MutationRequest(kind, payload, threading.Event())
+        self._mutations.put(request)
+        self._sync_requested.set()
+        if not request.completed.wait(timeout=_MUTATION_TIMEOUT_S):
+            raise DaemonError(f"supervisor mutation timed out: {kind}")
+        if request.error is not None:
+            raise DaemonError(str(request.error)) from request.error
+        return request.result or {}
+
     def resume(self) -> None:
         self._requires_foreground_auth = False
         self._resume_requested.set()
@@ -379,6 +431,7 @@ class WorkspaceSupervisor:
         self.engine = components.engine
         self.initial_sync = components.initial_sync
         self.local_watcher = components.local_watcher
+        self._mutation_handler = components.mutation_handler
 
     def _initialize_workspace(self) -> bool:
         while not self._stop_event.is_set():
@@ -427,6 +480,7 @@ class WorkspaceSupervisor:
                 delay = self.handle_subscription_failure(failure)
                 retry_at = None if delay is None else time.monotonic() + delay
                 continue
+            self._run_pending_mutations()
             if self._requires_foreground_auth and not self._resume_requested.is_set():
                 continue
             self._resume_requested.clear()
@@ -443,6 +497,20 @@ class WorkspaceSupervisor:
             except Exception as exc:
                 delay = self.handle_subscription_failure(exc)
                 retry_at = None if delay is None else time.monotonic() + delay
+
+    def _run_pending_mutations(self) -> None:
+        while True:
+            try:
+                request = self._mutations.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                assert self._mutation_handler is not None
+                request.result = self._mutation_handler(request.kind, request.payload)
+            except BaseException as exc:
+                request.error = exc
+            finally:
+                request.completed.set()
 
     def _start_subscription(self) -> None:
         if self.remote is None:
@@ -633,10 +701,31 @@ class SupervisorClient:
     def resume(self) -> bool:
         return self._request("resume") is not None
 
-    def _request(self, message: str) -> str | None:
+    def mutate(self, kind: str, payload: dict[str, object]) -> dict[str, object]:
+        if not isinstance(kind, str) or not kind:
+            raise ValueError("mutation kind must not be empty")
+        request = json.dumps(
+            {"kind": kind, "payload": payload},
+            separators=(",", ":"),
+        )
+        reply = self._request(f"mutate {request}", timeout=_MUTATION_TIMEOUT_S)
+        if reply is None:
+            raise DaemonError("supervisor mutation endpoint is unresponsive")
+        decoded = json.loads(reply)
+        if not isinstance(decoded, dict) or type(decoded.get("ok")) is not bool:
+            raise DaemonError("supervisor mutation response is malformed")
+        if not decoded["ok"]:
+            error = decoded.get("error")
+            raise DaemonError(error if isinstance(error, str) else "supervisor mutation failed")
+        result = decoded.get("result")
+        if not isinstance(result, dict):
+            raise DaemonError("supervisor mutation result is malformed")
+        return cast(dict[str, object], result)
+
+    def _request(self, message: str, *, timeout: float = _CONTROL_REQUEST_TIMEOUT_S) -> str | None:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(_CONTROL_REQUEST_TIMEOUT_S)
+                sock.settimeout(timeout)
                 sock.connect(str(self.runtime.socket))
                 _send_line(sock, message)
                 reply = _recv_line(sock).strip()
@@ -845,7 +934,46 @@ def _build_supervisor(
             start_local_watcher=start_local_watcher,
             placeholder_limit=load_settings().placeholder_limit,
         )
-        return _ProductionComponents(remote, engine, initial, watcher)
+
+        def mutate(kind: str, payload: dict[str, object]) -> dict[str, object]:
+            if kind == "resolve":
+                if set(payload) != {"path", "use_local"}:
+                    raise ValueError("resolve mutation payload is malformed")
+                path = payload["path"]
+                use_local = payload["use_local"]
+                if not isinstance(path, str) or type(use_local) is not bool:
+                    raise ValueError("resolve mutation payload is malformed")
+                resolved = resolve_conflict_transaction(
+                    store=store,
+                    local_root=local_root,
+                    remote=remote,
+                    transport=transport,
+                    path=path,
+                    use_local=use_local,
+                )
+                return {"path": resolved.path, "conflict_id": resolved.conflict_id}
+            if kind == "fetch":
+                if set(payload) != {"path", "fetch_all"}:
+                    raise ValueError("fetch mutation payload is malformed")
+                path = payload["path"]
+                fetch_all = payload["fetch_all"]
+                if path is not None and not isinstance(path, str):
+                    raise ValueError("fetch mutation payload is malformed")
+                if type(fetch_all) is not bool:
+                    raise ValueError("fetch mutation payload is malformed")
+                count, cancelled = fetch_placeholders(
+                    local_root=local_root,
+                    store=store,
+                    remote=remote,
+                    transport=transport,
+                    path=path,
+                    fetch_all=fetch_all,
+                    confirm=lambda _prompt: True,
+                )
+                return {"count": count, "cancelled": cancelled}
+            raise ValueError(f"unsupported supervisor mutation: {kind}")
+
+        return _ProductionComponents(remote, engine, initial, watcher, mutate)
 
     return WorkspaceSupervisor(
         runtime,

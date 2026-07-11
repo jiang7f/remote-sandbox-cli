@@ -3,16 +3,26 @@ from pathlib import Path
 
 import pytest
 from helpers.sync_harness import (
+    CliHarness,
     DaemonPairHarness,
     FakePtyBackendHarness,
     InitialPairHarness,
     PromptShellHarness,
     SyncPair,
+    make_cli_harness,
     make_daemon_pair,
     make_initial_pair,
     make_prompt_shell_harness,
     make_sync_pair,
 )
+
+
+@pytest.fixture
+def cli_fixture(tmp_path: Path) -> Iterator[CliHarness]:
+    harness = make_cli_harness(tmp_path)
+    yield harness
+    harness.store.close()
+    harness.pair.remote_client.close()
 
 
 @pytest.fixture

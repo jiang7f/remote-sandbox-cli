@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
 import secrets
 import shutil
 import sys
+import time
+import traceback
 import unicodedata
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
-from remote_sandbox.bind import BindError, bind_workspace
+from remote_sandbox.agent import RemoteAgentManager
+from remote_sandbox.bind import bind_workspace
 from remote_sandbox.daemon import (
     DaemonError,
     StopResult,
+    SupervisorClient,
+    SupervisorRuntime,
     daemon_control_status,
     daemon_status,
     ensure_daemon,
@@ -20,9 +30,9 @@ from remote_sandbox.daemon import (
     stop_daemon_result,
     wait_for_daemon_control,
 )
-from remote_sandbox.fetch import FetchError, fetch_placeholders
-from remote_sandbox.marker import METADATA_DIR, read_local_marker, remove_local_metadata
-from remote_sandbox.peek import PeekError, peek_placeholder
+from remote_sandbox.fetch import fetch_all_prompt
+from remote_sandbox.namespace import runtime_dir
+from remote_sandbox.peek import peek_placeholder
 from remote_sandbox.registry import (
     BindingRecord,
     RegistryError,
@@ -32,9 +42,10 @@ from remote_sandbox.registry import (
     list_binding_records,
     registry_path,
 )
+from remote_sandbox.remote_agent import AGENT_VERSION
+from remote_sandbox.remote_client import RemoteWorkspaceClient
 from remote_sandbox.resources import ProbeResult, probe_target_resources
 from remote_sandbox.settings import (
-    SettingsError,
     format_size_compact,
     load_settings,
     set_placeholder_limit,
@@ -47,32 +58,487 @@ from remote_sandbox.shell import (
     ReadyProbeResult,
     enter_shell_loop,
 )
-from remote_sandbox.ssh import SshError, SubprocessSshRunner
+from remote_sandbox.ssh import SubprocessSshRunner
 from remote_sandbox.ssh_config import SshHost, load_configured_hosts
-from remote_sandbox.sync import SyncExecutionError
-from remote_sandbox.syncsession import SyncSession
+from remote_sandbox.state import ConflictRecord, WorkspaceStore
+from remote_sandbox.status import WorkspaceStatus
+from remote_sandbox.transport import BatchTransport
+from remote_sandbox.workspace import read_workspace_spec, workspace_paths
 
-CLI_ERRORS = (
-    BindError,
-    FetchError,
-    PeekError,
-    RegistryError,
-    SettingsError,
-    SshError,
-    SyncExecutionError,
-    DaemonError,
-    OSError,
-    ValueError,
-)
+
+@dataclass(frozen=True, slots=True)
+class RemoteCommandResult:
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+@dataclass(slots=True)
+class CliServices:
+    registry: Path
+    cwd: Callable[[], Path]
+    list_records: Callable[[Path], list[BindingRecord]]
+    find_record: Callable[[str, Path], BindingRecord | None]
+    current_record: Callable[[Path, Path], BindingRecord | None]
+    workspace_status: Callable[[BindingRecord], WorkspaceStatus]
+    daemon_status: Callable[[BindingRecord], object]
+    ensure_supervisor: Callable[[BindingRecord], object]
+    request_sync: Callable[[BindingRecord], bool]
+    run_remote: Callable[[BindingRecord, tuple[str, ...]], RemoteCommandResult]
+    connect_workspace: Callable[[str, str, Path, str | None], BindingRecord]
+    fetch_placeholders: Callable[
+        [BindingRecord, str | None, bool, Callable[[str], bool]],
+        tuple[int, bool],
+    ]
+    peek_placeholder: Callable[[BindingRecord, str, int, bool], bytes]
+    list_conflicts: Callable[[BindingRecord], list[ConflictRecord]]
+    resolve_conflict: Callable[[BindingRecord, str, bool], None]
+    stop_local_supervisor: Callable[[BindingRecord], None]
+    stop_remote_watcher: Callable[[BindingRecord], None]
+    delete_remote_workspace: Callable[[BindingRecord], None]
+    prune_remote_agent: Callable[[BindingRecord], None]
+    delete_local_workspace: Callable[[BindingRecord], None]
+    delete_registry_record: Callable[[BindingRecord], None]
+    watch_sleep: Callable[[float], None] = time.sleep
+    watch_limit: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CapturedCliResult:
+    exit_code: int
+    stdout: str
+    stderr: str
+
+
+def invoke_cli(argv: list[str], *, services: CliServices) -> CapturedCliResult:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        try:
+            exit_code = _dispatch_services(build_parser().parse_args(argv), services)
+        except Exception as exc:
+            debug = "--debug" in argv
+            if debug:
+                traceback.print_exc()
+            else:
+                print(f"codex-rsb: {_one_line(str(exc), max_len=500)}", file=sys.stderr)
+            exit_code = 2
+    return CapturedCliResult(exit_code, stdout.getvalue(), stderr.getvalue())
+
+
+_DEFAULT_IGNORE_CONTENT = """# Common generated content that stays local.
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+
+# Git metadata is always local-only and cannot be re-enabled.
+"""
+
+
+def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
+    if args.command == "init":
+        policy_path = services.cwd() / ".rsbignore"
+        if not policy_path.exists():
+            policy_path.write_text(_DEFAULT_IGNORE_CONTENT, encoding="utf-8")
+            print(f"Initialized {policy_path}")
+        else:
+            print(f"Already initialized {policy_path}")
+        return 0
+
+    if args.command == "status":
+        records = services.list_records(services.registry)
+        if args.name is not None:
+            record = services.find_record(args.name, services.registry)
+            if record is None:
+                raise RegistryError(f"no connection named {args.name!r}")
+            records = [record]
+        if not records:
+            print("No bound workspaces")
+            return 0
+        iteration = 0
+        while True:
+            if iteration:
+                print("\x1b[H\x1b[2J", end="")
+            print(_service_status_table(records, services))
+            iteration += 1
+            if not args.watch or (
+                services.watch_limit is not None and iteration >= services.watch_limit
+            ):
+                break
+            try:
+                services.watch_sleep(1.0)
+            except KeyboardInterrupt:
+                break
+        return 0
+
+    if args.command == "run":
+        name, command = _parse_run_items(args.items)
+        record = _service_record(services, name)
+        services.ensure_supervisor(record)
+        result = services.run_remote(record, tuple(command))
+        if result.stdout:
+            sys.stdout.write(result.stdout)
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+        try:
+            if not services.request_sync(record):
+                raise DaemonError("supervisor did not accept the sync request")
+        except Exception as exc:
+            if args.debug:
+                traceback.print_exc()
+            else:
+                print(
+                    "codex-rsb: sync after run failed: "
+                    + _one_line(str(exc), max_len=500),
+                    file=sys.stderr,
+                )
+        return result.returncode
+
+    if args.command == "connect" and args.no_shell:
+        record = services.connect_workspace(
+            args.target,
+            args.remote,
+            Path(args.local),
+            args.name,
+        )
+        services.ensure_supervisor(record)
+        status = services.workspace_status(record)
+        if status.phase.value in {"failed", "stopped"}:
+            raise DaemonError(status.last_error or "workspace supervisor failed to start")
+        print(
+            f"Connected {record.name}: {record.target}:{record.remote_path} "
+            f"<-> {record.local_path}"
+        )
+        print("The initial sync continues in background.")
+        print(f"Watch progress with `codex-rsb status {record.name} --watch`.")
+        return 0
+
+    if args.command == "fetch":
+        record = _service_record(services, None)
+        count, cancelled = services.fetch_placeholders(
+            record,
+            args.path,
+            args.all,
+            confirm_prompt,
+        )
+        if count:
+            noun = "file" if count == 1 else "files"
+            print(f"Fetched {count} placeholder {noun}")
+        elif cancelled:
+            print("Fetch cancelled")
+        else:
+            print("No placeholders found")
+        return 0
+
+    if args.command == "peek":
+        record = _service_record(services, None)
+        content = services.peek_placeholder(
+            record,
+            args.path,
+            args.tail if args.tail is not None else args.lines,
+            args.tail is not None,
+        )
+        sys.stdout.write(content.decode("utf-8", errors="surrogateescape"))
+        return 0
+
+    if args.command == "conflicts":
+        record = _service_record(services, args.name)
+        paths = [
+            conflict.path
+            for conflict in services.list_conflicts(record)
+        ]
+        if not paths:
+            print(f"No unresolved conflicts for {record.name}")
+        else:
+            print("\n".join(paths))
+        return 0
+
+    if args.command == "resolve":
+        record = _service_record(services, None)
+        services.resolve_conflict(record, args.path, bool(args.use_local))
+        source = "local" if args.use_local else "remote"
+        print(f"Resolved {args.path} using {source}")
+        return 0
+
+    if args.command == "forget":
+        record = services.find_record(args.name, services.registry)
+        if record is None:
+            print(f"Connection {args.name} is already forgotten")
+            return 0
+        services.stop_local_supervisor(record)
+        if args.local_only:
+            services.delete_local_workspace(record)
+            services.delete_registry_record(record)
+            residue = f"~/.codex-remote-sandbox/workspaces/{record.workspace_id}"
+            print(f"Forgot {record.name} locally. Remote residue remains at {residue}")
+            return 0
+        services.stop_remote_watcher(record)
+        services.delete_remote_workspace(record)
+        services.prune_remote_agent(record)
+        services.delete_local_workspace(record)
+        services.delete_registry_record(record)
+        print(f"Forgot connection {record.name}")
+        return 0
+
+    raise ValueError(f"command service is not implemented: {args.command}")
+
+
+def _service_record(services: CliServices, name: str | None) -> BindingRecord:
+    if name is not None:
+        record = services.find_record(name, services.registry)
+    else:
+        record = services.current_record(services.registry, services.cwd())
+    if record is None:
+        if name is not None:
+            raise RegistryError(f"no connection named {name!r}")
+        raise RegistryError("current directory is not bound; pass a connection name")
+    return record
+
+
+def _service_status_table(records: list[BindingRecord], services: CliServices) -> str:
+    rows: list[list[str]] = []
+    guidance: list[str] = []
+    for record in records:
+        status = services.workspace_status(record)
+        rows.append(
+            [
+                record.name,
+                status.phase.value,
+                status.progress.stage,
+                str(status.pending),
+                str(status.conflicts),
+                _one_line(status.last_error or "", max_len=100),
+            ]
+        )
+        if status.phase.value == "disconnected":
+            guidance.append(
+                f"{record.name} is disconnected. Run `codex-rsb reconnect {record.name}` "
+                "in the foreground to re-enter authentication."
+            )
+    table = _format_table(
+        ["NAME", "PHASE", "PROGRESS", "PENDING", "CONFLICTS", "ERROR"],
+        rows,
+    )
+    return table if not guidance else table + "\n\n" + "\n".join(guidance)
+
+
+def default_cli_services() -> CliServices:
+    registry = registry_path()
+
+    def status_for(record: BindingRecord) -> WorkspaceStatus:
+        from remote_sandbox.daemon import daemon_workspace_status
+
+        return daemon_workspace_status(record.workspace_id)
+
+    def ensure_supervisor(record: BindingRecord) -> object:
+        local_root = _require_live_workspace(record)
+        status = ensure_daemon(local_root)
+        if status.phase.value == "starting":
+            status = wait_for_daemon_control(local_root, 5.0)
+        return status
+
+    def request_sync(record: BindingRecord) -> bool:
+        return poke_daemon(Path(record.local_path), "cli")
+
+    def run_remote(
+        record: BindingRecord,
+        argv: tuple[str, ...],
+    ) -> RemoteCommandResult:
+        runner = _connected_runner(record.target)
+        result = runner.run_command(record.target, record.remote_path, argv)
+        return RemoteCommandResult(result.returncode, result.stdout, result.stderr)
+
+    def connect_workspace(
+        target: str,
+        remote: str,
+        local: Path,
+        name: str | None,
+    ) -> BindingRecord:
+        result = bind_workspace(
+            target=target,
+            remote=remote,
+            local=local,
+            runner=_connected_runner(target),
+            confirm=confirm_prompt,
+            connection_name=name,
+        )
+        return result.connection
+
+    def list_conflicts(record: BindingRecord) -> list[ConflictRecord]:
+        with WorkspaceStore.open(workspace_paths(record.workspace_id).state_db) as store:
+            return store.list_conflicts(unresolved_only=True)
+
+    def resolve_conflict(record: BindingRecord, path: str, use_local: bool) -> None:
+        ensure_supervisor(record)
+        _supervisor_client(record).mutate(
+            "resolve",
+            {"path": path, "use_local": use_local},
+        )
+
+    def fetch_registered(
+        record: BindingRecord,
+        path: str | None,
+        fetch_all: bool,
+        confirm: Callable[[str], bool],
+    ) -> tuple[int, bool]:
+        if fetch_all:
+            with WorkspaceStore.open(workspace_paths(record.workspace_id).state_db) as store:
+                prompt = fetch_all_prompt(Path(record.local_path), store)
+            if prompt is None:
+                return 0, False
+            if not confirm(prompt):
+                return 0, True
+        ensure_supervisor(record)
+        result = _supervisor_client(record).mutate(
+            "fetch",
+            {"path": path, "fetch_all": fetch_all},
+        )
+        count = result.get("count")
+        cancelled = result.get("cancelled")
+        if type(count) is not int or type(cancelled) is not bool:
+            raise DaemonError("supervisor fetch result is malformed")
+        return count, cancelled
+
+    def peek_registered(
+        record: BindingRecord,
+        path: str,
+        lines: int,
+        tail: bool,
+    ) -> bytes:
+        runner, remote, _transport = _production_remote_components(record)
+        del runner
+        try:
+            with WorkspaceStore.open(workspace_paths(record.workspace_id).state_db) as store:
+                return peek_placeholder(
+                    local_root=Path(record.local_path),
+                    store=store,
+                    remote=remote,
+                    path=path,
+                    lines=lines,
+                    tail=tail,
+                )
+        finally:
+            remote.close()
+
+    def stop_local(record: BindingRecord) -> None:
+        result = stop_daemon_result(Path(record.local_path))
+        if result is StopResult.TIMEOUT:
+            raise DaemonError(f"supervisor for {record.name} did not stop")
+
+    def stop_remote(record: BindingRecord) -> None:
+        _with_remote_client(record, lambda client: client.stop_watcher())
+
+    def delete_remote(record: BindingRecord) -> None:
+        _with_remote_client(record, lambda client: client.forget())
+
+    def prune_remote(record: BindingRecord) -> None:
+        others = [
+            candidate
+            for candidate in list_binding_records(registry)
+            if candidate.workspace_id != record.workspace_id and candidate.target == record.target
+        ]
+        if others:
+            return
+        runner = _connected_runner(record.target)
+        runner.delete_path(
+            record.target,
+            f"~/.codex-remote-sandbox/agents/{AGENT_VERSION}/agent.pyz",
+        )
+
+    def delete_local(record: BindingRecord) -> None:
+        shutil.rmtree(workspace_paths(record.workspace_id).root, ignore_errors=True)
+
+    def delete_registry(record: BindingRecord) -> None:
+        delete_binding_record(record.name, registry)
+
+    return CliServices(
+        registry=registry,
+        cwd=Path.cwd,
+        list_records=lambda path: list_binding_records(path),
+        find_record=lambda name, path: find_binding_record(name, path),
+        current_record=lambda path, cwd: current_workspace_record(path, cwd),
+        workspace_status=status_for,
+        daemon_status=lambda record: daemon_status(Path(record.local_path)),
+        ensure_supervisor=ensure_supervisor,
+        request_sync=request_sync,
+        run_remote=run_remote,
+        connect_workspace=connect_workspace,
+        fetch_placeholders=fetch_registered,
+        peek_placeholder=peek_registered,
+        list_conflicts=list_conflicts,
+        resolve_conflict=resolve_conflict,
+        stop_local_supervisor=stop_local,
+        stop_remote_watcher=stop_remote,
+        delete_remote_workspace=delete_remote,
+        prune_remote_agent=prune_remote,
+        delete_local_workspace=delete_local,
+        delete_registry_record=delete_registry,
+    )
+
+
+def _production_remote_components(
+    record: BindingRecord,
+) -> tuple[SubprocessSshRunner, RemoteWorkspaceClient, BatchTransport]:
+    runner = _connected_runner(record.target)
+    remote = RemoteWorkspaceClient(
+        cast(Any, runner),
+        target=record.target,
+        workspace_id=record.workspace_id,
+        agent_manager=RemoteAgentManager(runner),
+    )
+    remote.ensure_agent()
+    transport = BatchTransport(
+        Path(record.local_path),
+        record.target,
+        record.remote_path,
+        remote,
+        runner=runner,
+    )
+    return runner, remote, transport
+
+
+def _supervisor_client(record: BindingRecord) -> SupervisorClient:
+    paths = workspace_paths(record.workspace_id)
+    return SupervisorClient(
+        SupervisorRuntime(
+            record.workspace_id,
+            paths.root,
+            runtime_dir() / "supervisors",
+        )
+    )
+
+
+def _with_remote_client(
+    record: BindingRecord,
+    operation: Callable[[RemoteWorkspaceClient], object],
+) -> object:
+    _runner, remote, _transport = _production_remote_components(record)
+    try:
+        return operation(remote)
+    finally:
+        remote.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=_program_name())
+    parser = argparse.ArgumentParser(prog="codex-rsb")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show a traceback when a command fails",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("init", help="Write the default .rsbignore file")
 
     subparsers.add_parser("list", help="List SSH-configured servers")
 
-    subparsers.add_parser("status", help="List local workspace bindings")
+    status = subparsers.add_parser("status", help="List local workspace bindings")
+    status.add_argument("name", nargs="?", help="Connection name; defaults to all workspaces")
+    status.add_argument("--watch", action="store_true", help="Refresh the status table")
 
     start = subparsers.add_parser("start", help="Start the sync daemon for a binding")
     start.add_argument("name", nargs="?", help="Connection name; defaults to current workspace")
@@ -113,7 +579,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote workspace path: /abs, ~, or ~/path",
     )
     connect.add_argument("-l", "--local", default=".", help="Local workspace path; defaults to cwd")
-    connect.add_argument("--name", default=None, help="Connection name for rsb reconnect")
+    connect.add_argument("--name", default=None, help="Connection name for codex-rsb reconnect")
     connect.add_argument(
         "--no-shell",
         action="store_true",
@@ -121,7 +587,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     reconnect = subparsers.add_parser("reconnect", help="Reconnect a named workspace")
-    reconnect.add_argument("name", help="Connection name shown by rsb list/status")
+    reconnect.add_argument("name", help="Connection name shown by codex-rsb list/status")
     reconnect.add_argument(
         "-l",
         "--local",
@@ -136,6 +602,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     forget = subparsers.add_parser("forget", help="Remove a saved connection record")
     forget.add_argument("name", help="Connection name to remove")
+    forget.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Abandon unreachable remote workspace state",
+    )
+
+    conflicts = subparsers.add_parser("conflicts", help="List unresolved conflicts")
+    conflicts.add_argument("name", nargs="?", help="Connection name; defaults to current workspace")
+
+    resolve = subparsers.add_parser("resolve", help="Resolve a synchronization conflict")
+    resolve.add_argument("path", help="Workspace-relative conflict path")
+    winner = resolve.add_mutually_exclusive_group(required=True)
+    winner.add_argument("--use-local", action="store_true", help="Keep the local version")
+    winner.add_argument("--use-remote", action="store_true", help="Keep the remote version")
 
     fetch = subparsers.add_parser("fetch", help="Fetch placeholder file content")
     fetch.add_argument("path", nargs="?", help="Workspace-relative placeholder path")
@@ -172,40 +652,6 @@ def confirm_prompt(prompt: str) -> bool:
         ) from exc
 
 
-def fetch_placeholder(*, path: str | None, fetch_all: bool) -> int:
-    if fetch_all and path is not None:
-        raise ValueError("Use either a path or --all, not both")
-    if not fetch_all and path is None:
-        raise ValueError("fetch requires a path or --all")
-    count, cancelled = fetch_placeholders(
-        local_root=_workspace_root_for_cwd(Path.cwd()),
-        runner=_runner_for_cwd(),
-        path=path,
-        fetch_all=fetch_all,
-        confirm=confirm_prompt,
-    )
-    if count:
-        noun = "file" if count == 1 else "files"
-        print(f"Fetched {count} placeholder {noun}")
-    elif cancelled:
-        print("Fetch cancelled")
-    else:
-        print("No placeholders found")
-    return 0
-
-
-def peek_file(*, path: str, lines: int, tail: bool) -> int:
-    content = peek_placeholder(
-        local_root=_workspace_root_for_cwd(Path.cwd()),
-        runner=_runner_for_cwd(),
-        path=path,
-        lines=lines,
-        tail=tail,
-    )
-    sys.stdout.buffer.write(content)
-    return 0
-
-
 def list_servers() -> int:
     settings = load_settings()
     hosts = load_configured_hosts(require_identity=False)
@@ -238,21 +684,6 @@ def list_servers() -> int:
     return 0
 
 
-def show_status() -> int:
-    records = list_binding_records()
-    if not records:
-        print("No bound workspaces")
-        return 0
-    current = current_workspace_record(None, Path.cwd())
-    print(
-        _format_status_table(
-            records,
-            current_workspace_id=current.workspace_id if current is not None else None,
-        )
-    )
-    return 0
-
-
 def start_binding_daemon(name: str | None) -> int:
     record = _record_for_execution(name)
     local_root = _require_live_workspace(record)
@@ -272,36 +703,6 @@ def stop_binding_daemon(name: str | None) -> int:
         print(f"No daemon running for {record.name}")
     else:
         print(f"Stop requested for {record.name}, but daemon is still shutting down")
-    return 0
-
-
-def forget_connection(name: str) -> int:
-    record = find_binding_record(name)
-    if record is None:
-        print(f"{_error_prefix()} no connection named {name!r}", file=sys.stderr)
-        return 2
-    local_root = Path(record.local_path)
-    status = daemon_status(local_root)
-    if status.running:
-        pid = f" (pid={status.pid})" if status.pid is not None else ""
-        if not confirm_prompt(
-            f"A sync daemon is running for {record.name}{pid}; a transfer may be in progress. "
-            "Stop it and forget anyway? [y/N] "
-        ):
-            print(f"Kept connection {record.name}")
-            return 0
-        if stop_daemon_result(local_root) is StopResult.TIMEOUT:
-            print(
-                f"{_error_prefix()} daemon for {record.name} did not stop; "
-                "try again once it settles",
-                file=sys.stderr,
-            )
-            return 2
-    delete_binding_record(record.name)
-    if remove_local_metadata(local_root):
-        print(f"Forgot connection {record.name}; removed {local_root / METADATA_DIR}")
-    else:
-        print(f"Forgot connection {record.name}")
     return 0
 
 
@@ -342,47 +743,6 @@ def _poke_or_restart_daemon(local_root: Path, source: str) -> None:
         )
 
 
-def _ensure_daemon_for_record(record: BindingRecord) -> None:
-    ensure_daemon(Path(record.local_path))
-
-
-def run_remote_command(items: list[str]) -> int:
-    record_name, command_argv = _parse_run_items(items)
-    record = _record_for_execution(record_name)
-    local_root = _require_live_workspace(record)
-    runner = _connected_runner(record.target)
-    ensure_daemon(local_root)
-    result = runner.run_command(
-        record.target,
-        record.remote_path,
-        tuple(command_argv),
-    )
-    if result.stdout:
-        sys.stdout.write(result.stdout)
-    if result.stderr:
-        sys.stderr.write(result.stderr)
-    # Block until the remote's output files are actually local, so the caller (an AI)
-    # can read real content immediately instead of a mid-transfer "syncing" stub.
-    _sync_now(local_root, runner, record)
-    return result.returncode
-
-
-def _sync_now(local_root: Path, runner: SubprocessSshRunner, record: BindingRecord) -> None:
-    """Run one foreground sync and report completion; keep the daemon as a fallback."""
-    try:
-        SyncSession(
-            local_root=local_root,
-            runner=runner,
-            target=record.target,
-            remote=record.remote_path,
-        ).sync_once()
-        print("[rsb] synced", file=sys.stderr)
-    except CLI_ERRORS as exc:
-        # Don't fail the command over a sync hiccup; let the daemon retry and tell the user.
-        print(f"{_error_prefix()} sync after run failed: {exc}", file=sys.stderr)
-        _poke_or_restart_daemon(local_root, "run")
-
-
 def _parse_run_items(items: list[str]) -> tuple[str | None, list[str]]:
     try:
         separator = items.index("--")
@@ -401,7 +761,7 @@ def _record_for_execution(name: str | None) -> BindingRecord:
     if name is not None:
         record = find_binding_record(name)
         if record is None:
-            raise RegistryError(f"no connection named {name!r}; run rsb status")
+            raise RegistryError(f"no connection named {name!r}; run codex-rsb status")
         return record
     record = current_workspace_record(None, Path.cwd())
     if record is None:
@@ -429,12 +789,22 @@ def _require_live_workspace(record: BindingRecord) -> Path:
     cryptic "not a bound workspace"; surface the recovery steps instead.
     """
     local = Path(record.local_path)
-    if not local.exists() or read_local_marker(local) is None:
+    if not local.exists():
         raise RegistryError(
-            f"connection {record.name!r} points to a missing or unbound local path: "
+            f"connection {record.name!r} points to a missing local path: "
             f"{record.local_path}. "
-            f"Run `rsb reconnect {record.name} --local <new-path>` to repair it, "
-            f"or `rsb forget {record.name}` to remove it from {registry_path()}"
+            f"Run `codex-rsb reconnect {record.name} --local <new-path>` to repair it, "
+            f"or `codex-rsb forget {record.name}` to remove it from {registry_path()}"
+        )
+    try:
+        spec = read_workspace_spec(workspace_paths(record.workspace_id).workspace_file)
+    except (OSError, ValueError) as exc:
+        raise RegistryError(
+            f"connection {record.name!r} has invalid external workspace state: {exc}"
+        ) from exc
+    if Path(spec.local_root).expanduser().resolve(strict=False) != local.resolve(strict=False):
+        raise RegistryError(
+            f"connection {record.name!r} local path disagrees with external workspace state"
         )
     return local
 
@@ -527,180 +897,94 @@ def enter_and_bind(*, target: str, remote: str, local: Path, open_shell: bool) -
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-
-    if args.command == "list":
-        try:
+    services = default_cli_services()
+    try:
+        service_commands = {
+            "init",
+            "status",
+            "run",
+            "forget",
+            "fetch",
+            "peek",
+            "conflicts",
+            "resolve",
+        }
+        if args.command in service_commands or (
+            args.command == "connect" and args.no_shell
+        ):
+            return _dispatch_services(args, services)
+        if args.command == "list":
             return list_servers()
-        except CLI_ERRORS as exc:
-            print(f"{_error_prefix()} {exc}", file=sys.stderr)
-            return 2
-
-    if args.command == "status":
-        try:
-            return show_status()
-        except CLI_ERRORS as exc:
-            print(f"{_error_prefix()} {exc}", file=sys.stderr)
-            return 2
-
-    if args.command == "start":
-        try:
+        if args.command == "start":
             return start_binding_daemon(args.name)
-        except CLI_ERRORS as exc:
-            print(f"{_error_prefix()} {exc}", file=sys.stderr)
-            return 2
-
-    if args.command == "stop":
-        try:
+        if args.command == "stop":
             return stop_binding_daemon(args.name)
-        except CLI_ERRORS as exc:
-            print(f"{_error_prefix()} {exc}", file=sys.stderr)
-            return 2
-
-    if args.command == "shell":
-        if not _has_tty():
-            print(f"{_error_prefix()} shell requires an interactive TTY", file=sys.stderr)
-            return 2
-        try:
+        if args.command == "shell":
+            if not _has_tty():
+                raise ValueError("shell requires an interactive TTY")
             return open_wrapped_shell(args.name)
-        except CLI_ERRORS as exc:
-            print(f"{_error_prefix()} {exc}", file=sys.stderr)
-            return 2
-
-    if args.command == "run":
-        try:
-            return run_remote_command(args.items)
-        except CLI_ERRORS as exc:
-            print(f"{_error_prefix()} {exc}", file=sys.stderr)
-            return 2
-
-    if args.command == "set" and args.setting == "placeholder-limit":
-        try:
+        if args.command == "set" and args.setting == "placeholder-limit":
             settings = set_placeholder_limit(args.value)
-        except (ValueError, OSError, SettingsError) as exc:
             print(
-                f"{_error_prefix()} could not update placeholder-limit "
-                f"at {settings_path()}: {exc}. "
-                "Use a value like 10MB or 1GB and check REMOTE_SANDBOX_HOME permissions.",
-                file=sys.stderr,
+                "placeholder-limit: "
+                f"{format_size_compact(settings.placeholder_limit)} "
+                f"({settings_path()})"
             )
-            return 2
-        print(
-            "placeholder-limit: "
-            f"{format_size_compact(settings.placeholder_limit)} "
-            f"({settings_path()})"
-        )
-        return 0
-
-    if args.command == "enter":
-        if not _has_tty():
-            print(f"{_error_prefix()} enter requires an interactive TTY", file=sys.stderr)
-            return 2
-        try:
+            return 0
+        if args.command == "enter":
+            if not _has_tty():
+                raise ValueError("enter requires an interactive TTY")
             return enter_and_bind(
                 target=args.target,
                 remote=args.remote,
                 local=Path(args.local),
                 open_shell=True,
             )
-        except CLI_ERRORS as exc:
-            print(f"{_error_prefix()} {exc}", file=sys.stderr)
-            return 2
-
-    if args.command == "connect":
-        if not args.no_shell and not _has_tty():
-            print(
-                f"{_error_prefix()} interactive shell requires a TTY; "
-                "rerun in a terminal or pass --no-shell",
-                file=sys.stderr,
-            )
-            return 2
-        try:
-            result = bind_workspace(
-                target=args.target,
-                remote=args.remote,
-                local=Path(args.local),
-                runner=_connected_runner(args.target),
-                confirm=confirm_prompt,
-                connection_name=args.name,
-            )
-        except CLI_ERRORS as exc:
-            print(f"{_error_prefix()} {exc}", file=sys.stderr)
-            return 2
-        _print_connection(result.connection)
-        if args.no_shell:
-            _ensure_daemon_for_record(result.connection)
-            return 0
-        return _open_wrapped_shell_for_record(result.connection)
-
-    if args.command == "reconnect":
-        try:
-            record = find_binding_record(args.name)
-            if record is None:
-                print(
-                    f"{_error_prefix()} no connection named {args.name!r}; run rsb status",
-                    file=sys.stderr,
+        if args.command == "connect":
+            if not _has_tty():
+                raise ValueError(
+                    "interactive shell requires a TTY; rerun in a terminal or pass --no-shell"
                 )
-                return 2
-            local = Path(args.local) if args.local is not None else Path(record.local_path)
-            if not local.exists():
-                print(
-                    f"{_error_prefix()} connection "
-                    f"{record.name!r} points to missing local path: {record.local_path}. "
-                    f"Run `rsb reconnect {record.name} --local <new-path>` to repair it, "
-                    f"or `rsb forget {record.name}` to remove it from {registry_path()}",
-                    file=sys.stderr,
+            record = services.connect_workspace(
+                args.target,
+                args.remote,
+                Path(args.local),
+                args.name,
+            )
+            _print_connection(record)
+            return _open_wrapped_shell_for_record(record)
+        if args.command == "reconnect":
+            existing = services.find_record(args.name, services.registry)
+            if existing is None:
+                raise RegistryError(
+                    f"no connection named {args.name!r}; run codex-rsb status"
                 )
-                return 2
+            local = Path(args.local) if args.local is not None else Path(existing.local_path)
             if not args.no_shell and not _has_tty():
-                print(
-                    f"{_error_prefix()} interactive shell requires a TTY; "
-                    "rerun in a terminal or pass --no-shell",
-                    file=sys.stderr,
+                raise ValueError(
+                    "interactive shell requires a TTY; rerun in a terminal or pass --no-shell"
                 )
-                return 2
-            result = bind_workspace(
-                target=record.target,
-                remote=record.remote_path,
-                local=local,
-                runner=_connected_runner(record.target),
-                confirm=confirm_prompt,
-                connection_name=record.name,
+            rebound = services.connect_workspace(
+                existing.target,
+                existing.remote_path,
+                local,
+                existing.name,
             )
-        except CLI_ERRORS as exc:
-            print(f"{_error_prefix()} {exc}", file=sys.stderr)
-            return 2
-        _print_connection(result.connection)
-        if args.no_shell:
-            _ensure_daemon_for_record(result.connection)
-            return 0
-        return _open_wrapped_shell_for_record(result.connection)
-
-    if args.command == "forget":
-        try:
-            return forget_connection(args.name)
-        except CLI_ERRORS as exc:
-            print(f"{_error_prefix()} {exc}", file=sys.stderr)
-            return 2
-
-    if args.command == "fetch":
-        try:
-            return fetch_placeholder(path=args.path, fetch_all=args.all)
-        except CLI_ERRORS as exc:
-            print(f"{_error_prefix()} {exc}", file=sys.stderr)
-            return 2
-
-    if args.command == "peek":
-        try:
-            return peek_file(
-                path=args.path,
-                lines=args.tail if args.tail is not None else args.lines,
-                tail=args.tail is not None,
-            )
-        except CLI_ERRORS as exc:
-            print(f"{_error_prefix()} {exc}", file=sys.stderr)
-            return 2
-
-    parser.error(f"unknown command: {args.command}")
+            if args.no_shell:
+                services.ensure_supervisor(rebound)
+                _print_connection(rebound)
+                print("The initial sync continues in background.")
+                print(f"Watch progress with `codex-rsb status {rebound.name} --watch`.")
+                return 0
+            _print_connection(rebound)
+            return _open_wrapped_shell_for_record(rebound)
+        parser.error(f"unknown command: {args.command}")
+    except Exception as exc:
+        if args.debug:
+            traceback.print_exc()
+        else:
+            print(f"codex-rsb: {_one_line(str(exc), max_len=500)}", file=sys.stderr)
+        return 2
     return 2
 
 
@@ -744,39 +1028,6 @@ def _format_servers_table(
             body,
         ]
     )
-
-
-def _format_status_table(
-    records: list[BindingRecord],
-    *,
-    current_workspace_id: str | None,
-) -> str:
-    sorted_records = sorted(
-        records,
-        key=lambda record: (record.target, record.name, record.local_path, record.remote_path),
-    )
-    headers = ["NAME", "REMOTE", "LOCAL", "REMOTE_PATH", "DAEMON", "CURRENT"]
-    rows = []
-    for record in sorted_records:
-        current = "*" if record.workspace_id == current_workspace_id else ""
-        daemon = _daemon_column(record)
-        rows.append(
-            [
-                record.name,
-                record.target,
-                record.local_path,
-                record.remote_path,
-                daemon,
-                current,
-            ]
-        )
-    table = _format_table(headers, rows)
-    # A single long temp path can push the horizontal table past the terminal width,
-    # so it wraps and the columns misalign (looks like garbled output). Fall back to a
-    # per-record vertical layout that never wraps when it would not fit.
-    if _table_fits(table):
-        return table
-    return _format_records_vertical(headers, rows)
 
 
 def _format_table(headers: list[str], rows: list[list[str]]) -> str:
@@ -834,13 +1085,6 @@ def _display_width(value: str) -> int:
 
 
 
-def _daemon_column(record: BindingRecord) -> str:
-    status = daemon_status(Path(record.local_path))
-    if not status.running:
-        return "stopped"
-    return f"running:{status.pid}" if status.pid is not None else "running"
-
-
 def _list_resource_columns(result: ProbeResult) -> tuple[str, str, str]:
     if result.error is not None or result.resources is None:
         error = f"error: {_one_line(result.error or 'probe failed', max_len=90)}"
@@ -865,21 +1109,6 @@ def _one_line(value: str, *, max_len: int) -> str:
     return compact[: max_len - 1] + "..."
 
 
-def _workspace_root_for_cwd(cwd: Path) -> Path:
-    record = current_workspace_record(None, cwd)
-    if record is not None:
-        return Path(record.local_path)
-    return cwd
-
-
-def _runner_for_cwd() -> SubprocessSshRunner:
-    """A runner with the SSH master established for the current workspace's target."""
-    record = current_workspace_record(None, Path.cwd())
-    if record is None:
-        return SubprocessSshRunner()
-    return _connected_runner(record.target)
-
-
 def _print_connection(record: BindingRecord) -> None:
     print(
         "Connected "
@@ -891,15 +1120,8 @@ def _has_tty() -> bool:
     return os.isatty(0) and os.isatty(1)
 
 
-def _program_name() -> str:
-    name = Path(sys.argv[0]).name
-    if name in {"rsb", "remote-sandbox"}:
-        return name
-    return "rsb"
-
-
 def _error_prefix() -> str:
-    return f"{_program_name()}:"
+    return "codex-rsb:"
 
 
 if __name__ == "__main__":

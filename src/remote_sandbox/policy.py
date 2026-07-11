@@ -148,7 +148,7 @@ class StaticPolicyEngine:
             if _is_placeholder_size_directive(stripped):
                 raise ValueError(
                     "placeholder-size moved to user settings; "
-                    "run `rsb set placeholder-limit 10MB` instead"
+                    "run `codex-rsb set placeholder-limit 10MB` instead"
                 )
             decision, pattern = _parse_rule(stripped, section, line_no)
             rules.append(PolicyRule(decision, pattern))
