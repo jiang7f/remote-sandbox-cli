@@ -4,12 +4,18 @@ from pathlib import Path
 import pytest
 from helpers.sync_harness import (
     DaemonPairHarness,
+    FakePtyBackendHarness,
     InitialPairHarness,
     SyncPair,
     make_daemon_pair,
     make_initial_pair,
     make_sync_pair,
 )
+
+
+@pytest.fixture
+def fake_pty_backend() -> FakePtyBackendHarness:
+    return FakePtyBackendHarness()
 
 
 @pytest.fixture

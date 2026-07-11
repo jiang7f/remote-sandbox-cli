@@ -38,7 +38,12 @@ from remote_sandbox.settings import (
     set_placeholder_limit,
     settings_path,
 )
-from remote_sandbox.shell import enter_shell_loop
+from remote_sandbox.shell import (
+    ConnectRequestEvent,
+    ConnectResponse,
+    InitialShellDirection,
+    enter_shell_loop,
+)
 from remote_sandbox.ssh import SshError, SubprocessSshRunner
 from remote_sandbox.ssh_config import SshHost, load_configured_hosts
 from remote_sandbox.sync import SyncExecutionError
@@ -433,43 +438,71 @@ def _require_live_workspace(record: BindingRecord) -> Path:
 
 def enter_and_bind(*, target: str, remote: str, local: Path, open_shell: bool) -> int:
     runner = SubprocessSshRunner()
-    remote_cwd = remote
-    decision = {"declined": False}
 
-    def _confirm(prompt: str) -> bool:
-        answer = confirm_prompt(prompt)
-        decision["declined"] = not answer
-        return answer
+    def _initial_direction(
+        selected_local: Path,
+        selected_remote: str,
+    ) -> InitialShellDirection:
+        from remote_sandbox.policy import POLICY_FILE_NAME, StaticPolicyEngine
 
-    while True:
-        decision["declined"] = False
-        enter_result = enter_shell_loop(target, remote_cwd, nonce=secrets.token_hex(8))
-        if enter_result.exit_code != 0:
-            return enter_result.exit_code
-        if enter_result.remote is None:
-            return 0
-        selected_local = Path(enter_result.local) if enter_result.local is not None else local
+        policy = StaticPolicyEngine.from_file(selected_local / POLICY_FILE_NAME)
         try:
-            result = bind_workspace(
-                target=target,
-                remote=enter_result.remote,
-                local=selected_local,
-                runner=runner,
-                confirm=_confirm,
-                connection_name=enter_result.name,
+            local_has_content = any(
+                not policy.is_ignored(entry.name) for entry in selected_local.iterdir()
             )
-        except CLI_ERRORS as exc:
-            if decision["declined"]:
-                # Answered N: keep browsing, resuming at the directory they tried to bind.
-                remote_cwd = enter_result.remote
-                continue
-            print(f"{_error_prefix()} {exc}", file=sys.stderr)
-            return 2
+        except FileNotFoundError:
+            local_has_content = False
+        remote_has_content = any(
+            not policy.is_ignored(name) for name in runner.listdir(target, selected_remote)
+        )
+        if local_has_content and not remote_has_content:
+            return "local-to-remote"
+        if not local_has_content and not remote_has_content:
+            return "empty"
+        return "remote-to-local"
+
+    def _connect(event: ConnectRequestEvent) -> ConnectResponse:
+        import time
+
+        selected_local = Path(event.local) if event.local is not None else local
+        result = bind_workspace(
+            target=target,
+            remote=event.remote,
+            local=selected_local,
+            runner=runner,
+            confirm=confirm_prompt,
+            connection_name=event.name,
+        )
+        bound_local = Path(result.connection.local_path)
+        direction = _initial_direction(bound_local, result.connection.remote_path)
+        status = ensure_daemon(bound_local, runner=runner)
+        deadline = time.monotonic() + 5.0
+        while status.phase.value == "starting" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            status = daemon_status(bound_local)
+        if status.phase.value == "starting":
+            raise DaemonError("supervisor did not publish initial sync state")
+        if not status.running or status.pid is None:
+            raise DaemonError("supervisor did not publish its process state")
+        if status.phase.value in {"failed", "stopped"}:
+            raise DaemonError(status.last_error or "workspace supervisor failed to start")
         _print_connection(result.connection)
-        if open_shell:
-            return _open_wrapped_shell_for_record(result.connection)
-        _ensure_daemon_for_record(result.connection)
-        return 0
+        return ConnectResponse(
+            ok=True,
+            workspace_id=result.workspace.workspace_id,
+            name=result.connection.name,
+            remote_root=result.connection.remote_path,
+            direction=direction,
+        )
+
+    del open_shell
+    result = enter_shell_loop(
+        target,
+        remote,
+        nonce=secrets.token_hex(8),
+        on_connect_request=_connect,
+    )
+    return result.exit_code
 
 
 def main(argv: list[str] | None = None) -> int:

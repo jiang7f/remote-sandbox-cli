@@ -29,6 +29,7 @@ from remote_sandbox.manifest import (
 from remote_sandbox.policy import StaticPolicyEngine
 from remote_sandbox.remote_agent.store import RemoteStore
 from remote_sandbox.remote_client import RemoteSnapshot
+from remote_sandbox.shell import ConnectResponse, ManagedShellSession
 from remote_sandbox.state import AuditSignature, WorkspaceStore
 from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
 from remote_sandbox.transport import (
@@ -37,6 +38,68 @@ from remote_sandbox.transport import (
     TransferResult,
 )
 from remote_sandbox.watch import PollingLocalWatcher
+
+
+@dataclass(slots=True)
+class FakePtyBackend:
+    remote_shell_pid: int
+
+
+@dataclass(slots=True)
+class FakeManagedPtySession:
+    remote_shell_pid: int
+    output: str
+    prompt_mode: str
+    _session: ManagedShellSession
+
+    def type(self, text: str) -> None:
+        self._session.feed_user_input(text.encode())
+
+    def accept_binding(self) -> None:
+        self._session.handle_connect_response(
+            ConnectResponse(
+                ok=True,
+                workspace_id="w1",
+                name="dq",
+                remote_root="/work/dq",
+                direction="remote-to-local",
+            )
+        )
+        self.output = self._session.captured_output()
+        self.prompt_mode = self._session.prompt_mode
+
+    def reject_binding(self, error: str) -> None:
+        self._session.handle_connect_response(ConnectResponse(ok=False, error=error))
+        self.output = self._session.captured_output()
+        self.prompt_mode = self._session.prompt_mode
+
+    def connect(self, *, direction: str, remote_root: str) -> None:
+        self._session.activate_workspace(
+            ConnectResponse(
+                ok=True,
+                workspace_id="w1",
+                name="dq",
+                remote_root=remote_root,
+                direction=direction,
+            ),
+            direction=direction,
+        )
+
+    def publish_ready(self) -> None:
+        self._session.publish_ready()
+
+    @property
+    def remote_cwd(self) -> str:
+        return self._session.remote_cwd
+
+
+@dataclass(slots=True)
+class FakePtyBackendHarness:
+    def open_enter_shell(self) -> FakeManagedPtySession:
+        backend = FakePtyBackend(remote_shell_pid=4242)
+        session = ManagedShellSession(backend=backend, nonce="test-nonce")
+        return FakeManagedPtySession(4242, "", "enter", session)
+
 
 FingerprintState = EntryFingerprint | MissingEntry
 
