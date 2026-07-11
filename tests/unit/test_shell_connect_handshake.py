@@ -74,9 +74,52 @@ def test_ready_transition_has_authenticated_prompt_and_private_readline_trigger(
     assert "READLINE_POINT" in script
     assert 'bind -x \'"\\C-x\\C-]": __codex_rsb_ready_key\'' in script
     assert "\\e[778~" not in script
-    assert "\\e[777~" not in script
+    assert 'bind -m emacs-standard \'"\\e[777~": redraw-current-line\'' in script
+    assert 'bind -m vi-move \'"\\e[777~": redraw-current-line\'' in script
+    assert "bind -m vi-insertion" not in script
     assert shell_module._ready_key_sequence() == b"\x18\x1d"
+    assert shell_module._redraw_key_sequence() == b"\x1b[777~"
+    assert "__codex_rsb_live_key" not in script
     assert shell_module._READY_PROBE_INTERVAL_S >= 0.25
+
+
+def test_live_prompt_sentinel_has_the_same_fixed_display_width() -> None:
+    sentinel = shell_module._prompt_slot_sentinel("abc")
+
+    assert len(sentinel) == 34
+    assert sentinel.startswith("[")
+    assert sentinel.endswith("]")
+    assert sentinel in _enter_rcfile()
+
+
+def test_ready_slot_keeps_readline_width_but_visually_returns_to_compact_width() -> None:
+    status = shell_module.WorkspaceStatus(
+        shell_module.WorkspacePhase.READY,
+        shell_module.SyncProgress("idle"),
+    )
+
+    replacement = shell_module._render_prompt_slot("ZJU_2", "dq", status)
+    compact = "[codex:ZJU_2:dq]"
+    padding = 34 - shell_module.display_width(compact)
+
+    assert replacement == compact + " " * padding + f"\x1b[{padding}D"
+
+
+def test_long_unicode_live_slot_cannot_overwrite_the_rest_of_the_prompt() -> None:
+    status = shell_module.WorkspaceStatus(
+        shell_module.WorkspacePhase.INITIAL_SYNCING,
+        shell_module.SyncProgress("planning"),
+    )
+
+    replacement = shell_module._render_prompt_slot(
+        "量子计算中心-long-target",
+        "超长工作区-name",
+        status,
+    )
+
+    assert shell_module.display_width(replacement) == 34
+    assert "\x1b[" not in replacement
+    assert replacement.rstrip().endswith("]")
 
 
 def test_connect_request_parser_requires_the_session_nonce_across_chunks() -> None:
@@ -184,6 +227,28 @@ def test_success_response_can_retain_a_local_ready_probe() -> None:
 
     assert response.ready_probe is probe
     assert response.encode() == "ok\tw1\tdq\t/work/dq\tlocal-to-remote"
+
+
+def test_success_response_can_retain_a_local_workspace_status_probe() -> None:
+    expected = shell_module.WorkspaceStatus(
+        shell_module.WorkspacePhase.INITIAL_SYNCING,
+        shell_module.SyncProgress("scanning"),
+    )
+
+    def probe() -> shell_module.WorkspaceStatus:
+        return expected
+
+    response = ConnectResponse(
+        ok=True,
+        workspace_id="w1",
+        name="dq",
+        remote_root="/work/dq",
+        direction="remote-to-local",
+        status_probe=probe,
+    )
+
+    assert response.status_probe is probe
+    assert response.encode() == "ok\tw1\tdq\t/work/dq\tremote-to-local"
 
 
 def test_ready_probe_worker_allows_only_one_in_flight_callback() -> None:

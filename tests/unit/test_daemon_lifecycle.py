@@ -2,7 +2,7 @@ import time
 
 from helpers.sync_harness import SupervisorHarness
 
-from remote_sandbox.status import WorkspacePhase
+from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
 
 
 def test_supervisor_publishes_starting_before_initial_sync(
@@ -26,6 +26,24 @@ def test_control_sync_runs_incremental_engine(
     while time.monotonic() < deadline and "event" not in supervisor_fixture.engine.reasons:
         time.sleep(0.01)
     assert "event" in supervisor_fixture.engine.reasons
+
+
+def test_control_status_includes_the_full_workspace_progress(
+    supervisor_fixture: SupervisorHarness,
+) -> None:
+    supervisor_fixture.initial_sync.block_before_scan()
+    supervisor_fixture.start_in_thread()
+    expected = WorkspaceStatus(
+        WorkspacePhase.INITIAL_SYNCING,
+        SyncProgress("planning", files_done=2, files_total=5),
+        pending=3,
+        conflicts=1,
+    )
+    supervisor_fixture.store.set_status(expected)
+
+    status = supervisor_fixture.client.control_status()
+
+    assert status.workspace_status == expected
 
 
 def test_graceful_stop_cleans_runtime_and_publishes_stopped(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import fcntl
+import hashlib
 import json
 import os
 import posixpath
@@ -21,8 +22,10 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
+from remote_sandbox.prompt import PromptRedrawController, PromptRenderer, display_width
 from remote_sandbox.registry import RegistryError, validate_connection_name
 from remote_sandbox.ssh import ssh_control_opts, validate_remote_path, validate_target
+from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
 
 _SAFE_LABEL_CHARS = re.compile(r"[^A-Za-z0-9_.@:-]")
 
@@ -49,21 +52,38 @@ class PromptEvent:
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class PromptSlotEvent:
+    pass
+
+
 InitialShellDirection = Literal["local-to-remote", "remote-to-local", "empty"]
 ReadyProbeResult = Literal["pending", "ready", "stop"]
 ReadyProbe = Callable[[], ReadyProbeResult | bool]
+StatusProbe = Callable[[], WorkspaceStatus]
 _READY_PROBE_INTERVAL_S = 0.25
 _READY_RESULT_POLL_S = 0.05
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionProbeResult:
+    ready: ReadyProbeResult | bool | None = None
+    status: WorkspaceStatus | None = None
 
 
 class _ReadyProbeWorker:
     def __init__(self) -> None:
         self._results: queue.SimpleQueue[
-            tuple[int, ReadyProbeResult | bool]
+            tuple[int, ReadyProbeResult | bool | _SessionProbeResult]
         ] = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
 
-    def launch(self, probe: ReadyProbe, *, generation: int) -> bool:
+    def launch(
+        self,
+        probe: Callable[[], ReadyProbeResult | bool | _SessionProbeResult],
+        *,
+        generation: int,
+    ) -> bool:
         if self._thread is not None and self._thread.is_alive():
             return False
 
@@ -78,7 +98,11 @@ class _ReadyProbeWorker:
         self._thread.start()
         return True
 
-    def take_result(self, *, generation: int) -> ReadyProbeResult | bool | None:
+    def take_result(
+        self,
+        *,
+        generation: int,
+    ) -> ReadyProbeResult | bool | _SessionProbeResult | None:
         while True:
             try:
                 result_generation, result = self._results.get_nowait()
@@ -101,6 +125,7 @@ class ConnectResponse:
         compare=False,
         repr=False,
     )
+    status_probe: StatusProbe | None = field(default=None, compare=False, repr=False)
 
     def encode(self) -> str:
         if not self.ok:
@@ -121,14 +146,30 @@ class _ManagedSessionBackend(Protocol):
 
 
 class ManagedShellSession:
-    def __init__(self, *, backend: _ManagedSessionBackend, nonce: str) -> None:
+    def __init__(
+        self,
+        *,
+        backend: _ManagedSessionBackend,
+        nonce: str,
+        target: str = "host",
+    ) -> None:
         self.backend = backend
         self.nonce = nonce
+        self.target = target
         self.prompt_mode = "enter"
         self.remote_cwd = "/home/test"
         self._holding_cwd: str | None = None
         self._pending_workspace_cwd: str | None = None
         self._output: list[str] = []
+        self._renderer = PromptRenderer()
+        self._redraw = PromptRedrawController()
+        self._workspace_name = "workspace"
+        self._status = WorkspaceStatus(WorkspacePhase.STARTING, SyncProgress("starting"))
+        self._pending_status: WorkspaceStatus | None = None
+        self._readline_buffer = ""
+        self._readline_cursor = 0
+        self._command_running = False
+        self._redraw_count = 0
 
     @property
     def remote_shell_pid(self) -> int:
@@ -136,13 +177,23 @@ class ManagedShellSession:
 
     def feed_user_input(self, data: bytes) -> None:
         text = data.decode("utf-8", errors="replace")
-        for line in text.splitlines():
-            try:
-                argv = shlex.split(line)
-            except ValueError:
+        for char in text:
+            if char == "\x02":
+                self._readline_cursor = max(0, self._readline_cursor - 1)
                 continue
-            if len(argv) == 2 and argv[0] == "cd":
-                self.remote_cwd = _resolve_test_remote_cwd(self.remote_cwd, argv[1])
+            if char in "\r\n":
+                self._submit_test_line(self._readline_buffer)
+                self._readline_buffer = ""
+                self._readline_cursor = 0
+                self._command_running = True
+                continue
+            if ord(char) < 32 or ord(char) == 127:
+                continue
+            point = self._readline_cursor
+            self._readline_buffer = (
+                self._readline_buffer[:point] + char + self._readline_buffer[point:]
+            )
+            self._readline_cursor += 1
 
     def handle_connect_response(self, response: ConnectResponse) -> None:
         if not response.ok:
@@ -164,6 +215,7 @@ class ManagedShellSession:
         if direction not in {"local-to-remote", "remote-to-local", "empty"}:
             raise ValueError("invalid initial shell direction")
         self.prompt_mode = "managed"
+        self._workspace_name = response.name or "workspace"
         if direction == "local-to-remote":
             self._holding_cwd = self.remote_cwd
             self._pending_workspace_cwd = response.remote_root
@@ -180,8 +232,54 @@ class ManagedShellSession:
         self._holding_cwd = None
         self._pending_workspace_cwd = None
 
+    def publish_status(self, status: WorkspaceStatus, *, now: float) -> None:
+        if status == self._status and self._pending_status is None:
+            return
+        if self._command_running:
+            self._pending_status = status
+            return
+        self._status = status
+        self._pending_status = None
+        sequence = self._redraw.request_redraw(
+            now,
+            at_prompt=True,
+            command_running=False,
+        )
+        if sequence is not None:
+            self._redraw_count += 1
+
+    def publish_prompt(self) -> None:
+        self._command_running = False
+        if self._pending_status is not None:
+            self._status = self._pending_status
+            self._pending_status = None
+
+    @property
+    def readline_buffer(self) -> str:
+        return self._readline_buffer
+
+    @property
+    def readline_cursor(self) -> int:
+        return self._readline_cursor
+
+    @property
+    def rendered_prompt(self) -> str:
+        return self._renderer.render(self.target, self._workspace_name, self._status)
+
+    @property
+    def redraw_count(self) -> int:
+        return self._redraw_count
+
     def captured_output(self) -> str:
         return "".join(self._output)
+
+    def _submit_test_line(self, line: str) -> None:
+        try:
+            argv = shlex.split(line)
+        except ValueError:
+            return
+        if len(argv) == 2 and argv[0] == "cd":
+            self.remote_cwd = _resolve_test_remote_cwd(self.remote_cwd, argv[1])
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,7 +290,7 @@ class EnterShellResult:
     name: str | None = None
 
 
-ShellEvent = BytesEvent | BarrierEvent | ConnectRequestEvent | PromptEvent
+ShellEvent = BytesEvent | BarrierEvent | ConnectRequestEvent | PromptEvent | PromptSlotEvent
 ShellBackend = Callable[[list[str], str, Callable[[int], None]], int]
 ConnectRequestHandler = Callable[[ConnectRequestEvent], ConnectResponse]
 EnterShellBackend = Callable[[list[str], str, ConnectRequestHandler], int]
@@ -257,6 +355,7 @@ def build_managed_remote_shell_command(target: str, cwd: str, *, nonce: str) -> 
 def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> list[str]:
     validate_target(target)
     validate_remote_path(cwd)
+    prompt_slot = _prompt_slot_sentinel(nonce)
     script = (
         "p=$1\n"
         "label=$2\n"
@@ -278,6 +377,9 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "__codex_prompt_mode=enter\n"
         "__codex_workspace_holding=\n"
         "__codex_workspace_pending_root=\n"
+        f"__codex_live_ps1='\\[\\e[01;36m\\]{prompt_slot}\\[\\e[00m\\] "
+        "${CONDA_PROMPT_MODIFIER}\\[\\e[01;32m\\]${USER:-user}@\\h"
+        "\\[\\e[00m\\]:\\[\\e[01;34m\\]\\W\\[\\e[00m\\] % '\n"
         "codex-rsb() {\n"
         "  if [ \"${1:-}\" = connect ]; then\n"
         "    shift\n"
@@ -439,13 +541,17 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "  READLINE_POINT=$__codex_saved_point\n"
         "}\n"
         "bind -x '\"\\C-x\\C-]\": __codex_rsb_ready_key'\n"
+        "bind '\"\\e[777~\": redraw-current-line'\n"
+        "bind -m emacs-standard '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
+        "bind -m emacs-meta '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
+        "bind -m emacs-ctlx '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
+        "bind -m vi-command '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
+        "bind -m vi-move '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
+        "bind -m vi '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
         "__codex_enter_prompt() {\n"
         "  printf '\\033]777;codex-rsb;prompt;%s\\007' \"$__codex_nonce\"\n"
         "  if [ \"$__codex_prompt_mode\" = managed ]; then\n"
-        "    PS1='\\[\\e[01;36m\\][${CODEX_RSB_DISPLAY_LABEL}:"
-        "${CODEX_RSB_WORKSPACE_NAME}]\\[\\e[00m\\] ${CONDA_PROMPT_MODIFIER}"
-        "\\[\\e[01;32m\\]${USER:-user}@\\h\\[\\e[00m\\]:"
-        "\\[\\e[01;34m\\]\\W\\[\\e[00m\\] % '\n"
+        "    PS1=$__codex_live_ps1\n"
         "  else\n"
         "    PS1='\\[\\e[01;33m\\][${CODEX_RSB_DISPLAY_LABEL}:enter]\\[\\e[00m\\] "
         "${CONDA_PROMPT_MODIFIER}\\[\\e[01;32m\\]${USER:-user}@\\h\\[\\e[00m\\]:"
@@ -482,10 +588,12 @@ class ShellOutputParser:
             f"\x1b]777;codex-rsb;connect-request;{nonce};".encode()
         )
         self._prompt_prefix = f"\x1b]777;codex-rsb;prompt;{nonce}".encode()
+        self._slot_prefix = _prompt_slot_sentinel(nonce).encode("ascii")
         self._prefixes = (
             self._cmd_done_prefix,
             self._connect_request_prefix,
             self._prompt_prefix,
+            self._slot_prefix,
         )
         self._buffer = b""
 
@@ -508,6 +616,10 @@ class ShellOutputParser:
                 events.append(BytesEvent(self._buffer[:start]))
                 self._buffer = self._buffer[start:]
             assert prefix is not None
+            if prefix == self._slot_prefix:
+                events.append(PromptSlotEvent())
+                self._buffer = self._buffer[len(prefix) :]
+                continue
             end = self._buffer.find(b"\x07", len(prefix))
             if end == -1:
                 break
@@ -626,8 +738,15 @@ def enter_shell_loop(
         except Exception as exc:
             return ConnectResponse(ok=False, error=str(exc))
 
-    shell_backend = backend or _pty_enter_shell_backend
-    exit_code = shell_backend(argv, nonce, handle_request)
+    if backend is None:
+        exit_code = _pty_enter_shell_backend(
+            argv,
+            nonce,
+            handle_request,
+            target=display_label(target),
+        )
+    else:
+        exit_code = backend(argv, nonce, handle_request)
     return EnterShellResult(
         exit_code=exit_code,
         remote=selected_remote,
@@ -675,17 +794,29 @@ def _pty_enter_shell_backend(
     argv: list[str],
     nonce: str,
     on_connect_request: ConnectRequestHandler,
+    *,
+    target: str = "host",
 ) -> int:
     pid, master_fd = pty.fork()
     if pid == 0:
         os.execvp(argv[0], argv)
     parser = ShellOutputParser(nonce)
     ready_probe: ReadyProbe | None = None
+    status_probe: StatusProbe | None = None
     ready_probe_generation = 0
     ready_probe_worker = _ReadyProbeWorker()
     ready_latched = False
     at_prompt = False
+    command_running = True
     next_ready_probe_at = 0.0
+    renderer = PromptRenderer()
+    redraw = PromptRedrawController()
+    active_name: str | None = None
+    current_status = WorkspaceStatus(
+        WorkspacePhase.INITIAL_SYNCING,
+        SyncProgress("scanning"),
+    )
+    pending_redraw = False
     stdin_fd = sys.stdin.fileno()
     try:
         original_terminal = termios.tcgetattr(stdin_fd)
@@ -697,7 +828,12 @@ def _pty_enter_shell_backend(
         try:
             while True:
                 timeout: float | None = None
-                if ready_probe is not None:
+                if (
+                    ready_probe is not None
+                    or status_probe is not None
+                    or pending_redraw
+                    or ready_latched
+                ):
                     timeout = _READY_RESULT_POLL_S
                 readable, _, _ = select.select([master_fd, stdin_fd], [], [], timeout)
                 if master_fd in readable:
@@ -712,6 +848,16 @@ def _pty_enter_shell_backend(
                             os.write(sys.stdout.fileno(), event.data)
                         elif isinstance(event, PromptEvent):
                             at_prompt = True
+                            command_running = False
+                        elif isinstance(event, PromptSlotEvent):
+                            if active_name is not None:
+                                replacement = _render_prompt_slot(
+                                    target,
+                                    active_name,
+                                    current_status,
+                                    renderer=renderer,
+                                )
+                                os.write(sys.stdout.fileno(), replacement.encode("utf-8"))
                         elif isinstance(event, ConnectRequestEvent):
                             if original_terminal is not None:
                                 termios.tcsetattr(
@@ -723,10 +869,8 @@ def _pty_enter_shell_backend(
                                 response = on_connect_request(event)
                                 payload = response.encode().encode("utf-8") + b"\n"
                             except Exception as exc:
-                                error_response = ConnectResponse(ok=False, error=str(exc))
-                                payload = (
-                                    error_response.encode().encode("utf-8") + b"\n"
-                                )
+                                response = ConnectResponse(ok=False, error=str(exc))
+                                payload = response.encode().encode("utf-8") + b"\n"
                             finally:
                                 if original_terminal is not None:
                                     tty.setraw(stdin_fd)
@@ -734,38 +878,76 @@ def _pty_enter_shell_backend(
                             if response.ok:
                                 ready_probe_generation += 1
                                 ready_probe = None
+                                status_probe = None
                                 ready_latched = False
                                 next_ready_probe_at = 0.0
+                                active_name = response.name
+                                current_status = WorkspaceStatus(
+                                    WorkspacePhase.INITIAL_SYNCING,
+                                    SyncProgress("scanning"),
+                                )
+                                pending_redraw = False
                                 if (
                                     response.direction == "local-to-remote"
                                     and response.ready_probe is not None
                                 ):
                                     ready_probe = response.ready_probe
-                                    next_ready_probe_at = time.monotonic()
+                                status_probe = response.status_probe or _status_probe_for_workspace(
+                                    response.workspace_id
+                                )
+                                next_ready_probe_at = time.monotonic()
                 if stdin_fd in readable:
                     data = os.read(stdin_fd, 4096)
                     if not data:
                         break
                     if any(char in data for char in b"\r\n\x03\x04\x1a"):
                         at_prompt = False
+                        command_running = True
                     os.write(master_fd, data)
                 probe_result = ready_probe_worker.take_result(
                     generation=ready_probe_generation
                 )
-                if ready_probe is not None and probe_result is not None:
+                if isinstance(probe_result, _SessionProbeResult):
+                    ready_result = probe_result.ready
+                    if ready_probe is not None and (
+                        ready_result is True or ready_result == "ready"
+                    ):
+                        ready_probe = None
+                        ready_latched = True
+                    elif ready_probe is not None and ready_result == "stop":
+                        ready_probe = None
+                    if probe_result.status is not None and active_name is not None:
+                        previous = current_status
+                        updated = probe_result.status
+                        previous_prompt = renderer.render(target, active_name, previous)
+                        updated_prompt = renderer.render(target, active_name, updated)
+                        current_status = updated
+                        if updated.phase is WorkspacePhase.READY:
+                            ready_probe = None
+                            ready_latched = True
+                        if previous_prompt != updated_prompt:
+                            pending_redraw = True
+                        if updated.phase in {
+                            WorkspacePhase.FAILED,
+                            WorkspacePhase.STOPPED,
+                        }:
+                            status_probe = None
+                elif ready_probe is not None and probe_result is not None:
                     if probe_result is True or probe_result == "ready":
-                        ready_probe_generation += 1
                         ready_probe = None
                         ready_latched = True
                     elif probe_result == "stop":
-                        ready_probe_generation += 1
                         ready_probe = None
                 now = time.monotonic()
                 if (
-                    ready_probe is not None
+                    (ready_probe is not None or (status_probe is not None and at_prompt))
                     and now >= next_ready_probe_at
                     and ready_probe_worker.launch(
-                        ready_probe,
+                        _session_probe_callback(
+                            ready_probe,
+                            status_probe,
+                            include_status=at_prompt,
+                        ),
                         generation=ready_probe_generation,
                     )
                 ):
@@ -773,7 +955,16 @@ def _pty_enter_shell_backend(
                 if ready_latched and at_prompt:
                     os.write(master_fd, _ready_key_sequence())
                     ready_latched = False
-                    at_prompt = False
+                    pending_redraw = False
+                if pending_redraw:
+                    sequence = redraw.request_redraw(
+                        now,
+                        at_prompt=at_prompt,
+                        command_running=command_running,
+                    )
+                    if sequence is not None:
+                        os.write(master_fd, sequence)
+                        pending_redraw = False
         finally:
             for event in parser.flush():
                 if isinstance(event, BytesEvent):
@@ -881,6 +1072,89 @@ def _protocol_error_text(error: str | None) -> str:
 
 def _ready_key_sequence() -> bytes:
     return b"\x18\x1d"
+
+
+def _redraw_key_sequence() -> bytes:
+    return PromptRedrawController.REDRAW_SEQUENCE
+
+
+def _render_prompt_slot(
+    target: str,
+    name: str,
+    status: WorkspaceStatus,
+    *,
+    renderer: PromptRenderer | None = None,
+) -> str:
+    active_renderer = renderer or PromptRenderer()
+    prompt = active_renderer.render(target, name, status)
+    padding = active_renderer.width - display_width(prompt)
+    replacement = prompt + " " * padding
+    if status.phase is WorkspacePhase.READY and padding:
+        replacement += f"\x1b[{padding}D"
+    return replacement
+
+
+def _prompt_slot_sentinel(nonce: str, width: int = 34) -> str:
+    if width < 2:
+        raise ValueError("prompt slot width must be at least 2")
+    digest = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+    body = f"codex-slot:{digest}"
+    return "[" + body[: width - 2].ljust(width - 2) + "]"
+
+
+def _status_probe_for_workspace(workspace_id: str | None) -> StatusProbe | None:
+    if workspace_id is None:
+        return None
+    try:
+        from remote_sandbox.workspace import validate_workspace_id
+
+        validate_workspace_id(workspace_id)
+    except ValueError:
+        return None
+
+    def probe() -> WorkspaceStatus:
+        from remote_sandbox.daemon import daemon_workspace_status
+
+        return daemon_workspace_status(workspace_id)
+
+    return probe
+
+
+def _run_session_probe(
+    ready_probe: ReadyProbe | None,
+    status_probe: StatusProbe | None,
+    *,
+    include_status: bool,
+) -> _SessionProbeResult:
+    ready: ReadyProbeResult | bool | None = None
+    status: WorkspaceStatus | None = None
+    if ready_probe is not None:
+        try:
+            ready = ready_probe()
+        except Exception:
+            ready = "pending"
+    if include_status and status_probe is not None:
+        try:
+            status = status_probe()
+        except Exception:
+            status = None
+    return _SessionProbeResult(ready=ready, status=status)
+
+
+def _session_probe_callback(
+    ready_probe: ReadyProbe | None,
+    status_probe: StatusProbe | None,
+    *,
+    include_status: bool,
+) -> Callable[[], _SessionProbeResult]:
+    def poll() -> _SessionProbeResult:
+        return _run_session_probe(
+            ready_probe,
+            status_probe,
+            include_status=include_status,
+        )
+
+    return poll
 
 
 def _resolve_test_remote_cwd(current: str, requested: str) -> str:

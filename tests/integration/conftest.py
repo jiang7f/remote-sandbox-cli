@@ -6,9 +6,11 @@ from helpers.sync_harness import (
     DaemonPairHarness,
     FakePtyBackendHarness,
     InitialPairHarness,
+    PromptShellHarness,
     SyncPair,
     make_daemon_pair,
     make_initial_pair,
+    make_prompt_shell_harness,
     make_sync_pair,
 )
 
@@ -16,6 +18,11 @@ from helpers.sync_harness import (
 @pytest.fixture
 def fake_pty_backend() -> FakePtyBackendHarness:
     return FakePtyBackendHarness()
+
+
+@pytest.fixture
+def shell_fixture() -> PromptShellHarness:
+    return make_prompt_shell_harness()
 
 
 @pytest.fixture

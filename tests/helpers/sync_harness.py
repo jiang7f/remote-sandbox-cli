@@ -101,6 +101,72 @@ class FakePtyBackendHarness:
         return FakeManagedPtySession(4242, "", "enter", session)
 
 
+@dataclass(slots=True)
+class PromptShellHarness:
+    session: ManagedShellSession
+
+    def type_without_enter(self, text: str) -> None:
+        self.session.feed_user_input(text.encode("utf-8"))
+
+    def move_cursor_left(self, count: int) -> None:
+        self.session.feed_user_input(b"\x02" * count)
+
+    def submit(self, text: str) -> None:
+        self.session.feed_user_input(text.encode("utf-8") + b"\n")
+
+    def publish_progress(self, percent: int) -> None:
+        self.session.publish_status(
+            WorkspaceStatus(
+                WorkspacePhase.INITIAL_SYNCING,
+                SyncProgress("transferring", files_done=percent, files_total=100),
+            ),
+            now=percent / 100.0,
+        )
+
+    def publish_prompt(self) -> None:
+        self.session.publish_prompt()
+
+    @property
+    def visible_input(self) -> str:
+        return self.session.readline_buffer
+
+    @property
+    def cursor_offset(self) -> int:
+        return self.session.readline_cursor
+
+    @property
+    def current_prompt(self) -> str:
+        return self.session.rendered_prompt
+
+    @property
+    def redraw_count(self) -> int:
+        return self.session.redraw_count
+
+
+def make_prompt_shell_harness() -> PromptShellHarness:
+    backend = FakePtyBackend(remote_shell_pid=4242)
+    session = ManagedShellSession(
+        backend=backend,
+        nonce="prompt-test-nonce",
+        target="ZJU_2",
+    )
+    session.activate_workspace(
+        ConnectResponse(
+            ok=True,
+            workspace_id="00000000-0000-4000-8000-000000000015",
+            name="dq",
+            remote_root="/work/dq",
+            direction="remote-to-local",
+        ),
+        direction="remote-to-local",
+    )
+    session.publish_status(
+        WorkspaceStatus(WorkspacePhase.INITIAL_SYNCING, SyncProgress("scanning")),
+        now=0.0,
+    )
+    return PromptShellHarness(session)
+
+
 FingerprintState = EntryFingerprint | MissingEntry
 
 

@@ -57,6 +57,7 @@ class DaemonStatus:
     last_error: str | None = None
     conn_state: str = "ok"
     phase: WorkspacePhase = WorkspacePhase.STOPPED
+    workspace_status: WorkspaceStatus | None = None
 
 
 class StopResult(Enum):
@@ -525,6 +526,7 @@ class WorkspaceSupervisor:
             last_error=status.last_error,
             conn_state=self._connection_state,
             phase=status.phase,
+            workspace_status=status,
         )
 
     def _acquire_lock(self) -> BinaryIO:
@@ -580,6 +582,7 @@ class SupervisorClient:
                 last_error=durable.last_error,
                 conn_state=phase.value,
                 phase=phase,
+                workspace_status=durable,
             )
         if pid is not None or durable.phase is not WorkspacePhase.STOPPED:
             return DaemonStatus(
@@ -588,8 +591,14 @@ class SupervisorClient:
                 last_error=durable.last_error or "supervisor process is not running",
                 conn_state="failed",
                 phase=WorkspacePhase.FAILED,
+                workspace_status=durable,
             )
-        return DaemonStatus(False, None, phase=WorkspacePhase.STOPPED)
+        return DaemonStatus(
+            False,
+            None,
+            phase=WorkspacePhase.STOPPED,
+            workspace_status=durable,
+        )
 
     def control_status(self) -> DaemonStatus:
         reply = self._request("status")
@@ -665,6 +674,34 @@ def daemon_status(local_root: Path) -> DaemonStatus:
 
 def daemon_control_status(local_root: Path) -> DaemonStatus:
     return SupervisorClient(_runtime_for_local(local_root)).control_status()
+
+
+def daemon_workspace_status(workspace_id: str) -> WorkspaceStatus:
+    """Read full status from the workspace supervisor without scanning the registry."""
+    paths = workspace_paths(workspace_id)
+    runtime = SupervisorRuntime(
+        workspace_id,
+        paths.root,
+        runtime_dir() / "supervisors",
+    )
+    client = SupervisorClient(runtime)
+    try:
+        daemon = client.control_status()
+    except DaemonError:
+        daemon = client.status()
+        if (
+            not daemon.running
+            or daemon.pid is None
+            or daemon.phase in {WorkspacePhase.FAILED, WorkspacePhase.STOPPED}
+        ):
+            return WorkspaceStatus(
+                WorkspacePhase.FAILED,
+                SyncProgress("failed"),
+                last_error=daemon.last_error,
+            )
+    if daemon.workspace_status is None:
+        raise DaemonError("supervisor did not publish workspace status")
+    return daemon.workspace_status
 
 
 def wait_for_daemon_control(local_root: Path, timeout: float) -> DaemonStatus:
@@ -899,6 +936,11 @@ def _daemon_status_payload(status: DaemonStatus) -> dict[str, object]:
         "last_error": status.last_error,
         "conn_state": status.conn_state,
         "phase": status.phase.value,
+        "workspace_status": (
+            _workspace_status_payload(status.workspace_status)
+            if status.workspace_status is not None
+            else None
+        ),
     }
 
 
@@ -911,6 +953,7 @@ def _daemon_status_from_payload(payload: object) -> DaemonStatus:
     last_error = payload.get("last_error")
     connection_state = payload.get("conn_state")
     phase = payload.get("phase")
+    workspace_status_payload = payload.get("workspace_status")
     if (
         type(running) is not bool
         or (pid is not None and type(pid) is not int)
@@ -920,14 +963,71 @@ def _daemon_status_from_payload(payload: object) -> DaemonStatus:
         or not isinstance(phase, str)
     ):
         raise DaemonError("malformed supervisor status")
+    try:
+        parsed_phase = WorkspacePhase(phase)
+        workspace_status = (
+            _workspace_status_from_payload(workspace_status_payload)
+            if workspace_status_payload is not None
+            else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise DaemonError("malformed supervisor status") from exc
     return DaemonStatus(
         running,
         pid,
         failures,
         last_error,
         connection_state,
-        WorkspacePhase(phase),
+        parsed_phase,
+        workspace_status,
     )
+
+
+def _workspace_status_payload(status: WorkspaceStatus) -> dict[str, object]:
+    progress = status.progress
+    return {
+        "phase": status.phase.value,
+        "progress": {
+            "stage": progress.stage,
+            "files_done": progress.files_done,
+            "files_total": progress.files_total,
+            "bytes_done": progress.bytes_done,
+            "bytes_total": progress.bytes_total,
+            "current_path": progress.current_path,
+            "elapsed_seconds": progress.elapsed_seconds,
+        },
+        "pending": status.pending,
+        "conflicts": status.conflicts,
+        "last_error": status.last_error,
+        "last_sync_at": status.last_sync_at,
+    }
+
+
+def _workspace_status_from_payload(payload: object) -> WorkspaceStatus:
+    if not isinstance(payload, dict):
+        raise DaemonError("malformed workspace status")
+    progress = payload.get("progress")
+    if not isinstance(progress, dict):
+        raise DaemonError("malformed workspace status")
+    try:
+        return WorkspaceStatus(
+            WorkspacePhase(payload["phase"]),
+            SyncProgress(
+                stage=progress["stage"],
+                files_done=progress["files_done"],
+                files_total=progress["files_total"],
+                bytes_done=progress["bytes_done"],
+                bytes_total=progress["bytes_total"],
+                current_path=progress["current_path"],
+                elapsed_seconds=progress["elapsed_seconds"],
+            ),
+            pending=payload["pending"],
+            conflicts=payload["conflicts"],
+            last_error=payload["last_error"],
+            last_sync_at=payload["last_sync_at"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DaemonError("malformed workspace status") from exc
 
 
 def _read_runtime_pidfile(runtime: SupervisorRuntime) -> int | None:

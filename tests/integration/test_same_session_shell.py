@@ -1,9 +1,12 @@
+import fcntl
 import os
 import pty
 import select
 import shlex
 import signal
+import struct
 import sys
+import termios
 import time
 import traceback
 from contextlib import suppress
@@ -108,7 +111,7 @@ def test_real_pty_ready_preserves_partial_readline_buffer_and_shell_process(
         "}\n",
         encoding="utf-8",
     )
-    frontend_master, frontend_slave = pty.openpty()
+    frontend_master, frontend_slave = _open_frontend_pty()
     pid = os.fork()
     if pid == 0:
         os.close(frontend_master)
@@ -206,7 +209,7 @@ def test_real_pty_ready_preserves_partial_readline_buffer_and_shell_process(
         _read_pty_until(
             frontend_master,
             output,
-            b"[host:dq]",
+            b"[codex:host:dq",
             timeout=3.0,
             start=command_start,
         )
@@ -314,7 +317,7 @@ def test_blocked_ready_probe_does_not_block_pty_passthrough(tmp_path: Path) -> N
         f"__codex_nonce={shlex.quote(nonce)}\n{_enter_rcfile(nonce)}\n",
         encoding="utf-8",
     )
-    frontend_master, frontend_slave = pty.openpty()
+    frontend_master, frontend_slave = _open_frontend_pty()
     pid = os.fork()
     if pid == 0:
         os.close(frontend_master)
@@ -410,7 +413,7 @@ def test_successful_reconnect_invalidates_in_flight_ready_probe(
         "}\n",
         encoding="utf-8",
     )
-    frontend_master, frontend_slave = pty.openpty()
+    frontend_master, frontend_slave = _open_frontend_pty()
     pid = os.fork()
     if pid == 0:
         os.close(frontend_master)
@@ -479,7 +482,7 @@ def test_successful_reconnect_invalidates_in_flight_ready_probe(
             output,
             f"\r\nNEW:{workspace}".encode(),
             start=command_start,
-            prompt=b"[host:next]",
+            prompt=b"[codex:host:next",
         )
         text = output.decode("utf-8", errors="replace")
         assert "bash_execute_unix_command" not in text
@@ -516,7 +519,7 @@ def _connect_remote(
     _read_pty_until(
         fd,
         output,
-        f"[host:{name}]".encode(),
+        f"\r\n\x1b[01;36m[codex:host:{name}".encode(),
         timeout=3.0,
         start=output_start,
     )
@@ -529,7 +532,7 @@ def _read_command_until_prompt(
     *,
     start: int,
     timeout: float = 3.0,
-    prompt: bytes = b"[host:dq]",
+    prompt: bytes = b"[codex:host:dq",
 ) -> None:
     _read_pty_until(fd, output, expected, timeout=timeout, start=start)
     expected_at = output.index(expected, start) + len(expected)
@@ -592,6 +595,16 @@ def _terminate_child(pid: int) -> None:
         time.sleep(0.01)
     os.kill(pid, signal.SIGTERM)
     os.waitpid(pid, 0)
+
+
+def _open_frontend_pty() -> tuple[int, int]:
+    master, slave = pty.openpty()
+    fcntl.ioctl(
+        slave,
+        termios.TIOCSWINSZ,
+        struct.pack("HHHH", 40, 160, 0, 0),
+    )
+    return master, slave
 
 
 def _wait_for_child_exit(
