@@ -348,6 +348,18 @@ class SyncEngine:
         changed: set[str] = set()
         base_after: dict[str, FingerprintState] = {}
         expected_echoes: dict[tuple[str, str], FingerprintState] = {}
+        deferred_deletes = self._conflicting_directory_deletes(plan)
+        if deferred_deletes:
+            plan = SyncPlan(
+                hash_requests=plan.hash_requests,
+                actions=tuple(
+                    action
+                    for action in plan.actions
+                    if action.path not in deferred_deletes
+                ),
+                conflicts=plan.conflicts,
+                warnings=plan.warnings,
+            )
         intents = self._expected_echo_intents(plan)
         successful_mutations: set[tuple[str, str]] = set()
         attempted_mutations: set[tuple[str, str]] = set()
@@ -477,7 +489,7 @@ class SyncEngine:
             | {conflict.path for conflict in plan.conflicts}
             | {warning.path for warning in plan.warnings}
             | requeued_before
-        ) - changed
+        ) - changed - deferred_deletes
         conflict_ids: list[str] = []
         acknowledge_events = not changed
         try:
@@ -509,6 +521,11 @@ class SyncEngine:
                     conflict_ids.append(record.conflict_id)
                 if changed:
                     self.store.requeue_paths(changed, "changed-during-transfer")
+                if deferred_deletes:
+                    self.store.requeue_paths(
+                        deferred_deletes,
+                        "descendant-conflict",
+                    )
                 self.store.clear_requeued_paths(clearable)
                 if acknowledge_events:
                     acknowledge_pending(self.store, "local", local_events)
@@ -516,7 +533,11 @@ class SyncEngine:
                 self._set_status(
                     (
                         WorkspacePhase.DEGRADED
-                        if plan.conflicts or plan.warnings
+                        if (
+                            plan.conflicts
+                            or plan.warnings
+                            or self.store.list_conflicts(unresolved_only=True)
+                        )
                         else WorkspacePhase.READY
                     ),
                     "idle",
@@ -531,11 +552,36 @@ class SyncEngine:
         return EngineResult(
             transferred=tuple(sorted(transferred)),
             completed=tuple(sorted(completed)),
-            requeued=tuple(sorted(changed)),
+            requeued=tuple(sorted(changed | deferred_deletes)),
             echoes=tuple(sorted({echo.path for echo in echoes})),
             conflict_ids=tuple(conflict_ids),
             warnings=plan.warnings,
         )
+
+    def _conflicting_directory_deletes(self, plan: SyncPlan) -> set[str]:
+        conflict_paths = {conflict.path for conflict in plan.conflicts}
+        conflict_paths.update(
+            conflict.path
+            for conflict in self.store.list_conflicts(unresolved_only=True)
+        )
+        if not conflict_paths:
+            return set()
+        deferred: set[str] = set()
+        for action in plan.actions:
+            if action.type is ActionType.DELETE_LOCAL:
+                destination = action.expected_local
+            elif action.type is ActionType.DELETE_REMOTE:
+                destination = action.expected_remote
+            else:
+                continue
+            if not (
+                isinstance(destination, EntryFingerprint)
+                and destination.kind is EntryKind.DIR
+            ):
+                continue
+            if any(_path_is_within(path, action.path) for path in conflict_paths):
+                deferred.add(action.path)
+        return deferred
 
     def _commit_noop(
         self,
@@ -762,6 +808,10 @@ def _regular_file(entry: FingerprintState) -> bool:
 
 def _entry_or_none(entry: FingerprintState) -> EntryFingerprint | None:
     return entry if isinstance(entry, EntryFingerprint) else None
+
+
+def _path_is_within(path: str, directory: str) -> bool:
+    return path == directory or path.startswith(f"{directory}/")
 
 
 def _blob_matches(state: FingerprintState, blob: bytes | None) -> bool:
