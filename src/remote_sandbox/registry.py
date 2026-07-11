@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import tempfile
 import tomllib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,6 +45,10 @@ def now_iso() -> str:
 
 def list_binding_records(path: Path | None = None) -> list[BindingRecord]:
     registry = path or registry_path()
+    return _list_binding_records_unlocked(registry)
+
+
+def _list_binding_records_unlocked(registry: Path) -> list[BindingRecord]:
     if not registry.exists():
         return []
     try:
@@ -72,50 +79,66 @@ def upsert_binding_record(path: Path | None, record: BindingRecord) -> None:
     validate_workspace_id(record.workspace_id)
     registry = path or registry_path()
     record_local = _resolved_local_path(record.local_path)
-    records = []
-    for existing in list_binding_records(registry):
-        existing_local = _resolved_local_path(existing.local_path)
-        same_workspace = existing.workspace_id == record.workspace_id
-        same_local = existing_local == record_local
-        same_name = existing.name == record.name
-        if same_name and not same_workspace:
-            raise RegistryError(f"Connection name already exists: {record.name}")
-        if same_local and not same_workspace:
-            raise RegistryError(f"Local path is already registered: {record_local}")
-        if same_workspace or same_local:
-            continue
-        records.append(existing)
-    records.append(record)
-    records.sort(key=lambda item: item.name)
-    registry.parent.mkdir(parents=True, exist_ok=True)
-    content = _records_to_toml(records)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix="bindings.",
-        suffix=".tmp",
-        dir=registry.parent,
-        text=True,
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, registry)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
+    with _registry_transaction(registry):
+        records = []
+        for existing in _list_binding_records_unlocked(registry):
+            existing_local = _resolved_local_path(existing.local_path)
+            same_workspace = existing.workspace_id == record.workspace_id
+            same_local = existing_local == record_local
+            same_name = existing.name == record.name
+            if same_name and not same_workspace:
+                raise RegistryError(f"Connection name already exists: {record.name}")
+            if same_local and not same_workspace:
+                raise RegistryError(f"Local path is already registered: {record_local}")
+            if same_workspace or same_local:
+                continue
+            records.append(existing)
+        records.append(record)
+        records.sort(key=lambda item: item.name)
+        _write_binding_records_unlocked(registry, records)
 
 
-def delete_binding_record(name: str, path: Path | None = None) -> bool:
+def delete_binding_record(
+    name: str,
+    path: Path | None = None,
+    *,
+    workspace_id: str | None = None,
+) -> bool:
     validate_connection_name(name)
+    if workspace_id is not None:
+        validate_workspace_id(workspace_id)
     registry = path or registry_path()
-    records = list_binding_records(registry)
-    kept = [record for record in records if record.name != name]
-    if len(kept) == len(records):
-        return False
-    registry.parent.mkdir(parents=True, exist_ok=True)
-    content = _records_to_toml(kept)
+    with _registry_transaction(registry):
+        records = _list_binding_records_unlocked(registry)
+        matched = next((record for record in records if record.name == name), None)
+        if matched is None or (
+            workspace_id is not None and matched.workspace_id != workspace_id
+        ):
+            return False
+        kept = [record for record in records if record.name != name]
+        _write_binding_records_unlocked(registry, kept)
+    return True
+
+
+@contextmanager
+def _registry_transaction(registry: Path) -> Iterator[None]:
+    registry.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    registry.parent.chmod(0o700)
+    lock_path = registry.with_name(f"{registry.name}.lock")
+    with lock_path.open("a+b") as handle:
+        lock_path.chmod(0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _write_binding_records_unlocked(
+    registry: Path,
+    records: list[BindingRecord],
+) -> None:
+    content = _records_to_toml(records)
     fd, tmp_name = tempfile.mkstemp(
         prefix="connections.",
         suffix=".tmp",
@@ -128,11 +151,11 @@ def delete_binding_record(name: str, path: Path | None = None) -> bool:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        tmp_path.chmod(0o600)
         os.replace(tmp_path, registry)
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
-    return True
 
 
 def register_workspace(

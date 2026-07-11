@@ -1,8 +1,11 @@
 import threading
 import time
 
+import pytest
 from helpers.sync_harness import SupervisorHarness
 
+import remote_sandbox.daemon as daemon_module
+from remote_sandbox.daemon import DaemonError
 from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
 
 
@@ -45,6 +48,20 @@ def test_control_status_includes_the_full_workspace_progress(
     status = supervisor_fixture.client.control_status()
 
     assert status.workspace_status == expected
+
+
+def test_control_status_exposes_initial_sync_start_generation(
+    supervisor_fixture: SupervisorHarness,
+) -> None:
+    supervisor_fixture.initial_sync.block_before_scan()
+    supervisor_fixture.start_in_thread()
+    supervisor_fixture.store.publish_initial_sync_started(
+        WorkspaceStatus(WorkspacePhase.INITIAL_SYNCING, SyncProgress("scanning"))
+    )
+
+    status = supervisor_fixture.client.control_status()
+
+    assert status.initial_sync_generation == 1
 
 
 def test_graceful_stop_cleans_runtime_and_publishes_stopped(
@@ -131,3 +148,179 @@ def test_control_mutation_failure_returns_error_without_stopping_supervisor(
 
     assert supervisor_fixture.client.control_status().running is True
     assert supervisor_fixture.store.get_status() == before
+
+
+def test_queued_mutation_timeout_cancels_before_worker_drain(
+    supervisor_fixture: SupervisorHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    supervisor_fixture.supervisor._mutation_handler = (  # type: ignore[attr-defined]
+        lambda kind, _payload: calls.append(kind) or {}
+    )
+    monkeypatch.setattr(daemon_module, "_MUTATION_TIMEOUT_S", 0.01)
+
+    with pytest.raises(DaemonError, match="timed out"):
+        supervisor_fixture.supervisor.request_mutation("resolve", {"path": "model.py"})
+
+    supervisor_fixture.supervisor._run_pending_mutations()  # type: ignore[attr-defined]
+    assert calls == []
+    assert supervisor_fixture.supervisor._mutations.empty()  # type: ignore[attr-defined]
+
+
+def test_stop_fails_all_queued_mutations_promptly(
+    supervisor_fixture: SupervisorHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor_fixture.supervisor._mutation_handler = (  # type: ignore[attr-defined]
+        lambda _kind, _payload: {}
+    )
+    monkeypatch.setattr(daemon_module, "_MUTATION_TIMEOUT_S", 5.0)
+    errors: list[str] = []
+
+    def request(path: str) -> None:
+        try:
+            supervisor_fixture.supervisor.request_mutation("resolve", {"path": path})
+        except DaemonError as exc:
+            errors.append(str(exc))
+
+    threads = [threading.Thread(target=request, args=(f"{index}.py",)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + 1.0
+    while (
+        supervisor_fixture.supervisor._mutations.qsize() < 2  # type: ignore[attr-defined]
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+
+    supervisor_fixture.supervisor.stop()
+    for thread in threads:
+        thread.join(timeout=0.2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == ["supervisor stopped before mutation started"] * 2
+    assert supervisor_fixture.supervisor._mutations.empty()  # type: ignore[attr-defined]
+
+
+def test_started_mutation_waits_for_definitive_result_after_timeout(
+    supervisor_fixture: SupervisorHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    result: list[dict[str, object]] = []
+    monkeypatch.setattr(daemon_module, "_MUTATION_TIMEOUT_S", 0.01)
+
+    def handler(_kind: str, _payload: dict[str, object]) -> dict[str, object]:
+        started.set()
+        release.wait(timeout=1.0)
+        return {"owner": "worker"}
+
+    supervisor_fixture.supervisor._mutation_handler = handler  # type: ignore[attr-defined]
+
+    requester = threading.Thread(
+        target=lambda: result.append(
+            supervisor_fixture.supervisor.request_mutation("resolve", {"path": "model.py"})
+        )
+    )
+    requester.start()
+    deadline = time.monotonic() + 1.0
+    while (
+        supervisor_fixture.supervisor._mutations.empty()  # type: ignore[attr-defined]
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    worker = threading.Thread(
+        target=supervisor_fixture.supervisor._run_pending_mutations  # type: ignore[attr-defined]
+    )
+    worker.start()
+    assert started.wait(timeout=1.0)
+    time.sleep(0.03)
+
+    assert requester.is_alive()
+    release.set()
+    requester.join(timeout=1.0)
+    worker.join(timeout=1.0)
+    assert result == [{"owner": "worker"}]
+
+
+def test_timeout_and_worker_claim_have_one_owner(
+    supervisor_fixture: SupervisorHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daemon_module, "_MUTATION_TIMEOUT_S", 0.02)
+    calls = 0
+    outcome: list[str] = []
+
+    def handler(_kind: str, _payload: dict[str, object]) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {}
+
+    supervisor_fixture.supervisor._mutation_handler = handler  # type: ignore[attr-defined]
+
+    def request() -> None:
+        try:
+            supervisor_fixture.supervisor.request_mutation("resolve", {"path": "model.py"})
+        except DaemonError:
+            outcome.append("cancelled")
+        else:
+            outcome.append("completed")
+
+    requester = threading.Thread(target=request)
+    requester.start()
+    deadline = time.monotonic() + 1.0
+    while (
+        supervisor_fixture.supervisor._mutations.empty()  # type: ignore[attr-defined]
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    time.sleep(0.018)
+    worker = threading.Thread(
+        target=supervisor_fixture.supervisor._run_pending_mutations  # type: ignore[attr-defined]
+    )
+    worker.start()
+    requester.join(timeout=1.0)
+    worker.join(timeout=1.0)
+
+    assert outcome in (["cancelled"], ["completed"])
+    assert calls == (1 if outcome == ["completed"] else 0)
+    assert supervisor_fixture.supervisor._mutations.empty()  # type: ignore[attr-defined]
+
+
+def test_control_stop_fails_queued_mutation_while_engine_is_busy(
+    supervisor_fixture: SupervisorHarness,
+) -> None:
+    supervisor_fixture.supervisor._mutation_handler = (  # type: ignore[attr-defined]
+        lambda _kind, _payload: {}
+    )
+    supervisor_fixture.store.mark_initial_sync_completed()
+    supervisor_fixture.start_in_thread()
+    supervisor_fixture.engine.release.clear()
+    assert supervisor_fixture.client.sync() is True
+    assert supervisor_fixture.engine.active.wait(timeout=1.0)
+    errors: list[str] = []
+
+    def mutate() -> None:
+        try:
+            supervisor_fixture.client.mutate("resolve", {"path": "model.py"})
+        except DaemonError as exc:
+            errors.append(str(exc))
+
+    requester = threading.Thread(target=mutate)
+    requester.start()
+    deadline = time.monotonic() + 1.0
+    while (
+        supervisor_fixture.supervisor._mutations.empty()  # type: ignore[attr-defined]
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+
+    assert supervisor_fixture.client.control_status().running is True
+    assert supervisor_fixture.client.stop() is True
+    requester.join(timeout=0.2)
+    supervisor_fixture.engine.release.set()
+
+    assert not requester.is_alive()
+    assert errors == ["supervisor stopped before mutation started"]

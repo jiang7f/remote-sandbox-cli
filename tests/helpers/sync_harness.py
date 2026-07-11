@@ -16,6 +16,7 @@ from typing import Literal
 from remote_sandbox.cli import (
     CapturedCliResult,
     CliServices,
+    ConnectedWorkspace,
     RemoteCommandResult,
     invoke_cli,
 )
@@ -540,6 +541,8 @@ class CliHarness:
     _followup_error: str | None = None
     _remote_forget_error: str | None = None
     _registry_delete_failures: int = 0
+    _fast_initial_sync: bool = False
+    _next_connection_created: bool = True
 
     def run(self, argv: list[str]) -> CapturedCliResult:
         return invoke_cli(argv, services=self.services)
@@ -643,6 +646,14 @@ class CliHarness:
     def block_initial_sync(self) -> None:
         return
 
+    def complete_initial_sync_immediately(self) -> None:
+        self._fast_initial_sync = True
+
+    def reconnect_existing_workspace(self) -> None:
+        self._next_connection_created = False
+        self.store.mark_initial_sync_completed()
+        self.store.set_status(WorkspaceStatus(WorkspacePhase.READY, SyncProgress("ready")))
+
     def change_selected_source_before_transfer(self, path: str) -> None:
         self.pair.transport.change_source_before_commit(path)
 
@@ -677,18 +688,33 @@ def make_cli_harness(tmp_path: Path) -> CliHarness:
         remote: str,
         local: Path,
         name: str | None,
-    ) -> BindingRecord:
+    ) -> ConnectedWorkspace:
         assert target == "host"
         assert remote == "/work/dq"
         assert local.resolve() == pair.local.resolve()
         assert name in {None, "dq"}
-        pair.store.set_status(
-            WorkspaceStatus(
-                WorkspacePhase.INITIAL_SYNCING,
-                SyncProgress("initial-syncing"),
+        created = harness._next_connection_created
+        generation = pair.store.initial_sync_started_generation()
+        if created:
+            pair.store.publish_initial_sync_started(
+                WorkspaceStatus(
+                    WorkspacePhase.INITIAL_SYNCING,
+                    SyncProgress("initial-syncing"),
+                )
             )
-        )
-        return record
+        if created and harness._fast_initial_sync:
+            pair.store.complete_initial_sync(
+                WorkspaceStatus(WorkspacePhase.READY, SyncProgress("ready"))
+            )
+        return ConnectedWorkspace(record, created, generation)
+
+    def wait_initial_sync(
+        _record: BindingRecord,
+        generation: int,
+    ) -> WorkspaceStatus:
+        if pair.store.initial_sync_started_generation() <= generation:
+            raise RuntimeError("initial sync acknowledgement was not published")
+        return pair.store.get_status()
 
     def fetch_registered(
         _record: BindingRecord,
@@ -753,7 +779,14 @@ def make_cli_harness(tmp_path: Path) -> CliHarness:
         if harness._registry_delete_failures:
             harness._registry_delete_failures -= 1
             raise RuntimeError("registry busy")
-        delete_binding_record(record_to_delete.name, registry)
+        if not delete_binding_record(
+            record_to_delete.name,
+            registry,
+            workspace_id=record_to_delete.workspace_id,
+        ):
+            raise RuntimeError(
+                f"Connection {record_to_delete.name} changed during cleanup"
+            )
 
     services = CliServices(
         registry=registry,
@@ -774,6 +807,7 @@ def make_cli_harness(tmp_path: Path) -> CliHarness:
         request_sync=request_sync,
         run_remote=run_remote,
         connect_workspace=connect_workspace,
+        wait_initial_sync=wait_initial_sync,
         fetch_placeholders=fetch_registered,
         peek_placeholder=peek_registered,
         list_conflicts=lambda _record: pair.store.list_conflicts(unresolved_only=True),

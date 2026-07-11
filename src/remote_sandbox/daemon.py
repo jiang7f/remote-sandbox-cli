@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -62,6 +62,7 @@ class DaemonStatus:
     conn_state: str = "ok"
     phase: WorkspacePhase = WorkspacePhase.STOPPED
     workspace_status: WorkspaceStatus | None = None
+    initial_sync_generation: int = 0
 
 
 class StopResult(Enum):
@@ -128,13 +129,69 @@ class _ProductionComponents:
     mutation_handler: Callable[[str, dict[str, object]], dict[str, object]]
 
 
+class _MutationState(Enum):
+    QUEUED = "queued"
+    STARTED = "started"
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 @dataclass(slots=True)
 class _MutationRequest:
     kind: str
     payload: dict[str, object]
-    completed: threading.Event
+    state: _MutationState = _MutationState.QUEUED
     result: dict[str, object] | None = None
     error: BaseException | None = None
+    condition: threading.Condition = field(default_factory=threading.Condition)
+
+    def wait(self, timeout: float) -> _MutationState:
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while self.state is _MutationState.QUEUED:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.state = _MutationState.CANCELLED
+                    self.condition.notify_all()
+                    return self.state
+                self.condition.wait(timeout=remaining)
+            while self.state is _MutationState.STARTED:
+                self.condition.wait()
+            return self.state
+
+    def claim(self) -> bool:
+        with self.condition:
+            if self.state is not _MutationState.QUEUED:
+                return False
+            self.state = _MutationState.STARTED
+            self.condition.notify_all()
+            return True
+
+    def complete(self, result: dict[str, object]) -> None:
+        with self.condition:
+            if self.state is not _MutationState.STARTED:
+                raise RuntimeError("only a started mutation can complete")
+            self.result = result
+            self.state = _MutationState.COMPLETED
+            self.condition.notify_all()
+
+    def fail_started(self, error: BaseException) -> None:
+        with self.condition:
+            if self.state is not _MutationState.STARTED:
+                raise RuntimeError("only a started mutation can fail")
+            self.error = error
+            self.state = _MutationState.FAILED
+            self.condition.notify_all()
+
+    def fail_queued(self, error: BaseException) -> bool:
+        with self.condition:
+            if self.state is not _MutationState.QUEUED:
+                return False
+            self.error = error
+            self.state = _MutationState.FAILED
+            self.condition.notify_all()
+            return True
 
 
 class _SupervisorControlServer:
@@ -158,6 +215,9 @@ class _SupervisorControlServer:
         self._log = log
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        self._connection_threads: set[threading.Thread] = set()
+        self._connection_lock = threading.Lock()
+        self._connection_slots = threading.BoundedSemaphore(16)
 
     def start(self) -> None:
         path = str(self._runtime.socket)
@@ -188,43 +248,63 @@ class _SupervisorControlServer:
                 continue
             except OSError:
                 return
+            if not self._connection_slots.acquire(blocking=False):
+                with connection, contextlib.suppress(OSError):
+                    _send_line(connection, "error")
+                continue
+            thread = threading.Thread(
+                target=self._handle_connection,
+                args=(connection,),
+                name="codex-rsb-supervisor-request",
+                daemon=True,
+            )
+            with self._connection_lock:
+                self._connection_threads.add(thread)
+            thread.start()
+
+    def _handle_connection(self, connection: socket.socket) -> None:
+        try:
             with connection:
-                try:
-                    connection.settimeout(_CONTROL_REQUEST_TIMEOUT_S)
-                    request = _recv_line(connection).strip()
-                    verb = request.partition(" ")[0]
-                    if verb == "status":
-                        payload = _daemon_status_payload(self._status())
-                        _send_line(connection, json.dumps(payload, separators=(",", ":")))
-                    elif verb in {"sync", "poke"}:
-                        self._on_sync()
-                        _send_line(connection, "ok")
-                    elif verb == "resume":
-                        self._on_resume()
-                        _send_line(connection, "ok")
-                    elif verb == "stop":
-                        _send_line(connection, "ok")
-                        self._on_stop()
-                    elif verb == "mutate":
-                        raw_payload = request.partition(" ")[2]
-                        decoded = json.loads(raw_payload)
-                        if not isinstance(decoded, dict):
-                            raise ValueError("mutation request must be an object")
-                        kind = decoded.get("kind")
-                        mutation_payload: object = decoded.get("payload")
-                        if not isinstance(kind, str) or not isinstance(mutation_payload, dict):
-                            raise ValueError("mutation request is malformed")
-                        try:
-                            result = self._on_mutation(kind, mutation_payload)
-                        except Exception as exc:
-                            response = {"ok": False, "error": " ".join(str(exc).split())}
-                        else:
-                            response = {"ok": True, "result": result}
-                        _send_line(connection, json.dumps(response, separators=(",", ":")))
+                connection.settimeout(_CONTROL_REQUEST_TIMEOUT_S)
+                request = _recv_line(connection).strip()
+                verb = request.partition(" ")[0]
+                if verb == "status":
+                    payload = _daemon_status_payload(self._status())
+                    _send_line(connection, json.dumps(payload, separators=(",", ":")))
+                elif verb in {"sync", "poke"}:
+                    self._on_sync()
+                    _send_line(connection, "ok")
+                elif verb == "resume":
+                    self._on_resume()
+                    _send_line(connection, "ok")
+                elif verb == "stop":
+                    _send_line(connection, "ok")
+                    self._on_stop()
+                elif verb == "mutate":
+                    raw_payload = request.partition(" ")[2]
+                    decoded = json.loads(raw_payload)
+                    if not isinstance(decoded, dict):
+                        raise ValueError("mutation request must be an object")
+                    kind = decoded.get("kind")
+                    mutation_payload: object = decoded.get("payload")
+                    if not isinstance(kind, str) or not isinstance(mutation_payload, dict):
+                        raise ValueError("mutation request is malformed")
+                    try:
+                        result = self._on_mutation(kind, mutation_payload)
+                    except Exception as exc:
+                        response = {"ok": False, "error": " ".join(str(exc).split())}
                     else:
-                        _send_line(connection, "error")
-                except Exception as exc:  # pragma: no cover - defensive boundary
-                    self._log.warning("supervisor control request failed: %s", exc)
+                        response = {"ok": True, "result": result}
+                    _send_line(connection, json.dumps(response, separators=(",", ":")))
+                else:
+                    _send_line(connection, "error")
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            self._log.warning("supervisor control request failed: %s", exc)
+        finally:
+            current = threading.current_thread()
+            with self._connection_lock:
+                self._connection_threads.discard(current)
+            self._connection_slots.release()
 
     def stop(self) -> None:
         if self._sock is not None:
@@ -232,6 +312,10 @@ class _SupervisorControlServer:
                 self._sock.close()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        with self._connection_lock:
+            connections = tuple(self._connection_threads)
+        for thread in connections:
+            thread.join(timeout=2.0)
         self._runtime.socket.unlink(missing_ok=True)
 
 
@@ -258,6 +342,8 @@ class WorkspaceSupervisor:
         self._component_factory = component_factory
         self._mutation_handler = mutation_handler
         self._mutations: queue.Queue[_MutationRequest] = queue.Queue()
+        self._mutation_lock = threading.Lock()
+        self._queued_mutations: dict[int, _MutationRequest] = {}
         self._close_store = close_store
         self._stop_event = threading.Event()
         self._sync_requested = threading.Event()
@@ -354,6 +440,9 @@ class WorkspaceSupervisor:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._fail_queued_mutations(
+            DaemonError("supervisor stopped before mutation started")
+        )
         self._sync_requested.set()
         self._stop_subscription()
 
@@ -367,14 +456,24 @@ class WorkspaceSupervisor:
     ) -> dict[str, object]:
         if not kind or self._mutation_handler is None:
             raise DaemonError("supervisor mutation is unavailable")
-        request = _MutationRequest(kind, payload, threading.Event())
-        self._mutations.put(request)
+        request = _MutationRequest(kind, payload)
+        with self._mutation_lock:
+            if self._stop_event.is_set():
+                raise DaemonError("supervisor stopped before mutation started")
+            self._queued_mutations[id(request)] = request
+            self._mutations.put(request)
         self._sync_requested.set()
-        if not request.completed.wait(timeout=_MUTATION_TIMEOUT_S):
+        state = request.wait(_MUTATION_TIMEOUT_S)
+        if state is _MutationState.CANCELLED:
+            with self._mutation_lock:
+                self._queued_mutations.pop(id(request), None)
             raise DaemonError(f"supervisor mutation timed out: {kind}")
-        if request.error is not None:
+        if state is _MutationState.FAILED:
+            assert request.error is not None
             raise DaemonError(str(request.error)) from request.error
-        return request.result or {}
+        if state is not _MutationState.COMPLETED or request.result is None:
+            raise DaemonError("supervisor mutation ended without a result")
+        return request.result
 
     def resume(self) -> None:
         self._requires_foreground_auth = False
@@ -504,13 +603,30 @@ class WorkspaceSupervisor:
                 request = self._mutations.get_nowait()
             except queue.Empty:
                 return
+            with self._mutation_lock:
+                tracked = self._queued_mutations.pop(id(request), None)
+                claimed = tracked is not None and request.claim()
+            if not claimed:
+                continue
             try:
                 assert self._mutation_handler is not None
-                request.result = self._mutation_handler(request.kind, request.payload)
+                result = self._mutation_handler(request.kind, request.payload)
             except BaseException as exc:
-                request.error = exc
-            finally:
-                request.completed.set()
+                request.fail_started(exc)
+            else:
+                request.complete(result)
+
+    def _fail_queued_mutations(self, error: BaseException) -> None:
+        with self._mutation_lock:
+            queued = tuple(self._queued_mutations.values())
+            self._queued_mutations.clear()
+            while True:
+                try:
+                    self._mutations.get_nowait()
+                except queue.Empty:
+                    break
+        for request in queued:
+            request.fail_queued(error)
 
     def _start_subscription(self) -> None:
         if self.remote is None:
@@ -595,6 +711,7 @@ class WorkspaceSupervisor:
             conn_state=self._connection_state,
             phase=status.phase,
             workspace_status=status,
+            initial_sync_generation=self.store.initial_sync_started_generation(),
         )
 
     def _acquire_lock(self) -> BinaryIO:
@@ -692,6 +809,23 @@ class SupervisorClient:
             time.sleep(0.01)
         raise DaemonError(f"supervisor did not reach {phase.value}")
 
+    def wait_for_initial_sync_started(
+        self,
+        after_generation: int,
+        timeout: float,
+    ) -> DaemonStatus:
+        if type(after_generation) is not int or after_generation < 0:
+            raise ValueError("initial sync generation must be a non-negative integer")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = self.control_status()
+            if status.initial_sync_generation > after_generation:
+                return status
+            if status.phase in {WorkspacePhase.FAILED, WorkspacePhase.STOPPED}:
+                raise DaemonError(status.last_error or "workspace supervisor failed to start")
+            time.sleep(0.01)
+        raise DaemonError("supervisor did not publish initial-syncing acknowledgement")
+
     def stop(self) -> bool:
         return self._request("stop") is not None
 
@@ -708,7 +842,7 @@ class SupervisorClient:
             {"kind": kind, "payload": payload},
             separators=(",", ":"),
         )
-        reply = self._request(f"mutate {request}", timeout=_MUTATION_TIMEOUT_S)
+        reply = self._request(f"mutate {request}", timeout=None)
         if reply is None:
             raise DaemonError("supervisor mutation endpoint is unresponsive")
         decoded = json.loads(reply)
@@ -722,7 +856,12 @@ class SupervisorClient:
             raise DaemonError("supervisor mutation result is malformed")
         return cast(dict[str, object], result)
 
-    def _request(self, message: str, *, timeout: float = _CONTROL_REQUEST_TIMEOUT_S) -> str | None:
+    def _request(
+        self,
+        message: str,
+        *,
+        timeout: float | None = _CONTROL_REQUEST_TIMEOUT_S,
+    ) -> str | None:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.settimeout(timeout)
@@ -1081,6 +1220,7 @@ def _daemon_status_payload(status: DaemonStatus) -> dict[str, object]:
             if status.workspace_status is not None
             else None
         ),
+        "initial_sync_generation": status.initial_sync_generation,
     }
 
 
@@ -1094,6 +1234,7 @@ def _daemon_status_from_payload(payload: object) -> DaemonStatus:
     connection_state = payload.get("conn_state")
     phase = payload.get("phase")
     workspace_status_payload = payload.get("workspace_status")
+    initial_sync_generation = payload.get("initial_sync_generation", 0)
     if (
         type(running) is not bool
         or (pid is not None and type(pid) is not int)
@@ -1101,6 +1242,8 @@ def _daemon_status_from_payload(payload: object) -> DaemonStatus:
         or (last_error is not None and not isinstance(last_error, str))
         or not isinstance(connection_state, str)
         or not isinstance(phase, str)
+        or type(initial_sync_generation) is not int
+        or initial_sync_generation < 0
     ):
         raise DaemonError("malformed supervisor status")
     try:
@@ -1120,6 +1263,7 @@ def _daemon_status_from_payload(payload: object) -> DaemonStatus:
         connection_state,
         parsed_phase,
         workspace_status,
+        initial_sync_generation,
     )
 
 

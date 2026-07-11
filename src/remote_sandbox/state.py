@@ -348,6 +348,38 @@ class WorkspaceStore:
             raise RuntimeError("invalid initial sync completion state")
         return value == "1"
 
+    def initial_sync_started_generation(self) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'initial_sync_started_generation'"
+            ).fetchone()
+        if row is None:
+            return 0
+        value = _expect_str(row["value"], "initial sync started generation")
+        try:
+            generation = int(value)
+        except ValueError as exc:
+            raise RuntimeError("invalid initial sync started generation") from exc
+        if generation < 0:
+            raise RuntimeError("invalid initial sync started generation")
+        return generation
+
+    def publish_initial_sync_started(self, status: WorkspaceStatus) -> int:
+        if status.phase is not WorkspacePhase.INITIAL_SYNCING:
+            raise ValueError("initial sync start status must be initial-syncing")
+        with self.transaction():
+            generation = self.initial_sync_started_generation() + 1
+            self._set_status(status)
+            self._connection.execute(
+                """
+                INSERT INTO schema_meta(key, value)
+                VALUES ('initial_sync_started_generation', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(generation),),
+            )
+        return generation
+
     def mark_initial_sync_completed(self) -> None:
         with self.transaction():
             self._connection.execute(

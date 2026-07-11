@@ -120,11 +120,13 @@ class InitialSyncCoordinator:
         self._last_progress_at = 0.0
         self._scan_files = 0
         self._scan_bytes = 0
+        self._start_acknowledged = False
 
     def run(self) -> InitialSyncResult:
         self._started_at = self._clock()
         self._scan_files = 0
         self._scan_bytes = 0
+        self._start_acknowledged = False
         try:
             self._publish("scanning")
             sampled_local_start = self.start_local_watcher() or 0
@@ -363,17 +365,20 @@ class InitialSyncCoordinator:
         bytes_total: int = 0,
         current_path: str | None = None,
     ) -> None:
-        self.store.set_status(
-            self._status(
-                stage,
-                phase=phase,
-                files_done=files_done,
-                files_total=files_total,
-                bytes_done=bytes_done,
-                bytes_total=bytes_total,
-                current_path=current_path,
-            )
+        status = self._status(
+            stage,
+            phase=phase,
+            files_done=files_done,
+            files_total=files_total,
+            bytes_done=bytes_done,
+            bytes_total=bytes_total,
+            current_path=current_path,
         )
+        if phase is WorkspacePhase.INITIAL_SYNCING and not self._start_acknowledged:
+            self.store.publish_initial_sync_started(status)
+            self._start_acknowledged = True
+        else:
+            self.store.set_status(status)
 
     def _status(
         self,

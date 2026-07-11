@@ -61,7 +61,7 @@ from remote_sandbox.shell import (
 from remote_sandbox.ssh import SubprocessSshRunner
 from remote_sandbox.ssh_config import SshHost, load_configured_hosts
 from remote_sandbox.state import ConflictRecord, WorkspaceStore
-from remote_sandbox.status import WorkspaceStatus
+from remote_sandbox.status import WorkspacePhase, WorkspaceStatus
 from remote_sandbox.transport import BatchTransport
 from remote_sandbox.workspace import read_workspace_spec, workspace_paths
 
@@ -71,6 +71,13 @@ class RemoteCommandResult:
     returncode: int
     stdout: str = ""
     stderr: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectedWorkspace:
+    record: BindingRecord
+    created: bool
+    initial_sync_generation_before: int
 
 
 @dataclass(slots=True)
@@ -85,7 +92,8 @@ class CliServices:
     ensure_supervisor: Callable[[BindingRecord], object]
     request_sync: Callable[[BindingRecord], bool]
     run_remote: Callable[[BindingRecord, tuple[str, ...]], RemoteCommandResult]
-    connect_workspace: Callable[[str, str, Path, str | None], BindingRecord]
+    connect_workspace: Callable[[str, str, Path, str | None], ConnectedWorkspace]
+    wait_initial_sync: Callable[[BindingRecord, int], WorkspaceStatus]
     fetch_placeholders: Callable[
         [BindingRecord, str | None, bool, Callable[[str], bool]],
         tuple[int, bool],
@@ -199,22 +207,52 @@ def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
         return result.returncode
 
     if args.command == "connect" and args.no_shell:
-        record = services.connect_workspace(
+        connection = services.connect_workspace(
             args.target,
             args.remote,
             Path(args.local),
             args.name,
         )
+        record = connection.record
         services.ensure_supervisor(record)
-        status = services.workspace_status(record)
+        status = (
+            services.wait_initial_sync(
+                record,
+                connection.initial_sync_generation_before,
+            )
+            if connection.created
+            else services.workspace_status(record)
+        )
         if status.phase.value in {"failed", "stopped"}:
             raise DaemonError(status.last_error or "workspace supervisor failed to start")
         print(
             f"Connected {record.name}: {record.target}:{record.remote_path} "
             f"<-> {record.local_path}"
         )
-        print("The initial sync continues in background.")
-        print(f"Watch progress with `codex-rsb status {record.name} --watch`.")
+        _print_no_shell_status(record, status, initial=connection.created)
+        return 0
+
+    if args.command == "reconnect" and args.no_shell:
+        existing = services.find_record(args.name, services.registry)
+        if existing is None:
+            raise RegistryError(
+                f"no connection named {args.name!r}; run codex-rsb status"
+            )
+        local = Path(args.local) if args.local is not None else Path(existing.local_path)
+        connection = services.connect_workspace(
+            existing.target,
+            existing.remote_path,
+            local,
+            existing.name,
+        )
+        rebound = connection.record
+        services.ensure_supervisor(rebound)
+        _print_connection(rebound)
+        _print_no_shell_status(
+            rebound,
+            services.workspace_status(rebound),
+            initial=False,
+        )
         return 0
 
     if args.command == "fetch":
@@ -357,7 +395,7 @@ def default_cli_services() -> CliServices:
         remote: str,
         local: Path,
         name: str | None,
-    ) -> BindingRecord:
+    ) -> ConnectedWorkspace:
         result = bind_workspace(
             target=target,
             remote=remote,
@@ -366,7 +404,13 @@ def default_cli_services() -> CliServices:
             confirm=confirm_prompt,
             connection_name=name,
         )
-        return result.connection
+        with WorkspaceStore.open(workspace_paths(result.connection.workspace_id).state_db) as store:
+            generation = store.initial_sync_started_generation()
+        return ConnectedWorkspace(result.connection, result.created, generation)
+
+    def wait_initial_sync(record: BindingRecord, generation: int) -> WorkspaceStatus:
+        status = _supervisor_client(record).wait_for_initial_sync_started(generation, 5.0)
+        return status.workspace_status or status_for(record)
 
     def list_conflicts(record: BindingRecord) -> list[ConflictRecord]:
         with WorkspaceStore.open(workspace_paths(record.workspace_id).state_db) as store:
@@ -450,10 +494,19 @@ def default_cli_services() -> CliServices:
         )
 
     def delete_local(record: BindingRecord) -> None:
-        shutil.rmtree(workspace_paths(record.workspace_id).root, ignore_errors=True)
+        metadata_root = workspace_paths(record.workspace_id).root
+        if metadata_root.exists():
+            shutil.rmtree(metadata_root)
+        if metadata_root.exists():
+            raise RegistryError(f"Local metadata still exists: {metadata_root}")
 
     def delete_registry(record: BindingRecord) -> None:
-        delete_binding_record(record.name, registry)
+        if not delete_binding_record(
+            record.name,
+            registry,
+            workspace_id=record.workspace_id,
+        ):
+            raise RegistryError(f"Connection {record.name} changed during cleanup")
 
     return CliServices(
         registry=registry,
@@ -467,6 +520,7 @@ def default_cli_services() -> CliServices:
         request_sync=request_sync,
         run_remote=run_remote,
         connect_workspace=connect_workspace,
+        wait_initial_sync=wait_initial_sync,
         fetch_placeholders=fetch_registered,
         peek_placeholder=peek_registered,
         list_conflicts=list_conflicts,
@@ -910,7 +964,7 @@ def main(argv: list[str] | None = None) -> int:
             "resolve",
         }
         if args.command in service_commands or (
-            args.command == "connect" and args.no_shell
+            args.command in {"connect", "reconnect"} and args.no_shell
         ):
             return _dispatch_services(args, services)
         if args.command == "list":
@@ -945,12 +999,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     "interactive shell requires a TTY; rerun in a terminal or pass --no-shell"
                 )
-            record = services.connect_workspace(
+            connection = services.connect_workspace(
                 args.target,
                 args.remote,
                 Path(args.local),
                 args.name,
             )
+            record = connection.record
             _print_connection(record)
             return _open_wrapped_shell_for_record(record)
         if args.command == "reconnect":
@@ -964,17 +1019,21 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     "interactive shell requires a TTY; rerun in a terminal or pass --no-shell"
                 )
-            rebound = services.connect_workspace(
+            connection = services.connect_workspace(
                 existing.target,
                 existing.remote_path,
                 local,
                 existing.name,
             )
+            rebound = connection.record
             if args.no_shell:
                 services.ensure_supervisor(rebound)
                 _print_connection(rebound)
-                print("The initial sync continues in background.")
-                print(f"Watch progress with `codex-rsb status {rebound.name} --watch`.")
+                _print_no_shell_status(
+                    rebound,
+                    services.workspace_status(rebound),
+                    initial=False,
+                )
                 return 0
             _print_connection(rebound)
             return _open_wrapped_shell_for_record(rebound)
@@ -1114,6 +1173,21 @@ def _print_connection(record: BindingRecord) -> None:
         "Connected "
         f"{record.name}: {record.target}:{record.remote_path} <-> {record.local_path}"
     )
+
+
+def _print_no_shell_status(
+    record: BindingRecord,
+    status: WorkspaceStatus,
+    *,
+    initial: bool,
+) -> None:
+    if status.phase is WorkspacePhase.INITIAL_SYNCING:
+        print("The initial sync continues in background.")
+        print(f"Watch progress with `codex-rsb status {record.name} --watch`.")
+    elif status.phase is WorkspacePhase.READY:
+        print("Initial sync completed." if initial else "Workspace is ready.")
+    else:
+        print(f"Workspace supervisor phase: {status.phase.value}")
 
 
 def _has_tty() -> bool:

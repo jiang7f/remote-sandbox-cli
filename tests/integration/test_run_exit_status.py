@@ -119,6 +119,48 @@ def test_no_shell_connect_returns_after_initial_syncing_publication(
     assert "initial sync continues in background" in result.stdout
     assert "codex-rsb status dq --watch" in result.stdout
     assert cli_fixture.store.get_status().phase.value == "initial-syncing"
+    assert cli_fixture.store.initial_sync_started_generation() == 1
+
+
+def test_no_shell_fast_initial_sync_uses_ack_without_false_background_copy(
+    cli_fixture: CliHarness,
+) -> None:
+    cli_fixture.complete_initial_sync_immediately()
+
+    result = cli_fixture.run(
+        [
+            "connect",
+            "host",
+            "--remote",
+            "/work/dq",
+            "--local",
+            str(cli_fixture.pair.local),
+            "--name",
+            "dq",
+            "--no-shell",
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert cli_fixture.store.initial_sync_started_generation() == 1
+    assert cli_fixture.store.get_status().phase.value == "ready"
+    assert "continues in background" not in result.stdout
+    assert "Initial sync completed" in result.stdout
+
+
+def test_reconnect_completed_workspace_does_not_wait_for_new_initial_ack(
+    cli_fixture: CliHarness,
+) -> None:
+    cli_fixture.reconnect_existing_workspace()
+    cli_fixture.services.wait_initial_sync = lambda _record, _generation: (_ for _ in ()).throw(
+        AssertionError("reconnect must not wait for initial-sync acknowledgement")
+    )
+
+    result = cli_fixture.run(["reconnect", "dq", "--no-shell"])
+
+    assert result.exit_code == 0
+    assert "Workspace is ready" in result.stdout
+    assert "continues in background" not in result.stdout
 
 
 def test_default_error_is_one_line_and_debug_enables_traceback(

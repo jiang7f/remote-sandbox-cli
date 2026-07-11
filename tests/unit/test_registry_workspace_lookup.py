@@ -1,4 +1,12 @@
+import contextlib
+import multiprocessing
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from threading import BrokenBarrierError
+from typing import Protocol
+from unittest.mock import patch
 
 import pytest
 
@@ -6,11 +14,60 @@ from remote_sandbox.registry import (
     BindingRecord,
     RegistryError,
     current_workspace_record,
+    delete_binding_record,
     list_binding_records,
     register_workspace,
     upsert_binding_record,
 )
 from remote_sandbox.workspace import WorkspaceSpec
+
+
+class _ProcessBarrier(Protocol):
+    def wait(self, timeout: float | None = None) -> int: ...
+
+
+@contextmanager
+def _synchronized_registry_read(
+    registry: Path,
+    barrier: _ProcessBarrier,
+) -> Iterator[None]:
+    original_read_text = Path.read_text
+
+    def synchronized_read_text(
+        path: Path,
+        encoding: str | None = None,
+        errors: str | None = None,
+    ) -> str:
+        content = original_read_text(path, encoding=encoding, errors=errors)
+        if path == registry:
+            with contextlib.suppress(BrokenBarrierError):
+                barrier.wait(timeout=0.5)
+        return content
+
+    with patch.object(Path, "read_text", synchronized_read_text):
+        yield
+
+
+def _synchronized_upsert(
+    registry: Path,
+    record: BindingRecord,
+    barrier: _ProcessBarrier,
+) -> None:
+    with _synchronized_registry_read(registry, barrier):
+        upsert_binding_record(registry, record)
+
+
+def _synchronized_delete(
+    registry: Path,
+    record: BindingRecord,
+    barrier: _ProcessBarrier,
+) -> None:
+    with _synchronized_registry_read(registry, barrier):
+        delete_binding_record(
+            record.name,
+            registry,
+            workspace_id=record.workspace_id,
+        )
 
 
 def _workspace_spec(
@@ -27,6 +84,17 @@ def _workspace_spec(
         local_root=str(local_root),
         remote_root=f"/remote/{name}",
         created_at="2026-07-10T00:00:00+00:00",
+    )
+
+
+def _record(name: str, workspace_suffix: int, local_root: Path) -> BindingRecord:
+    return BindingRecord(
+        name=name,
+        workspace_id=f"00000000-0000-4000-8000-{workspace_suffix:012d}",
+        target="host",
+        remote_path=f"/remote/{name}",
+        local_path=str(local_root),
+        updated_at="2026-07-10T00:00:00Z",
     )
 
 
@@ -152,3 +220,86 @@ def test_current_workspace_does_not_read_in_tree_marker(
 
     assert record is not None
     assert record.name == "dq"
+
+
+def test_concurrent_upserts_preserve_both_records(
+    tmp_path: Path,
+) -> None:
+    registry = tmp_path / "codex-home" / "connections.toml"
+    upsert_binding_record(registry, _record("seed", 1, tmp_path / "seed"))
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(2)
+    first = context.Process(
+        target=_synchronized_upsert,
+        args=(registry, _record("first", 2, tmp_path / "first"), barrier),
+    )
+    second = context.Process(
+        target=_synchronized_upsert,
+        args=(registry, _record("second", 3, tmp_path / "second"), barrier),
+    )
+
+    first.start()
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert first.exitcode == 0
+    assert second.exitcode == 0
+    assert [record.name for record in list_binding_records(registry)] == [
+        "first",
+        "second",
+        "seed",
+    ]
+
+
+def test_concurrent_upsert_and_delete_preserve_both_mutations(
+    tmp_path: Path,
+) -> None:
+    registry = tmp_path / "codex-home" / "connections.toml"
+    seed = _record("seed", 1, tmp_path / "seed")
+    upsert_binding_record(registry, seed)
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(2)
+    insert = context.Process(
+        target=_synchronized_upsert,
+        args=(registry, _record("added", 2, tmp_path / "added"), barrier),
+    )
+    delete = context.Process(
+        target=_synchronized_delete,
+        args=(registry, seed, barrier),
+    )
+
+    insert.start()
+    delete.start()
+    insert.join(timeout=5)
+    delete.join(timeout=5)
+
+    assert insert.exitcode == 0
+    assert delete.exitcode == 0
+    assert [record.name for record in list_binding_records(registry)] == ["added"]
+
+
+def test_delete_binding_record_does_not_delete_rebound_name(tmp_path: Path) -> None:
+    registry = tmp_path / "codex-home" / "connections.toml"
+    replacement = _record("dq", 2, tmp_path / "replacement")
+    upsert_binding_record(registry, replacement)
+
+    deleted = delete_binding_record(
+        "dq",
+        registry,
+        workspace_id="00000000-0000-4000-8000-000000000001",
+    )
+
+    assert deleted is False
+    assert list_binding_records(registry) == [replacement]
+
+
+def test_registry_transaction_files_have_private_permissions(tmp_path: Path) -> None:
+    registry = tmp_path / "codex-home" / "connections.toml"
+
+    upsert_binding_record(registry, _record("dq", 1, tmp_path / "dq"))
+
+    lock_path = registry.with_name(f"{registry.name}.lock")
+    assert stat.S_IMODE(registry.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(registry.stat().st_mode) == 0o600
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600

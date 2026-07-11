@@ -59,6 +59,27 @@ def test_initial_sync_completion_survives_reopen(tmp_path: Path) -> None:
         assert reopened.initial_sync_completed() is True
 
 
+def test_initial_sync_start_acknowledgement_survives_ready_transition(tmp_path: Path) -> None:
+    with WorkspaceStore.open(tmp_path / "state.sqlite3") as store:
+        initial = WorkspaceStatus(
+            WorkspacePhase.INITIAL_SYNCING,
+            SyncProgress("scanning"),
+        )
+
+        generation = store.publish_initial_sync_started(initial)
+
+        assert generation == 1
+        assert store.get_status() == initial
+        assert store.initial_sync_started_generation() == 1
+
+        store.complete_initial_sync(
+            WorkspaceStatus(WorkspacePhase.READY, SyncProgress("ready"))
+        )
+
+        assert store.get_status().phase is WorkspacePhase.READY
+        assert store.initial_sync_started_generation() == 1
+
+
 def test_initial_sync_terminal_commit_is_atomic_across_crash_boundary(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     syncing = WorkspaceStatus(WorkspacePhase.INITIAL_SYNCING, SyncProgress("replaying"))
