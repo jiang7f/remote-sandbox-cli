@@ -13,10 +13,12 @@ from remote_sandbox.bind import BindError, bind_workspace
 from remote_sandbox.daemon import (
     DaemonError,
     StopResult,
+    daemon_control_status,
     daemon_status,
     ensure_daemon,
     poke_daemon,
     stop_daemon_result,
+    wait_for_daemon_control,
 )
 from remote_sandbox.fetch import FetchError, fetch_placeholders
 from remote_sandbox.marker import METADATA_DIR, read_local_marker, remove_local_metadata
@@ -42,6 +44,7 @@ from remote_sandbox.shell import (
     ConnectRequestEvent,
     ConnectResponse,
     InitialShellDirection,
+    ReadyProbeResult,
     enter_shell_loop,
 )
 from remote_sandbox.ssh import SshError, SubprocessSshRunner
@@ -462,8 +465,6 @@ def enter_and_bind(*, target: str, remote: str, local: Path, open_shell: bool) -
         return "remote-to-local"
 
     def _connect(event: ConnectRequestEvent) -> ConnectResponse:
-        import time
-
         selected_local = Path(event.local) if event.local is not None else local
         result = bind_workspace(
             target=target,
@@ -475,17 +476,26 @@ def enter_and_bind(*, target: str, remote: str, local: Path, open_shell: bool) -
         )
         bound_local = Path(result.connection.local_path)
         direction = _initial_direction(bound_local, result.connection.remote_path)
-        status = ensure_daemon(bound_local, runner=runner)
-        deadline = time.monotonic() + 5.0
-        while status.phase.value == "starting" and time.monotonic() < deadline:
-            time.sleep(0.01)
-            status = daemon_status(bound_local)
-        if status.phase.value == "starting":
-            raise DaemonError("supervisor did not publish initial sync state")
+        ensure_daemon(bound_local, runner=runner)
+        status = wait_for_daemon_control(bound_local, 5.0)
         if not status.running or status.pid is None:
             raise DaemonError("supervisor did not publish its process state")
         if status.phase.value in {"failed", "stopped"}:
             raise DaemonError(status.last_error or "workspace supervisor failed to start")
+
+        def _ready_probe() -> ReadyProbeResult:
+            try:
+                current = daemon_control_status(bound_local)
+            except DaemonError:
+                return "pending"
+            if current.phase.value == "ready":
+                return "ready"
+            if current.phase.value in {"failed", "stopped"}:
+                return "stop"
+            if current.conn_state == "disconnected":
+                return "stop"
+            return "pending"
+
         _print_connection(result.connection)
         return ConnectResponse(
             ok=True,
@@ -493,6 +503,7 @@ def enter_and_bind(*, target: str, remote: str, local: Path, open_shell: bool) -
             name=result.connection.name,
             remote_root=result.connection.remote_path,
             direction=direction,
+            ready_probe=_ready_probe if direction == "local-to-remote" else None,
         )
 
     del open_shell

@@ -61,6 +61,22 @@ def test_local_to_remote_uses_home_as_the_holding_directory() -> None:
     assert branch.index('cd -- "$HOME"') < branch.index("__codex_workspace_holding=$PWD")
 
 
+def test_ready_transition_has_authenticated_prompt_and_private_readline_trigger() -> None:
+    script = _enter_rcfile()
+
+    assert "codex-rsb;prompt;%s" in script
+    assert '"$__codex_nonce"' in script
+    assert "bind -x" in script
+    assert "__codex_rsb_publish_ready" in script
+    assert "READLINE_LINE" in script
+    assert "READLINE_POINT" in script
+    assert 'bind -x \'"\\C-x\\C-]": __codex_rsb_ready_key\'' in script
+    assert "\\e[778~" not in script
+    assert "\\e[777~" not in script
+    assert shell_module._ready_key_sequence() == b"\x18\x1d"
+    assert shell_module._READY_PROBE_INTERVAL_S >= 0.25
+
+
 def test_connect_request_parser_requires_the_session_nonce_across_chunks() -> None:
     payload = base64.b64encode(
         json.dumps(
@@ -85,6 +101,15 @@ def test_connect_request_parser_requires_the_session_nonce_across_chunks() -> No
 
     forged = marker.replace(b";good;", b";wrong;")
     assert ShellOutputParser("good").feed(forged) == [BytesEvent(forged)]
+
+
+def test_prompt_marker_requires_the_session_nonce() -> None:
+    marker = b"\x1b]777;codex-rsb;prompt;good\x07"
+
+    assert ShellOutputParser("good").feed(marker) == [shell_module.PromptEvent()]
+    assert ShellOutputParser("good").feed(
+        marker.replace(b";good\x07", b";wrong\x07")
+    ) == [BytesEvent(marker.replace(b";good\x07", b";wrong\x07"))]
 
 
 def test_raw_terminal_restores_attributes_after_an_exception(
@@ -140,6 +165,23 @@ def test_success_response_preserves_unicode_and_spaces() -> None:
     )
 
     assert response.encode() == "ok\tw1\tdq\t/work/量子 project\tlocal-to-remote"
+
+
+def test_success_response_can_retain_a_local_ready_probe() -> None:
+    def probe() -> bool:
+        return True
+
+    response = ConnectResponse(
+        ok=True,
+        workspace_id="w1",
+        name="dq",
+        remote_root="/work/dq",
+        direction="local-to-remote",
+        ready_probe=probe,
+    )
+
+    assert response.ready_probe is probe
+    assert response.encode() == "ok\tw1\tdq\t/work/dq\tlocal-to-remote"
 
 
 @pytest.mark.parametrize(
@@ -264,6 +306,13 @@ def test_enter_and_bind_responds_after_initial_sync_state_is_published(
             last_error=None,
         )
 
+    def fake_wait_for_daemon_control(
+        local_root: Path,
+        timeout: float,
+    ) -> SimpleNamespace:
+        assert timeout == 5.0
+        return fake_daemon_status(local_root)
+
     def fake_enter_shell_loop(
         target: str,
         cwd: str,
@@ -289,6 +338,7 @@ def test_enter_and_bind_responds_after_initial_sync_state_is_published(
     monkeypatch.setattr(cli, "bind_workspace", fake_bind_workspace)
     monkeypatch.setattr(cli, "ensure_daemon", fake_ensure_daemon)
     monkeypatch.setattr(cli, "daemon_status", fake_daemon_status)
+    monkeypatch.setattr(cli, "wait_for_daemon_control", fake_wait_for_daemon_control)
     monkeypatch.setattr(cli, "enter_shell_loop", fake_enter_shell_loop)
     monkeypatch.setattr(cli, "_print_connection", lambda _record: None)
     monkeypatch.setattr(
@@ -314,6 +364,84 @@ def test_enter_and_bind_responds_after_initial_sync_state_is_published(
             remote_root="/work/量子 project",
             direction="remote-to-local",
         )
+    ]
+
+
+def test_enter_and_bind_rejects_durable_status_without_control_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    selected_local = tmp_path / "local"
+    selected_local.mkdir()
+    connection = BindingRecord(
+        name="dq",
+        workspace_id="00000000-0000-4000-8000-000000000014",
+        target="host",
+        remote_path="/work/dq",
+        local_path=str(selected_local),
+        updated_at="2026-07-11T00:00:00+00:00",
+    )
+    captured: list[ConnectResponse] = []
+
+    class FakeRunner:
+        def listdir(self, target: str, remote: str) -> list[str]:
+            assert (target, remote) == ("host", "/work/dq")
+            return ["source.txt"]
+
+    fallback_status = SimpleNamespace(
+        running=True,
+        pid=1234,
+        phase=SimpleNamespace(value="initial-syncing"),
+        last_error=None,
+    )
+
+    monkeypatch.setattr(
+        cli,
+        "bind_workspace",
+        lambda **_kwargs: SimpleNamespace(
+            workspace=SimpleNamespace(workspace_id=connection.workspace_id),
+            connection=connection,
+        ),
+    )
+    monkeypatch.setattr(cli, "SubprocessSshRunner", FakeRunner)
+    monkeypatch.setattr(cli, "ensure_daemon", lambda *_args, **_kwargs: fallback_status)
+    monkeypatch.setattr(cli, "daemon_status", lambda _root: fallback_status)
+
+    def control_unavailable(_root: Path, _timeout: float) -> object:
+        raise cli.DaemonError("supervisor control endpoint is unresponsive")
+
+    monkeypatch.setattr(
+        cli,
+        "wait_for_daemon_control",
+        control_unavailable,
+        raising=False,
+    )
+
+    def fake_enter_shell_loop(
+        _target: str,
+        _cwd: str,
+        *,
+        nonce: str,
+        on_connect_request: Any,
+    ) -> EnterShellResult:
+        assert nonce
+        try:
+            response = on_connect_request(
+                ConnectRequestEvent(remote="/work/dq", local=str(selected_local), name="dq")
+            )
+        except Exception as exc:
+            response = ConnectResponse(ok=False, error=str(exc))
+        captured.append(response)
+        return EnterShellResult(0, "/work/dq", str(selected_local), "dq")
+
+    monkeypatch.setattr(cli, "enter_shell_loop", fake_enter_shell_loop)
+    monkeypatch.setattr(cli, "_print_connection", lambda _record: None)
+
+    result = cli.enter_and_bind(target="host", remote="~", local=tmp_path, open_shell=True)
+
+    assert result == 0
+    assert captured == [
+        ConnectResponse(ok=False, error="supervisor control endpoint is unresponsive")
     ]
 
 

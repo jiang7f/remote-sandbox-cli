@@ -591,6 +591,12 @@ class SupervisorClient:
             )
         return DaemonStatus(False, None, phase=WorkspacePhase.STOPPED)
 
+    def control_status(self) -> DaemonStatus:
+        reply = self._request("status")
+        if reply is None:
+            raise DaemonError("supervisor control endpoint is unresponsive")
+        return _daemon_status_from_payload(json.loads(reply))
+
     def wait_until_running(self, timeout: float) -> DaemonStatus:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -655,6 +661,25 @@ def daemon_status(local_root: Path) -> DaemonStatus:
         return SupervisorClient(_runtime_for_local(local_root)).status()
     except DaemonError:
         return DaemonStatus(False, None, phase=WorkspacePhase.STOPPED)
+
+
+def daemon_control_status(local_root: Path) -> DaemonStatus:
+    return SupervisorClient(_runtime_for_local(local_root)).control_status()
+
+
+def wait_for_daemon_control(local_root: Path, timeout: float) -> DaemonStatus:
+    client = SupervisorClient(_runtime_for_local(local_root))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            status = client.control_status()
+        except DaemonError:
+            time.sleep(0.01)
+            continue
+        if status.phase is not WorkspacePhase.STARTING:
+            return status
+        time.sleep(0.01)
+    raise DaemonError("supervisor control endpoint is unresponsive")
 
 
 def poke_daemon(local_root: Path, source: str = "cli") -> bool:

@@ -12,10 +12,11 @@ import shlex
 import struct
 import sys
 import termios
+import time
 import tty
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 from remote_sandbox.registry import RegistryError, validate_connection_name
@@ -41,7 +42,14 @@ class ConnectRequestEvent:
     name: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PromptEvent:
+    pass
+
+
 InitialShellDirection = Literal["local-to-remote", "remote-to-local", "empty"]
+ReadyProbeResult = Literal["pending", "ready", "stop"]
+_READY_PROBE_INTERVAL_S = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +60,11 @@ class ConnectResponse:
     remote_root: str | None = None
     direction: InitialShellDirection | None = None
     error: str | None = None
+    ready_probe: Callable[[], ReadyProbeResult | bool] | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def encode(self) -> str:
         if not self.ok:
@@ -143,7 +156,7 @@ class EnterShellResult:
     name: str | None = None
 
 
-ShellEvent = BytesEvent | BarrierEvent | ConnectRequestEvent
+ShellEvent = BytesEvent | BarrierEvent | ConnectRequestEvent | PromptEvent
 ShellBackend = Callable[[list[str], str, Callable[[int], None]], int]
 ConnectRequestHandler = Callable[[ConnectRequestEvent], ConnectResponse]
 EnterShellBackend = Callable[[list[str], str, ConnectRequestHandler], int]
@@ -382,7 +395,16 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "  __codex_workspace_holding=\n"
         "  __codex_workspace_pending_root=\n"
         "}\n"
+        "__codex_rsb_ready_key() {\n"
+        "  local __codex_saved_line=$READLINE_LINE\n"
+        "  local __codex_saved_point=$READLINE_POINT\n"
+        "  __codex_rsb_publish_ready\n"
+        "  READLINE_LINE=$__codex_saved_line\n"
+        "  READLINE_POINT=$__codex_saved_point\n"
+        "}\n"
+        "bind -x '\"\\C-x\\C-]\": __codex_rsb_ready_key'\n"
         "__codex_enter_prompt() {\n"
+        "  printf '\\033]777;codex-rsb;prompt;%s\\007' \"$__codex_nonce\"\n"
         "  if [ \"$__codex_prompt_mode\" = managed ]; then\n"
         "    PS1='\\[\\e[01;36m\\][${CODEX_RSB_DISPLAY_LABEL}:"
         "${CODEX_RSB_WORKSPACE_NAME}]\\[\\e[00m\\] ${CONDA_PROMPT_MODIFIER}"
@@ -423,7 +445,12 @@ class ShellOutputParser:
         self._connect_request_prefix = (
             f"\x1b]777;codex-rsb;connect-request;{nonce};".encode()
         )
-        self._prefixes = (self._cmd_done_prefix, self._connect_request_prefix)
+        self._prompt_prefix = f"\x1b]777;codex-rsb;prompt;{nonce}".encode()
+        self._prefixes = (
+            self._cmd_done_prefix,
+            self._connect_request_prefix,
+            self._prompt_prefix,
+        )
         self._buffer = b""
 
     def feed(self, data: bytes) -> list[ShellEvent]:
@@ -492,6 +519,8 @@ class ShellOutputParser:
             except (ValueError, RegistryError):
                 return None
             return ConnectRequestEvent(remote=remote, local=local, name=name)
+        if prefix == self._prompt_prefix and not payload:
+            return PromptEvent()
         return None
 
 
@@ -510,14 +539,14 @@ def process_shell_output(
                 write_output(event.data)
             elif isinstance(event, BarrierEvent):
                 on_barrier(event.status)
-            elif on_connect_request is not None:
+            elif isinstance(event, ConnectRequestEvent) and on_connect_request is not None:
                 on_connect_request(event)
     for event in parser.flush():
         if isinstance(event, BytesEvent):
             write_output(event.data)
         elif isinstance(event, BarrierEvent):
             on_barrier(event.status)
-        elif on_connect_request is not None:
+        elif isinstance(event, ConnectRequestEvent) and on_connect_request is not None:
             on_connect_request(event)
 
 
@@ -615,6 +644,10 @@ def _pty_enter_shell_backend(
     if pid == 0:
         os.execvp(argv[0], argv)
     parser = ShellOutputParser(nonce)
+    ready_probe: Callable[[], ReadyProbeResult | bool] | None = None
+    ready_latched = False
+    at_prompt = False
+    next_ready_probe_at = 0.0
     stdin_fd = sys.stdin.fileno()
     try:
         original_terminal = termios.tcgetattr(stdin_fd)
@@ -625,7 +658,10 @@ def _pty_enter_shell_backend(
     with _mirrored_window_size(master_fd):
         try:
             while True:
-                readable, _, _ = select.select([master_fd, stdin_fd], [], [])
+                timeout: float | None = None
+                if ready_probe is not None:
+                    timeout = max(0.0, next_ready_probe_at - time.monotonic())
+                readable, _, _ = select.select([master_fd, stdin_fd], [], [], timeout)
                 if master_fd in readable:
                     try:
                         data = os.read(master_fd, 4096)
@@ -636,6 +672,8 @@ def _pty_enter_shell_backend(
                     for event in parser.feed(data):
                         if isinstance(event, BytesEvent):
                             os.write(sys.stdout.fileno(), event.data)
+                        elif isinstance(event, PromptEvent):
+                            at_prompt = True
                         elif isinstance(event, ConnectRequestEvent):
                             if original_terminal is not None:
                                 termios.tcsetattr(
@@ -655,11 +693,37 @@ def _pty_enter_shell_backend(
                                 if original_terminal is not None:
                                     tty.setraw(stdin_fd)
                             os.write(master_fd, payload)
+                            if (
+                                response.ok
+                                and response.direction == "local-to-remote"
+                                and response.ready_probe is not None
+                            ):
+                                ready_probe = response.ready_probe
+                                ready_latched = False
+                                next_ready_probe_at = time.monotonic()
                 if stdin_fd in readable:
                     data = os.read(stdin_fd, 4096)
                     if not data:
                         break
+                    if any(char in data for char in b"\r\n\x03\x04\x1a"):
+                        at_prompt = False
                     os.write(master_fd, data)
+                now = time.monotonic()
+                if ready_probe is not None and now >= next_ready_probe_at:
+                    next_ready_probe_at = now + _READY_PROBE_INTERVAL_S
+                    try:
+                        probe_result = ready_probe()
+                    except Exception:
+                        probe_result = "pending"
+                    if probe_result is True or probe_result == "ready":
+                        ready_probe = None
+                        ready_latched = True
+                    elif probe_result == "stop":
+                        ready_probe = None
+                if ready_latched and at_prompt:
+                    os.write(master_fd, _ready_key_sequence())
+                    ready_latched = False
+                    at_prompt = False
         finally:
             for event in parser.flush():
                 if isinstance(event, BytesEvent):
@@ -763,6 +827,10 @@ def _protocol_error_text(error: str | None) -> str:
     value = error or "binding failed"
     printable = "".join(" " if _has_control_char(char) else char for char in value)
     return " ".join(printable.split()) or "binding failed"
+
+
+def _ready_key_sequence() -> bytes:
+    return b"\x18\x1d"
 
 
 def _resolve_test_remote_cwd(current: str, requested: str) -> str:
