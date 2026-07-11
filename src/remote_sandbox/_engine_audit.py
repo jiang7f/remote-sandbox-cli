@@ -52,12 +52,20 @@ class AuditCoordinator:
         local_entries, local_signatures = self.local.snapshot_with_signatures(base)
         remote_snapshot = self.remote.snapshot()
         remote_entries = remote_snapshot.entries
-        paths = sorted(set(base) | set(local_entries) | set(remote_entries))
         stored_local = self.store.list_audit_signatures("local")
         stored_remote = self.store.list_audit_signatures("remote")
+        paths = sorted(
+            set(base)
+            | set(local_entries)
+            | set(remote_entries)
+            | set(stored_local)
+            | set(stored_remote)
+        )
         dirty: set[str] = set()
         ambiguous_local: list[str] = []
         ambiguous_remote: list[str] = []
+        local_updates: dict[str, AuditSignature | None] = {}
+        remote_updates: dict[str, AuditSignature | None] = {}
 
         for path in paths:
             if self.policy.is_ignored(path):
@@ -65,46 +73,63 @@ class AuditCoordinator:
             base_entry = base.get(path)
             local_entry = local_entries.get(path, MissingEntry(path))
             remote_entry = remote_entries.get(path, MissingEntry(path))
-            if not quick_matches_base(local_entry, base_entry) or not quick_matches_base(
-                remote_entry, base_entry
-            ):
+            local_quick = _side_quick_matches(local_entry, base_entry, side="local")
+            remote_quick = _side_quick_matches(remote_entry, base_entry, side="remote")
+            if not local_quick or not remote_quick:
                 dirty.add(path)
-                continue
             if base_entry is None or base_entry.kind is not EntryKind.FILE:
+                if local_quick:
+                    local_updates[path] = local_signatures.get(path)
+                if remote_quick:
+                    remote_updates[path] = remote_snapshot.signatures.get(path)
                 continue
             if base_entry.is_placeholder:
+                if local_quick:
+                    local_updates[path] = local_signatures.get(path)
+                if remote_quick:
+                    if stored_remote.get(path) != remote_snapshot.signatures.get(path):
+                        ambiguous_remote.append(path)
+                    else:
+                        remote_updates[path] = remote_snapshot.signatures.get(path)
                 continue
-            if stored_local.get(path) != local_signatures.get(path):
+            if local_quick and stored_local.get(path) != local_signatures.get(path):
                 ambiguous_local.append(path)
-            if stored_remote.get(path) != remote_snapshot.signatures.get(path):
+            elif local_quick:
+                local_updates[path] = local_signatures.get(path)
+            if remote_quick and stored_remote.get(path) != remote_snapshot.signatures.get(path):
                 ambiguous_remote.append(path)
+            elif remote_quick:
+                remote_updates[path] = remote_snapshot.signatures.get(path)
 
-        local_hashes = (
-            self.local.paths(ambiguous_local, with_hash=True, base=base)
-            if ambiguous_local
-            else {}
-        )
-        remote_hashes = self.remote.hash_paths(ambiguous_remote) if ambiguous_remote else {}
+        if ambiguous_local:
+            local_hashes, local_observed_signatures = self.local.observations(
+                ambiguous_local,
+                with_hash=True,
+                base=base,
+            )
+        else:
+            local_hashes, local_observed_signatures = {}, {}
+        if ambiguous_remote:
+            remote_hashes, remote_observed_signatures = self.remote.observations(
+                ambiguous_remote,
+                with_hash=True,
+            )
+        else:
+            remote_hashes, remote_observed_signatures = {}, {}
         for path in ambiguous_local:
-            if not _strong_matches_base(local_hashes[path], base.get(path)):
+            if _strong_matches_base(local_hashes[path], base.get(path)):
+                local_updates[path] = local_observed_signatures[path]
+            else:
                 dirty.add(path)
         for path in ambiguous_remote:
-            if not _strong_matches_base(remote_hashes[path], base.get(path)):
+            if _strong_matches_base(remote_hashes[path], base.get(path)):
+                remote_updates[path] = remote_observed_signatures[path]
+            else:
                 dirty.add(path)
 
-        clean_local = {
-            path: signature
-            for path, signature in local_signatures.items()
-            if path not in dirty and path in base
-        }
-        clean_remote = {
-            path: signature
-            for path, signature in remote_snapshot.signatures.items()
-            if path not in dirty and path in base
-        }
         with self.store.transaction():
-            self.store.replace_audit_signatures("local", clean_local)
-            self.store.replace_audit_signatures("remote", clean_remote)
+            self.store.update_audit_signatures("local", local_updates)
+            self.store.update_audit_signatures("remote", remote_updates)
             if dirty:
                 self.store.requeue_paths(dirty, "audit-drift")
 
@@ -154,6 +179,22 @@ def _strong_matches_base(
         and current.content_hash is not None
         and base.content_hash is not None
         and current.content_hash == base.content_hash
+    )
+
+
+def _side_quick_matches(
+    current: FingerprintState,
+    base: EntryFingerprint | None,
+    *,
+    side: str,
+) -> bool:
+    if base is None or not base.is_placeholder:
+        return quick_matches_base(current, base)
+    if side == "local":
+        return current == base
+    return (
+        isinstance(current, EntryFingerprint)
+        and current.kind is EntryKind.FILE
     )
 
 
