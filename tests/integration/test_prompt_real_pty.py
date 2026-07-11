@@ -131,7 +131,10 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
         os.write(frontend_master, b"printf 'PS1-COPY:%s\\n' \"$PS1\"\n")
         _read_until(frontend_master, output, b"PS1-COPY:", timeout=2.0, start=ps1_start)
         _read_until(frontend_master, output, slot, timeout=2.0, start=ps1_start)
-        assert b"\\[\\e]777;codex-rsb;prompt;${__codex_nonce}\\a\\]" in output[ps1_start:]
+        assert (
+            b"\\[\\e]777;codex-rsb;prompt;${__codex_nonce};managed\\a\\]"
+            in output[ps1_start:]
+        )
 
         pid_start = len(output)
         os.write(frontend_master, b"printf 'PID:%s\\n' \"$$\"\n")
@@ -230,8 +233,9 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
             later - earlier >= 0.20
             for earlier, later in zip(probe_times, probe_times[1:], strict=False)
         )
-        prompt_marker = f"\x1b]777;codex-rsb;prompt;{nonce}\x07".encode()
-        assert prompt_marker not in output
+        for mode in ("enter", "managed"):
+            prompt_marker = f"\x1b]777;codex-rsb;prompt;{nonce};{mode}\x07".encode()
+            assert prompt_marker not in output
         text = output.decode("utf-8", errors="replace")
         assert "connect-request" not in text
         assert "ok\t00000000" not in text

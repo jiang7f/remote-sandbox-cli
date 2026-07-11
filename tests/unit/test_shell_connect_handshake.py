@@ -66,7 +66,8 @@ def test_local_to_remote_uses_home_as_the_holding_directory() -> None:
 def test_ready_transition_has_authenticated_prompt_and_private_readline_trigger() -> None:
     script = _enter_rcfile()
 
-    assert "\\e]777;codex-rsb;prompt;${__codex_nonce}\\a" in script
+    assert "\\e]777;codex-rsb;prompt;${__codex_nonce};managed\\a" in script
+    assert "\\e]777;codex-rsb;prompt;${__codex_nonce};enter\\a" in script
     prompt_function = script.split("__codex_enter_prompt() {", 1)[1].split("}\n", 1)[0]
     assert "printf" not in prompt_function
     assert "bind -x" in script
@@ -150,12 +151,62 @@ def test_connect_request_parser_requires_the_session_nonce_across_chunks() -> No
 
 
 def test_prompt_marker_requires_the_session_nonce() -> None:
-    marker = b"\x1b]777;codex-rsb;prompt;good\x07"
+    enter = b"\x1b]777;codex-rsb;prompt;good;enter\x07"
+    managed = b"\x1b]777;codex-rsb;prompt;good;managed\x07"
 
-    assert ShellOutputParser("good").feed(marker) == [shell_module.PromptEvent()]
-    assert ShellOutputParser("good").feed(
-        marker.replace(b";good\x07", b";wrong\x07")
-    ) == [BytesEvent(marker.replace(b";good\x07", b";wrong\x07"))]
+    assert ShellOutputParser("good").feed(enter) == [
+        shell_module.PromptEvent(slot_authorized=False)
+    ]
+    assert ShellOutputParser("good").feed(managed) == [
+        shell_module.PromptEvent(slot_authorized=True)
+    ]
+    forged = enter.replace(b";good;", b";wrong;")
+    assert ShellOutputParser("good").feed(forged) == [BytesEvent(forged)]
+
+
+def test_real_enter_prompt_does_not_authorize_bare_slot_bytes() -> None:
+    marker = b"\x1b]777;codex-rsb;prompt;good;enter\x07"
+    visible_prompt = b"\x1b[01;33m[host:enter]\x1b[00m user@host:repo % "
+    slot = shell_module._prompt_slot_sentinel("good").encode()
+    parser = ShellOutputParser("good")
+
+    events = parser.feed(marker + visible_prompt + slot)
+
+    assert events[0] == shell_module.PromptEvent(slot_authorized=False)
+    assert b"".join(event.data for event in events[1:] if isinstance(event, BytesEvent)) == (
+        visible_prompt + slot
+    )
+    assert not any(isinstance(event, shell_module.PromptSlotEvent) for event in events)
+
+
+def test_real_enter_prompt_preserves_fragmented_bare_slot_bytes() -> None:
+    marker = b"\x1b]777;codex-rsb;prompt;good;enter\x07"
+    visible_prompt = b"\x1b[01;33m[host:enter]\x1b[00m % "
+    slot = shell_module._prompt_slot_sentinel("good").encode()
+    parser = ShellOutputParser("good")
+
+    events = parser.feed(marker + visible_prompt + slot[:8])
+    events.extend(parser.feed(slot[8:23]))
+    events.extend(parser.feed(slot[23:]))
+
+    assert events[0] == shell_module.PromptEvent(slot_authorized=False)
+    assert b"".join(event.data for event in events[1:] if isinstance(event, BytesEvent)) == (
+        visible_prompt + slot
+    )
+
+
+def test_real_enter_prompt_preserves_wrong_nonce_slot_bytes() -> None:
+    marker = b"\x1b]777;codex-rsb;prompt;good;enter\x07"
+    visible_prompt = b"[host:enter] % "
+    wrong_slot = shell_module._prompt_slot_sentinel("wrong").encode()
+    parser = ShellOutputParser("good")
+
+    events = parser.feed(marker + visible_prompt + wrong_slot)
+
+    assert events[0] == shell_module.PromptEvent(slot_authorized=False)
+    assert b"".join(event.data for event in events[1:] if isinstance(event, BytesEvent)) == (
+        visible_prompt + wrong_slot
+    )
 
 
 def test_prompt_slot_is_ordinary_output_without_authenticated_prompt_marker() -> None:
@@ -176,16 +227,23 @@ def test_fragmented_prompt_slot_is_ordinary_output_without_authorization() -> No
 
 
 def test_authenticated_prompt_allows_exactly_one_fragmented_slot() -> None:
-    marker = b"\x1b]777;codex-rsb;prompt;good\x07"
+    marker = b"\x1b]777;codex-rsb;prompt;good;managed\x07"
+    color = b"\x1b[01;36m"
     slot = shell_module._prompt_slot_sentinel("good").encode()
     parser = ShellOutputParser("good")
 
     events = []
-    for chunk in (marker[:13], marker[13:] + slot[:7], slot[7:21], slot[21:] + slot):
+    for chunk in (
+        marker[:13],
+        marker[13:] + color + slot[:7],
+        slot[7:21],
+        slot[21:] + slot,
+    ):
         events.extend(parser.feed(chunk))
 
     assert events == [
-        shell_module.PromptEvent(),
+        shell_module.PromptEvent(slot_authorized=True),
+        BytesEvent(color),
         shell_module.PromptSlotEvent(),
         BytesEvent(slot),
     ]
@@ -204,8 +262,23 @@ def test_wrong_nonce_prompt_does_not_authorize_identical_slot_bytes() -> None:
     assert not any(isinstance(event, shell_module.PromptSlotEvent) for event in events)
 
 
+def test_wrong_nonce_prompt_does_not_clear_valid_managed_authorization() -> None:
+    managed = b"\x1b]777;codex-rsb;prompt;good;managed\x07"
+    forged = b"\x1b]777;codex-rsb;prompt;wrong;enter\x07"
+    slot = shell_module._prompt_slot_sentinel("good").encode()
+    parser = ShellOutputParser("good")
+
+    events = parser.feed(managed + forged + slot)
+
+    assert events == [
+        shell_module.PromptEvent(slot_authorized=True),
+        BytesEvent(forged),
+        shell_module.PromptSlotEvent(),
+    ]
+
+
 def test_connect_request_clears_unused_prompt_slot_authorization() -> None:
-    marker = b"\x1b]777;codex-rsb;prompt;good\x07"
+    marker = b"\x1b]777;codex-rsb;prompt;good;managed\x07"
     payload = base64.b64encode(b'{"remote":"/work/dq","local":null,"name":"dq"}')
     connect = b"\x1b]777;codex-rsb;connect-request;good;b64:" + payload + b"\x07"
     slot = shell_module._prompt_slot_sentinel("good").encode()
@@ -214,9 +287,29 @@ def test_connect_request_clears_unused_prompt_slot_authorization() -> None:
     events = parser.feed(marker + connect + slot)
 
     assert events == [
-        shell_module.PromptEvent(),
+        shell_module.PromptEvent(slot_authorized=True),
         ConnectRequestEvent(remote="/work/dq", name="dq"),
         BytesEvent(slot),
+    ]
+
+
+def test_enter_connect_then_managed_prompt_authorizes_one_slot() -> None:
+    enter = b"\x1b]777;codex-rsb;prompt;good;enter\x07"
+    payload = base64.b64encode(b'{"remote":"/work/dq","local":null,"name":"dq"}')
+    connect = b"\x1b]777;codex-rsb;connect-request;good;b64:" + payload + b"\x07"
+    managed = b"\x1b]777;codex-rsb;prompt;good;managed\x07"
+    color = b"\x1b[01;36m"
+    slot = shell_module._prompt_slot_sentinel("good").encode()
+    parser = ShellOutputParser("good")
+
+    events = parser.feed(enter + connect + managed + color + slot)
+
+    assert events == [
+        shell_module.PromptEvent(slot_authorized=False),
+        ConnectRequestEvent(remote="/work/dq", name="dq"),
+        shell_module.PromptEvent(slot_authorized=True),
+        BytesEvent(color),
+        shell_module.PromptSlotEvent(),
     ]
 
 

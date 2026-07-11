@@ -49,7 +49,7 @@ class ConnectRequestEvent:
 
 @dataclass(frozen=True, slots=True)
 class PromptEvent:
-    pass
+    slot_authorized: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,7 +377,7 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "__codex_prompt_mode=enter\n"
         "__codex_workspace_holding=\n"
         "__codex_workspace_pending_root=\n"
-        "__codex_live_ps1='\\[\\e]777;codex-rsb;prompt;${__codex_nonce}\\a\\]"
+        "__codex_live_ps1='\\[\\e]777;codex-rsb;prompt;${__codex_nonce};managed\\a\\]"
         f"\\[\\e[01;36m\\]{prompt_slot}\\[\\e[00m\\] "
         "${CONDA_PROMPT_MODIFIER}\\[\\e[01;32m\\]${USER:-user}@\\h"
         "\\[\\e[00m\\]:\\[\\e[01;34m\\]\\W\\[\\e[00m\\] % '\n"
@@ -553,7 +553,7 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "  if [ \"$__codex_prompt_mode\" = managed ]; then\n"
         "    PS1=$__codex_live_ps1\n"
         "  else\n"
-        "    PS1='\\[\\e]777;codex-rsb;prompt;${__codex_nonce}\\a\\]"
+        "    PS1='\\[\\e]777;codex-rsb;prompt;${__codex_nonce};enter\\a\\]"
         "\\[\\e[01;33m\\][${CODEX_RSB_DISPLAY_LABEL}:enter]\\[\\e[00m\\] "
         "${CONDA_PROMPT_MODIFIER}\\[\\e[01;32m\\]${USER:-user}@\\h\\[\\e[00m\\]:"
         "\\[\\e[01;34m\\]\\W\\[\\e[00m\\] % '\n"
@@ -636,7 +636,7 @@ class ShellOutputParser:
             else:
                 events.append(event)
                 if isinstance(event, PromptEvent):
-                    self._prompt_slot_authorized = True
+                    self._prompt_slot_authorized = event.slot_authorized
                 elif isinstance(event, ConnectRequestEvent):
                     self._prompt_slot_authorized = False
             self._buffer = self._buffer[end + 1 :]
@@ -677,8 +677,11 @@ class ShellOutputParser:
             except (ValueError, RegistryError):
                 return None
             return ConnectRequestEvent(remote=remote, local=local, name=name)
-        if prefix == self._prompt_prefix and not payload:
-            return PromptEvent()
+        if prefix == self._prompt_prefix:
+            if payload == b";enter":
+                return PromptEvent(slot_authorized=False)
+            if payload == b";managed":
+                return PromptEvent(slot_authorized=True)
         return None
 
 
