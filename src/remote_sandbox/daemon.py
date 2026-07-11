@@ -685,23 +685,35 @@ def daemon_workspace_status(workspace_id: str) -> WorkspaceStatus:
         runtime_dir() / "supervisors",
     )
     client = SupervisorClient(runtime)
+    used_fallback = False
     try:
         daemon = client.control_status()
     except DaemonError:
+        used_fallback = True
         daemon = client.status()
-        if (
-            not daemon.running
-            or daemon.pid is None
-            or daemon.phase in {WorkspacePhase.FAILED, WorkspacePhase.STOPPED}
-        ):
-            return WorkspaceStatus(
-                WorkspacePhase.FAILED,
-                SyncProgress("failed"),
-                last_error=daemon.last_error,
-            )
+    if used_fallback:
+        return _project_workspace_status(daemon)
     if daemon.workspace_status is None:
         raise DaemonError("supervisor did not publish workspace status")
     return daemon.workspace_status
+
+
+def _project_workspace_status(daemon: DaemonStatus) -> WorkspaceStatus:
+    durable = daemon.workspace_status
+    if durable is None:
+        return WorkspaceStatus(
+            daemon.phase,
+            SyncProgress(daemon.phase.value),
+            last_error=daemon.last_error,
+        )
+    return WorkspaceStatus(
+        daemon.phase,
+        durable.progress,
+        pending=durable.pending,
+        conflicts=durable.conflicts,
+        last_error=daemon.last_error or durable.last_error,
+        last_sync_at=durable.last_sync_at,
+    )
 
 
 def wait_for_daemon_control(local_root: Path, timeout: float) -> DaemonStatus:

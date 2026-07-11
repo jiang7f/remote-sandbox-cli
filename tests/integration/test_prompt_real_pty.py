@@ -43,7 +43,7 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
     fcntl.ioctl(
         frontend_slave,
         termios.TIOCSWINSZ,
-        struct.pack("HHHH", 40, 160, 0, 0),
+        struct.pack("HHHH", 40, 96, 0, 0),
     )
     pid = os.fork()
     if pid == 0:
@@ -126,6 +126,13 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
         )
         _read_until(frontend_master, output, b"[codex:ZJU_2:dq scanning]", timeout=3.0)
 
+        slot = shell_module._prompt_slot_sentinel(nonce).encode()
+        ps1_start = len(output)
+        os.write(frontend_master, b"printf 'PS1-COPY:%s\\n' \"$PS1\"\n")
+        _read_until(frontend_master, output, b"PS1-COPY:", timeout=2.0, start=ps1_start)
+        _read_until(frontend_master, output, slot, timeout=2.0, start=ps1_start)
+        assert b"\\[\\e]777;codex-rsb;prompt;${__codex_nonce}\\a\\]" in output[ps1_start:]
+
         pid_start = len(output)
         os.write(frontend_master, b"printf 'PID:%s\\n' \"$$\"\n")
         _read_until(frontend_master, output, b"\r\nPID:", timeout=2.0, start=pid_start)
@@ -170,6 +177,31 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
             timeout=2.0,
             start=compact_start,
         )
+        ready_prompt = bytes(output[compact_start:])
+        assert b"@" in ready_prompt
+        assert workspace.name.encode() in ready_prompt
+
+        ready_typing_start = len(output)
+        os.write(frontend_master, b"printf 'READY-CURSOR:%s\\n' AD")
+        os.write(frontend_master, b"\x02")
+        os.write(frontend_master, shell_module._redraw_key_sequence())
+        _read_until(
+            frontend_master,
+            output,
+            b"[codex:ZJU_2:dq]",
+            timeout=2.0,
+            start=ready_typing_start,
+        )
+        os.write(frontend_master, b"M\n")
+        _read_until(
+            frontend_master,
+            output,
+            b"\r\nREADY-CURSOR:AMD",
+            timeout=2.0,
+            start=ready_typing_start,
+        )
+        assert b"READY-CURSOR:AAMD" not in output[ready_typing_start:]
+
         pid_check_start = len(output)
         os.write(frontend_master, b"printf 'PID2:%s\\n' \"$$\"\n")
         _read_until(frontend_master, output, b"\r\nPID2:", timeout=2.0, start=pid_check_start)
@@ -188,7 +220,7 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
         status_file.write_text("conflict", encoding="utf-8")
         _read_until(frontend_master, output, b"conflict 3", timeout=2.0, start=offline_start)
         status_file.write_text("degraded", encoding="utf-8")
-        _read_until(frontend_master, output, b"offline", timeout=2.0, start=len(output))
+        _read_until(frontend_master, output, b"degraded", timeout=2.0, start=len(output))
 
         probe_times = [
             float(line.split()[0])
@@ -198,11 +230,87 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
             later - earlier >= 0.20
             for earlier, later in zip(probe_times, probe_times[1:], strict=False)
         )
+        prompt_marker = f"\x1b]777;codex-rsb;prompt;{nonce}\x07".encode()
+        assert prompt_marker not in output
         text = output.decode("utf-8", errors="replace")
-        assert "codex-rsb;prompt" not in text
-        assert "codex-slot:" not in text
         assert "connect-request" not in text
         assert "ok\t00000000" not in text
+    finally:
+        with suppress(OSError):
+            os.write(frontend_master, b"\nexit\n")
+        _terminate_child(pid)
+        os.close(frontend_master)
+
+
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded, use of fork\\(\\) may lead to "
+    "deadlocks in the child\\.:DeprecationWarning"
+)
+@pytest.mark.parametrize(
+    ("phase", "stage", "token"),
+    [
+        (WorkspacePhase.DISCONNECTED, "offline", b" offline]"),
+        (WorkspacePhase.DEGRADED, "audit-requested", b" degraded]"),
+        (WorkspacePhase.FAILED, "failed", b" failed]"),
+        (WorkspacePhase.STOPPED, "stopped", b" stopped]"),
+    ],
+)
+@pytest.mark.timeout(8)
+def test_lifecycle_phase_has_a_distinct_real_pty_prompt_token(
+    tmp_path: Path,
+    phase: WorkspacePhase,
+    stage: str,
+    token: bytes,
+) -> None:
+    nonce = f"phase15-{phase.value}"
+    workspace = tmp_path / "remote"
+    workspace.mkdir()
+    rcfile = tmp_path / "bashrc"
+    rcfile.write_text(
+        "CODEX_RSB_DISPLAY_LABEL=host\n"
+        f"__codex_nonce={shlex.quote(nonce)}\n{_enter_rcfile(nonce)}\n",
+        encoding="utf-8",
+    )
+    frontend_master, frontend_slave = pty.openpty()
+    fcntl.ioctl(
+        frontend_slave,
+        termios.TIOCSWINSZ,
+        struct.pack("HHHH", 24, 100, 0, 0),
+    )
+    pid = os.fork()
+    if pid == 0:
+        os.close(frontend_master)
+        os.login_tty(frontend_slave)
+        sys.stdin = os.fdopen(os.dup(0), "r", encoding="utf-8")
+        sys.stdout = os.fdopen(os.dup(1), "w", encoding="utf-8")
+
+        def connect(_event: ConnectRequestEvent) -> ConnectResponse:
+            return ConnectResponse(
+                ok=True,
+                workspace_id="00000000-0000-4000-8000-000000000015",
+                name="dq",
+                remote_root=str(workspace),
+                direction="remote-to-local",
+                status_probe=lambda: WorkspaceStatus(phase, SyncProgress(stage)),
+            )
+
+        try:
+            result = shell_module._pty_enter_shell_backend(
+                ["bash", "--noprofile", "--rcfile", str(rcfile), "-i"],
+                nonce,
+                connect,
+            )
+        except BaseException:
+            traceback.print_exc()
+            result = 1
+        os._exit(result)
+
+    os.close(frontend_slave)
+    output = bytearray()
+    try:
+        _read_until(frontend_master, output, b":enter]", timeout=2.0)
+        os.write(frontend_master, b"codex-rsb connect --remote /tmp\n")
+        _read_until(frontend_master, output, token, timeout=3.0)
     finally:
         with suppress(OSError):
             os.write(frontend_master, b"\nexit\n")

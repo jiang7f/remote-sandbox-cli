@@ -377,7 +377,8 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "__codex_prompt_mode=enter\n"
         "__codex_workspace_holding=\n"
         "__codex_workspace_pending_root=\n"
-        f"__codex_live_ps1='\\[\\e[01;36m\\]{prompt_slot}\\[\\e[00m\\] "
+        "__codex_live_ps1='\\[\\e]777;codex-rsb;prompt;${__codex_nonce}\\a\\]"
+        f"\\[\\e[01;36m\\]{prompt_slot}\\[\\e[00m\\] "
         "${CONDA_PROMPT_MODIFIER}\\[\\e[01;32m\\]${USER:-user}@\\h"
         "\\[\\e[00m\\]:\\[\\e[01;34m\\]\\W\\[\\e[00m\\] % '\n"
         "codex-rsb() {\n"
@@ -549,11 +550,11 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "bind -m vi-move '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
         "bind -m vi '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
         "__codex_enter_prompt() {\n"
-        "  printf '\\033]777;codex-rsb;prompt;%s\\007' \"$__codex_nonce\"\n"
         "  if [ \"$__codex_prompt_mode\" = managed ]; then\n"
         "    PS1=$__codex_live_ps1\n"
         "  else\n"
-        "    PS1='\\[\\e[01;33m\\][${CODEX_RSB_DISPLAY_LABEL}:enter]\\[\\e[00m\\] "
+        "    PS1='\\[\\e]777;codex-rsb;prompt;${__codex_nonce}\\a\\]"
+        "\\[\\e[01;33m\\][${CODEX_RSB_DISPLAY_LABEL}:enter]\\[\\e[00m\\] "
         "${CONDA_PROMPT_MODIFIER}\\[\\e[01;32m\\]${USER:-user}@\\h\\[\\e[00m\\]:"
         "\\[\\e[01;34m\\]\\W\\[\\e[00m\\] % '\n"
         "  fi\n"
@@ -596,6 +597,7 @@ class ShellOutputParser:
             self._slot_prefix,
         )
         self._buffer = b""
+        self._prompt_slot_authorized = False
 
     def feed(self, data: bytes) -> list[ShellEvent]:
         self._buffer += data
@@ -617,7 +619,11 @@ class ShellOutputParser:
                 self._buffer = self._buffer[start:]
             assert prefix is not None
             if prefix == self._slot_prefix:
-                events.append(PromptSlotEvent())
+                if self._prompt_slot_authorized:
+                    events.append(PromptSlotEvent())
+                    self._prompt_slot_authorized = False
+                else:
+                    events.append(BytesEvent(prefix))
                 self._buffer = self._buffer[len(prefix) :]
                 continue
             end = self._buffer.find(b"\x07", len(prefix))
@@ -629,6 +635,10 @@ class ShellOutputParser:
                 events.append(BytesEvent(self._buffer[: end + 1]))
             else:
                 events.append(event)
+                if isinstance(event, PromptEvent):
+                    self._prompt_slot_authorized = True
+                elif isinstance(event, ConnectRequestEvent):
+                    self._prompt_slot_authorized = False
             self._buffer = self._buffer[end + 1 :]
         return events
 

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-import unicodedata
+
+from wcwidth import wcswidth, wcwidth
 
 from remote_sandbox.status import WorkspacePhase, WorkspaceStatus
 
@@ -65,24 +66,25 @@ def render_status_slot(
 
 def display_width(value: str) -> int:
     """Return the terminal cell width of plain prompt text."""
-    width = 0
-    for char in value:
-        if unicodedata.combining(char):
-            continue
-        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("prompt text contains a nonprintable character")
+    width = wcswidth(value)
+    if width < 0:
+        raise ValueError("prompt text contains a nonprintable character")
     return width
 
 
 def _status_suffix(status: WorkspaceStatus) -> str:
     if status.conflicts:
         return f" conflict {status.conflicts}"
-    if status.phase in {
-        WorkspacePhase.DEGRADED,
-        WorkspacePhase.DISCONNECTED,
-        WorkspacePhase.FAILED,
-        WorkspacePhase.STOPPED,
-    }:
+    if status.phase is WorkspacePhase.DISCONNECTED:
         return " offline"
+    if status.phase is WorkspacePhase.DEGRADED:
+        return " degraded"
+    if status.phase is WorkspacePhase.FAILED:
+        return " failed"
+    if status.phase is WorkspacePhase.STOPPED:
+        return " stopped"
     if status.phase is WorkspacePhase.READY:
         return ""
     if status.progress.stage == "scanning":
@@ -101,16 +103,36 @@ def _status_suffix(status: WorkspaceStatus) -> str:
 def _truncate_closed_bracket(value: str, width: int) -> str:
     if display_width(value) <= width:
         return value
-    available = width - 1
-    current = 0
-    chars: list[str] = []
-    for char in value[1:-1]:
-        char_width = display_width(char)
-        if current + char_width > available - 1:
+    clusters: list[str] = []
+    for cluster in _display_clusters(value[1:-1]):
+        candidate = "[" + "".join((*clusters, cluster)) + "]"
+        if display_width(candidate) > width:
             break
-        chars.append(char)
-        current += char_width
-    return "[" + "".join(chars) + "]"
+        clusters.append(cluster)
+    return "[" + "".join(clusters) + "]"
+
+
+def _display_clusters(value: str) -> list[str]:
+    clusters: list[str] = []
+    current = ""
+    join_next = False
+    for char in value:
+        if not current:
+            current = char
+        elif join_next:
+            current += char
+            join_next = False
+        elif char == "\u200d":
+            current += char
+            join_next = True
+        elif wcwidth(char) == 0:
+            current += char
+        else:
+            clusters.append(current)
+            current = char
+    if current:
+        clusters.append(current)
+    return clusters
 
 
 def _reject_control_characters(value: str, *, field: str) -> None:
