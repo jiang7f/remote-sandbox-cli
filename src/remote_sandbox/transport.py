@@ -598,6 +598,7 @@ class BatchTransport:
                 REMOTE_STAGE_RSYNC_CODE,
                 paths,
             )
+        transfer_failure: BaseException | None = None
         try:
             argv = build_rsync_argv(
                 batch,
@@ -652,15 +653,27 @@ class BatchTransport:
                     path: (remote_entries[path], remote_signatures_after[path])
                     for path in paths
                 }
+        except BaseException as exc:
+            transfer_failure = exc
+            raise
         finally:
             if remote_stage is not None:
-                self._runner.run_workspace_python_bytes(
-                    self._target,
-                    self._remote_root,
-                    REMOTE_CLEANUP_RSYNC_CODE,
-                    b"",
-                    (remote_stage,),
-                )
+                try:
+                    cleaned = self._runner.run_workspace_python_bytes(
+                        self._target,
+                        self._remote_root,
+                        REMOTE_CLEANUP_RSYNC_CODE,
+                        b"",
+                        (remote_stage,),
+                    )
+                    self._check_remote_stage_result(cleaned, "remote rsync cleanup")
+                except BaseException as cleanup_failure:
+                    if transfer_failure is None:
+                        raise
+                    raise BaseExceptionGroup(
+                        "remote rsync transfer and cleanup failed",
+                        [transfer_failure, cleanup_failure],
+                    ) from None
         return _RsyncAudit(verified_source_signatures, destination_observations)
 
     def _remote_rsync_stage(self, code: str, paths: tuple[str, ...]) -> str:
@@ -969,13 +982,26 @@ def _protocol_verified_destination(
         EntryFingerprint,
     ):
         return None
+    if source.path != destination.path:
+        return None
     if source.kind is EntryKind.FILE and destination.kind is EntryKind.FILE:
-        if source.content_hash is None:
+        if (
+            source.content_hash is None
+            or source.size != destination.size
+            or not _rsync_mtime_compatible(source.mtime_ns, destination.mtime_ns)
+            or source.mode != destination.mode
+        ):
             return None
         return replace(destination, content_hash=source.content_hash)
     if not _same_content(source, destination):
         return None
     return destination
+
+
+def _rsync_mtime_compatible(source: int | None, destination: int | None) -> bool:
+    if source is None or destination is None:
+        return source is destination
+    return source // 1_000_000_000 == destination // 1_000_000_000
 
 
 def _target_present_in_stage(

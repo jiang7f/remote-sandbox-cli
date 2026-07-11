@@ -36,10 +36,12 @@ jobs:
           -k test_agent_zipapp_runs_on_python_310
       - name: Check legacy imports
         run: uv run pytest -q tests/unit/test_release_quality.py -k test_no_legacy_module_imports
+      - name: Check E2E fixture contract
+        run: uv run pytest -q tests/e2e/test_fixture_contract.py
       - name: Check in-tree metadata
         run: >-
-          uv run pytest -q tests/integration/test_bind_validation.py
-          -k test_bind_writes_only_external_metadata
+          uv run pytest -q tests/unit/test_release_quality.py
+          -k test_no_in_tree_control_metadata
       - name: Check generated artifacts
         run: >-
           uv run pytest -q tests/unit/test_release_quality.py

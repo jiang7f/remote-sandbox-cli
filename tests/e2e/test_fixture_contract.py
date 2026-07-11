@@ -116,6 +116,94 @@ def test_fixture_cleanup_aggregates_failures_and_removes_all_local_residue(
     assert ("docker", "image", "rm", "-f", "fixture-image") in docker_calls
 
 
+def test_start_fixture_cleans_generated_artifacts_when_docker_build_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = tmp_path / "client-key"
+    home = tmp_path / "home"
+    state = tmp_path / "codex-state"
+    runtime = tmp_path / "codex-runtime"
+    for path in (home, state, runtime):
+        path.mkdir()
+    docker_calls: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(
+        e2e.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"docker", "ssh"} else None,
+    )
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "ssh-keygen":
+            key.write_text("private", encoding="utf-8")
+            key.with_suffix(".pub").write_text("public", encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        docker_calls.append(tuple(argv))
+        if "build" in argv:
+            raise subprocess.CalledProcessError(1, argv, stderr="build failed")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(e2e.subprocess, "run", fake_run)
+
+    with pytest.raises(subprocess.CalledProcessError, match="docker.*build"):
+        e2e.start_ssh_fixture(tmp_path)
+
+    assert not key.exists()
+    assert not key.with_suffix(".pub").exists()
+    assert not home.exists()
+    assert not state.exists()
+    assert not runtime.exists()
+    assert any(call[1:4] == ("image", "rm", "-f") for call in docker_calls)
+
+
+def test_start_fixture_preserves_startup_and_all_cleanup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = tmp_path / "client-key"
+    cleanup_calls: list[tuple[str, ...]] = []
+    original_remove = e2e._remove_path
+
+    monkeypatch.setattr(
+        e2e.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"docker", "ssh"} else None,
+    )
+
+    def fake_remove(path: Path) -> None:
+        if path == key:
+            raise RuntimeError("private key cleanup failed")
+        original_remove(path)
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "ssh-keygen":
+            key.write_text("private", encoding="utf-8")
+            key.with_suffix(".pub").write_text("public", encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if "build" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if "run" in argv:
+            return subprocess.CompletedProcess(argv, 0, "container-id\n", "")
+        if "port" in argv:
+            raise RuntimeError("port lookup failed")
+        cleanup_calls.append(tuple(argv))
+        return subprocess.CompletedProcess(argv, 1, "", "docker cleanup failed")
+
+    monkeypatch.setattr(e2e, "_remove_path", fake_remove)
+    monkeypatch.setattr(e2e.subprocess, "run", fake_run)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        e2e.start_ssh_fixture(tmp_path)
+
+    failures = tuple(str(failure) for failure in raised.value.exceptions)
+    assert any("port lookup failed" in failure for failure in failures)
+    assert any("private key cleanup failed" in failure for failure in failures)
+    assert sum("docker cleanup failed" in failure for failure in failures) == 2
+    assert ("/usr/bin/docker", "rm", "-f", "container-id") in cleanup_calls
+    assert any(call[1:4] == ("image", "rm", "-f") for call in cleanup_calls)
+
+
 def test_prompt_wait_ignores_matching_text_from_prior_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

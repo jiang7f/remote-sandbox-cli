@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import subprocess
@@ -11,6 +12,25 @@ from remote_sandbox.shell import (
 )
 from remote_sandbox.ssh import build_remote_shell_command
 
+_CONTROL_METADATA_NAMES = {".remote-sandbox", ".codex-remote-sandbox"}
+
+
+def _find_in_tree_control_metadata(
+    root: Path,
+    tracked_paths: tuple[str, ...],
+) -> list[Path]:
+    found = {
+        root / path
+        for path in tracked_paths
+        if any(part in _CONTROL_METADATA_NAMES for part in Path(path).parts)
+    }
+    for current, directories, _files in os.walk(root):
+        directories[:] = [name for name in directories if name != ".git"]
+        for name in directories:
+            if name in _CONTROL_METADATA_NAMES:
+                found.add(Path(current) / name)
+    return sorted(found)
+
 
 def test_quality_job_has_explicit_non_skippable_release_checks() -> None:
     workflow = Path(".github/workflows/test.yml").read_text(encoding="utf-8")
@@ -18,7 +38,8 @@ def test_quality_job_has_explicit_non_skippable_release_checks() -> None:
         "Check generated shell syntax": "test_generated_shell_syntax",
         "Check Python 3.10 packaged agent": "test_agent_zipapp_runs_on_python_310",
         "Check legacy imports": "test_no_legacy_module_imports",
-        "Check in-tree metadata": "test_bind_writes_only_external_metadata",
+        "Check E2E fixture contract": "tests/e2e/test_fixture_contract.py",
+        "Check in-tree metadata": "test_no_in_tree_control_metadata",
         "Check generated artifacts": "test_no_tracked_generated_artifacts",
         "Check git diff": "git diff --check",
     }
@@ -109,6 +130,27 @@ def test_no_tracked_generated_artifacts() -> None:
         or path.name.endswith(".egg-info")
     ]
     assert generated == []
+
+
+def test_in_tree_metadata_scan_detects_directories_and_tracked_paths(tmp_path: Path) -> None:
+    directory = tmp_path / "nested" / ".remote-sandbox"
+    directory.mkdir(parents=True)
+    tracked = "docs/.codex-remote-sandbox/config.toml"
+
+    found = _find_in_tree_control_metadata(tmp_path, (tracked,))
+
+    assert set(found) == {directory, tmp_path / tracked}
+
+
+def test_no_in_tree_control_metadata() -> None:
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        check=True,
+        capture_output=True,
+    )
+    tracked = tuple(raw.decode() for raw in result.stdout.split(b"\0") if raw)
+
+    assert _find_in_tree_control_metadata(Path.cwd(), tracked) == []
 
 
 def test_readme_advertises_only_codex_rsb_command() -> None:

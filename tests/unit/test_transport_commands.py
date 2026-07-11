@@ -9,6 +9,7 @@ from typing import cast
 import pytest
 
 from remote_sandbox._transport_remote import (
+    REMOTE_CLEANUP_RSYNC_CODE,
     REMOTE_PREPARE_RSYNC_CODE,
     REMOTE_STAGE_RSYNC_CODE,
 )
@@ -366,6 +367,137 @@ def test_batch_transport_runs_one_verified_rsync_session(
     assert remote.calls == [(("a.txt",), True), (("a.txt",), False)]
     assert remote.audit_calls == []
     assert result.verified_fingerprints == (source,)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("size", 0), ("mode", 0o100600), ("mtime_ns", 1)),
+)
+def test_rsync_protocol_proof_rejects_incompatible_destination_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    field: str,
+    value: int,
+) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    (local_root / "a.txt").write_text("a", encoding="utf-8")
+    source = cast(EntryFingerprint, fingerprint_local(local_root, "a.txt", with_hash=True))
+    destination = dataclasses.replace(source, **{field: value}, content_hash=None)
+    remote = _RemoteFingerprinter(
+        [
+            {"a.txt": MissingEntry("a.txt")},
+            {"a.txt": destination},
+        ]
+    )
+    monkeypatch.setattr(
+        "remote_sandbox.transport.subprocess.run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, b"", b""),
+    )
+
+    with pytest.raises(TransferError, match="post-transfer verification"):
+        BatchTransport(
+            local_root,
+            "host",
+            "/remote",
+            remote,
+            runner=_TransportRunner(),
+            capabilities=RsyncCapabilities(False, False),
+            remote_rsync_available=True,
+        ).transfer(
+            TransferBatch(
+                TransferDirection.PUSH,
+                (TransferItem("a.txt", source, MissingEntry("a.txt")),),
+            ),
+            lambda _progress: None,
+        )
+
+
+class _CleanupFailureRunner(_TransportRunner):
+    def run_workspace_python_bytes(
+        self,
+        target: str,
+        root: str,
+        code: str,
+        input_data: bytes,
+        args: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess[bytes]:
+        if code == REMOTE_CLEANUP_RSYNC_CODE:
+            self.transport_calls.append((target, root, code, input_data, args))
+            return subprocess.CompletedProcess(["ssh"], 17, b"", b"cleanup failed")
+        return super().run_workspace_python_bytes(target, root, code, input_data, args)
+
+
+def test_remote_rsync_cleanup_failure_prevents_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    source = EntryFingerprint("a.txt", EntryKind.FILE, 1, 1, 0o100644, None, "hash")
+    remote = _RemoteFingerprinter([{"a.txt": source}, {"a.txt": source}])
+    monkeypatch.setattr(
+        "remote_sandbox.transport.subprocess.run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, b"", b""),
+    )
+    monkeypatch.setattr(
+        "remote_sandbox.transport.ProtectedLocalRoot.finalize",
+        lambda _self, _staging, _paths, **_kwargs: {
+            "a.txt": (source, AuditSignature("a.txt", EntryKind.FILE, 1, 1, 1))
+        },
+    )
+
+    with pytest.raises(TransferError, match="remote rsync cleanup failed.*cleanup failed"):
+        BatchTransport(
+            local_root,
+            "host",
+            "/remote",
+            remote,
+            runner=_CleanupFailureRunner(),
+            capabilities=RsyncCapabilities(False, False),
+            remote_rsync_available=True,
+        ).transfer(
+            TransferBatch(
+                TransferDirection.PULL,
+                (TransferItem("a.txt", source, MissingEntry("a.txt")),),
+            ),
+            lambda _progress: None,
+        )
+
+
+def test_remote_rsync_transfer_and_cleanup_failures_are_both_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    (local_root / "a.txt").write_text("a", encoding="utf-8")
+    source = cast(EntryFingerprint, fingerprint_local(local_root, "a.txt", with_hash=True))
+    monkeypatch.setattr(
+        "remote_sandbox.transport.subprocess.run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 23, b"", b"transfer failed"),
+    )
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        BatchTransport(
+            local_root,
+            "host",
+            "/remote",
+            _RemoteFingerprinter([{"a.txt": MissingEntry("a.txt")}]),
+            runner=_CleanupFailureRunner(),
+            capabilities=RsyncCapabilities(False, False),
+            remote_rsync_available=True,
+        ).transfer(
+            TransferBatch(
+                TransferDirection.PUSH,
+                (TransferItem("a.txt", source, MissingEntry("a.txt")),),
+            ),
+            lambda _progress: None,
+        )
+
+    failures = tuple(str(failure) for failure in raised.value.exceptions)
+    assert any("transfer failed" in failure for failure in failures)
+    assert any("cleanup failed" in failure for failure in failures)
 
 
 def test_batch_transport_uses_tar_for_unsafe_unprotected_remote_root(

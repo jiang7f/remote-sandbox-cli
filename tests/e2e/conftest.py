@@ -797,6 +797,39 @@ def _inspect_cleanup_resource(
         return subprocess.CompletedProcess(argv, 0, "", str(exc))
 
 
+def _cleanup_failed_ssh_fixture_startup(
+    *,
+    docker: str,
+    image: str,
+    container_id: str,
+    paths: tuple[Path, ...],
+) -> list[BaseException]:
+    failures: list[BaseException] = []
+
+    def record(operation: Callable[[], object]) -> None:
+        try:
+            operation()
+        except BaseException as exc:
+            failures.append(exc)
+
+    for path in paths:
+        record(lambda value=path: _remove_path(value))
+    if container_id:
+        record(
+            lambda: _run_cleanup_command(
+                [docker, "rm", "-f", container_id],
+                30.0,
+            )
+        )
+    record(
+        lambda: _run_cleanup_command(
+            [docker, "image", "rm", "-f", image],
+            30.0,
+        )
+    )
+    return failures
+
+
 def start_ssh_fixture(tmp_path: Path) -> SshFixture:
     docker = shutil.which("docker")
     if docker is None:
@@ -808,24 +841,36 @@ def start_ssh_fixture(tmp_path: Path) -> SshFixture:
         raise RuntimeError("OpenSSH is required for SSH E2E")
     image = f"codex-rsb-e2e:{uuid.uuid4().hex}"
     key_file = tmp_path / "client-key"
-    subprocess.run(
-        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key_file)],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30.0,
-    )
-    key_file.chmod(0o600)
-    key_file.with_suffix(".pub").chmod(0o644)
-    subprocess.run(
-        [docker, "build", "-t", image, "-f", str(_E2E_DIR / "Dockerfile"), str(_E2E_DIR)],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=300.0,
-    )
+    home = tmp_path / "home"
+    state_home = tmp_path / "codex-state"
+    runtime = tmp_path / "codex-runtime"
+    production_home = tmp_path / "production-state"
     container_id = ""
     try:
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key_file)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
+        key_file.chmod(0o600)
+        key_file.with_suffix(".pub").chmod(0o644)
+        subprocess.run(
+            [
+                docker,
+                "build",
+                "-t",
+                image,
+                "-f",
+                str(_E2E_DIR / "Dockerfile"),
+                str(_E2E_DIR),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=300.0,
+        )
         run = subprocess.run(
             [
                 docker,
@@ -852,7 +897,6 @@ def start_ssh_fixture(tmp_path: Path) -> SshFixture:
             timeout=10.0,
         )
         port = int(port_result.stdout.strip().rsplit(":", 1)[1])
-        home = tmp_path / "home"
         ssh_dir = home / ".ssh"
         ssh_dir.mkdir(parents=True, mode=0o700)
         config = ssh_dir / "config"
@@ -863,9 +907,6 @@ def start_ssh_fixture(tmp_path: Path) -> SshFixture:
         config.chmod(0o600)
         ssh_wrapper = home / "isolated-bin" / "ssh"
         _write_isolated_ssh_wrapper(ssh_wrapper, Path(ssh_executable), config)
-        state_home = tmp_path / "codex-state"
-        runtime = tmp_path / "codex-runtime"
-        production_home = tmp_path / "production-state"
         env = _isolated_ssh_environment(
             {
                 **os.environ,
@@ -897,22 +938,25 @@ def start_ssh_fixture(tmp_path: Path) -> SshFixture:
         )
         _wait_for_ssh_python(fixture)
         return fixture
-    except BaseException:
-        if container_id:
-            subprocess.run(
-                [docker, "rm", "-f", container_id],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30.0,
-            )
-        subprocess.run(
-            [docker, "image", "rm", "-f", image],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30.0,
+    except BaseException as startup_failure:
+        cleanup_failures = _cleanup_failed_ssh_fixture_startup(
+            docker=docker,
+            image=image,
+            container_id=container_id,
+            paths=(
+                key_file,
+                key_file.with_suffix(".pub"),
+                state_home,
+                runtime,
+                home,
+                production_home,
+            ),
         )
+        if cleanup_failures:
+            raise BaseExceptionGroup(
+                "SSH E2E fixture startup and cleanup failed",
+                [startup_failure, *cleanup_failures],
+            ) from None
         raise
 
 
