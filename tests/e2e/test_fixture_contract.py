@@ -1,13 +1,45 @@
 from __future__ import annotations
 
 import base64
+import importlib.util
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+from types import ModuleType
 
-import conftest as e2e
 import pytest
+
+_E2E_FIXTURE_MODULE = "_codex_remote_sandbox_e2e_fixture"
+
+
+def _load_e2e_fixture_module() -> ModuleType:
+    path = Path(__file__).with_name("conftest.py").resolve()
+    existing = sys.modules.get(_E2E_FIXTURE_MODULE)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(_E2E_FIXTURE_MODULE, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load E2E fixture module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_E2E_FIXTURE_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(_E2E_FIXTURE_MODULE, None)
+        raise
+    return module
+
+
+e2e = _load_e2e_fixture_module()
+
+
+def test_fixture_contract_loads_sibling_conftest_under_stable_name() -> None:
+    expected = Path(__file__).with_name("conftest.py").resolve()
+
+    assert Path(e2e.__file__).resolve() == expected
+    assert e2e.__name__ == "_codex_remote_sandbox_e2e_fixture"
 
 
 def test_isolated_ssh_wrapper_forces_fixture_config_and_environment(tmp_path: Path) -> None:
