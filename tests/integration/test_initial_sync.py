@@ -24,6 +24,7 @@ def test_remote_source_bulk_sync_starts_watchers_before_copy(
     assert initial_pair.remote_watcher.started_before_transfer is True
     assert (initial_pair.local / "a.txt").read_text(encoding="utf-8") == "a"
     assert initial_pair.store.get_status().phase.value == "ready"
+    assert initial_pair.store.get_initial_sync_watermarks() is None
     assert initial_pair.transport.transfer_calls == 1
 
 
@@ -47,6 +48,24 @@ def test_both_empty_reaches_ready_without_a_transfer(initial_pair: InitialPairHa
     assert initial_pair.store.get_status().progress.stage == "ready"
 
 
+def test_both_empty_persists_zero_total_transferring_stage(
+    initial_pair: InitialPairHarness,
+    monkeypatch,
+) -> None:
+    statuses: list[WorkspaceStatus] = []
+    original = initial_pair.store.set_status
+
+    def record(status: WorkspaceStatus) -> None:
+        statuses.append(status)
+        original(status)
+
+    monkeypatch.setattr(initial_pair.store, "set_status", record)
+
+    initial_pair.coordinator.run()
+
+    _assert_zero_transfer_stage_sequence(statuses)
+
+
 def test_large_remote_file_becomes_a_validated_local_placeholder(
     initial_pair: InitialPairHarness,
 ) -> None:
@@ -67,6 +86,26 @@ def test_large_remote_file_becomes_a_validated_local_placeholder(
         path for call in initial_pair.remote_client.hash_calls for path in call
     } == {"weights.bin"}
     assert initial_pair.transport.transfer_calls == 0
+
+
+def test_placeholder_only_persists_zero_total_transferring_stage(
+    initial_pair: InitialPairHarness,
+    monkeypatch,
+) -> None:
+    initial_pair.set_placeholder_limit(4)
+    (initial_pair.remote / "weights.bin").write_bytes(b"0123456789")
+    statuses: list[WorkspaceStatus] = []
+    original = initial_pair.store.set_status
+
+    def record(status: WorkspaceStatus) -> None:
+        statuses.append(status)
+        original(status)
+
+    monkeypatch.setattr(initial_pair.store, "set_status", record)
+
+    initial_pair.coordinator.run()
+
+    _assert_zero_transfer_stage_sequence(statuses)
 
 
 def test_plan_contains_explicit_deterministic_entry_types(
@@ -164,3 +203,16 @@ def test_initial_snapshot_excludes_git_and_policy_ignored_entries(
     assert not (initial_pair.remote / ".git").exists()
     assert not (initial_pair.remote / "ignored.txt").exists()
     assert (initial_pair.remote / "kept.txt").read_text(encoding="utf-8") == "kept"
+
+
+def _assert_zero_transfer_stage_sequence(statuses: list[WorkspaceStatus]) -> None:
+    stages = [status.progress.stage for status in statuses]
+    planning = stages.index("planning")
+    transferring = stages.index("transferring")
+    replaying = stages.index("replaying")
+    ready = len(stages) - 1
+    assert planning < transferring < replaying < ready
+    progress = statuses[transferring].progress
+    assert progress.files_done == progress.files_total == 0
+    assert progress.bytes_done == progress.bytes_total == 0
+    assert stages[ready] == "ready"

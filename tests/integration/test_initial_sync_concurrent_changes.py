@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 from helpers.sync_harness import InitialPairHarness
 
+from remote_sandbox.journal import EventKind
+
 
 def test_change_created_during_bulk_copy_is_replayed(
     initial_pair: InitialPairHarness,
@@ -46,6 +48,8 @@ def test_restart_mid_transfer_only_copies_unfinished_paths(
     with pytest.raises(RuntimeError, match="interruption"):
         initial_pair.coordinator.run()
 
+    assert initial_pair.store.get_initial_sync_watermarks() == (0, 0)
+
     assert initial_pair.store.get_status().phase.value == "degraded"
     initial_pair.coordinator.run()
 
@@ -53,6 +57,30 @@ def test_restart_mid_transfer_only_copies_unfinished_paths(
     assert [item.path for item in initial_pair.transport.batches[1].items] == ["b.txt"]
     assert (initial_pair.local / "a.txt").read_text(encoding="utf-8") == "a"
     assert (initial_pair.local / "b.txt").read_text(encoding="utf-8") == "b"
+
+
+def test_restart_preserves_edit_to_completed_destination(
+    initial_pair: InitialPairHarness,
+) -> None:
+    (initial_pair.remote / "a.txt").write_text("source-a", encoding="utf-8")
+    (initial_pair.remote / "b.txt").write_text("source-b", encoding="utf-8")
+    initial_pair.transport.fail_after_first_progress = True
+
+    with pytest.raises(RuntimeError, match="interruption"):
+        initial_pair.coordinator.run()
+
+    initial_pair.local_watcher.stop()
+    (initial_pair.local / "a.txt").write_text("user-edit", encoding="utf-8")
+    edited = initial_pair.store.append_event("local", EventKind.MODIFY, "a.txt")
+    initial_pair.coordinator.start_local_watcher = lambda: edited.sequence
+
+    initial_pair.coordinator.run()
+
+    assert (initial_pair.local / "a.txt").read_text(encoding="utf-8") == "user-edit"
+    assert (initial_pair.remote / "a.txt").read_text(encoding="utf-8") == "user-edit"
+    assert initial_pair.store.acknowledged_sequence("local") >= edited.sequence
+    assert initial_pair.store.get_initial_sync_watermarks() is None
+    assert (initial_pair.local / "b.txt").read_text(encoding="utf-8") == "source-b"
 
 
 def test_restart_during_replay_does_not_repeat_bulk_transfer(

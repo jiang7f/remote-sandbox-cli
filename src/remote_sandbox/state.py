@@ -24,7 +24,7 @@ from remote_sandbox.manifest import (
 )
 from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _JSON_SCHEMA_VERSION = 1
 _SIDES = frozenset({"local", "remote"})
 
@@ -303,6 +303,40 @@ class WorkspaceStore:
         _validate_side(side)
         with self._lock:
             return self._last_allocated_sequence(side)
+
+    def get_initial_sync_watermarks(self) -> tuple[int, int] | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT local_start, remote_start
+                FROM initial_sync_checkpoint WHERE singleton = 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return (
+            _expect_int(row["local_start"], "initial local watermark"),
+            _expect_int(row["remote_start"], "initial remote watermark"),
+        )
+
+    def set_initial_sync_watermarks(self, local_start: int, remote_start: int) -> None:
+        _validate_non_negative_int(local_start, "local_start")
+        _validate_non_negative_int(remote_start, "remote_start")
+        with self.transaction():
+            self._connection.execute(
+                """
+                INSERT INTO initial_sync_checkpoint(singleton, local_start, remote_start)
+                VALUES (1, ?, ?)
+                ON CONFLICT(singleton) DO NOTHING
+                """,
+                (local_start, remote_start),
+            )
+
+    def clear_initial_sync_watermarks(self) -> None:
+        with self.transaction():
+            self._connection.execute(
+                "DELETE FROM initial_sync_checkpoint WHERE singleton = 1"
+            )
 
     def acknowledged_sequence(self, side: str) -> int:
         _validate_side(side)
@@ -658,7 +692,7 @@ class WorkspaceStore:
             elif version == 1:
                 self._migrate_legacy_base_entries()
                 self._create_current_schema()
-            elif version in {2, 3}:
+            elif version in {2, 3, 4}:
                 self._create_current_schema()
             self._connection.execute(
                 """
@@ -768,6 +802,13 @@ class WorkspaceStore:
                 conflicts INTEGER NOT NULL CHECK(conflicts >= 0),
                 last_error TEXT,
                 last_sync_at REAL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS initial_sync_checkpoint (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                local_start INTEGER NOT NULL CHECK(local_start >= 0),
+                remote_start INTEGER NOT NULL CHECK(remote_start >= 0)
             )
             """,
             """

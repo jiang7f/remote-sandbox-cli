@@ -36,6 +36,35 @@ def test_new_store_has_stopped_status(tmp_path: Path) -> None:
         )
 
 
+def test_initial_sync_watermarks_survive_store_restart_until_cleared(tmp_path: Path) -> None:
+    db = tmp_path / "state.sqlite3"
+    with WorkspaceStore.open(db) as store:
+        store.set_initial_sync_watermarks(7, 11)
+
+    with WorkspaceStore.open(db) as store:
+        assert store.get_initial_sync_watermarks() == (7, 11)
+        store.set_initial_sync_watermarks(13, 17)
+        assert store.get_initial_sync_watermarks() == (7, 11)
+        store.clear_initial_sync_watermarks()
+        assert store.get_initial_sync_watermarks() is None
+
+
+def test_v4_store_migrates_initial_sync_checkpoint_table(tmp_path: Path) -> None:
+    db = tmp_path / "state.sqlite3"
+    with WorkspaceStore.open(db):
+        pass
+    connection = sqlite3.connect(db)
+    connection.execute("DROP TABLE initial_sync_checkpoint")
+    connection.execute("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'")
+    connection.execute("PRAGMA user_version=4")
+    connection.commit()
+    connection.close()
+
+    with WorkspaceStore.open(db) as store:
+        store.set_initial_sync_watermarks(3, 5)
+        assert store.get_initial_sync_watermarks() == (3, 5)
+
+
 def test_scanning_progress_is_informative_before_a_total_exists() -> None:
     progress = SyncProgress("scanning", files_done=1_843, bytes_done=31_000_000)
 

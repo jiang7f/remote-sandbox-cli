@@ -11,12 +11,23 @@ from remote_sandbox.workspace import workspace_paths
 
 
 class RecordingRemoteRegistration:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        created: bool = True,
+        remote_state: dict[str, bool] | None = None,
+    ) -> None:
+        self.created = created
+        self.remote_state = remote_state
         self.forgotten = False
         self.closed = False
+        if created and remote_state is not None:
+            remote_state["active"] = True
 
     def forget(self) -> dict[str, object]:
         self.forgotten = True
+        if self.remote_state is not None:
+            self.remote_state["active"] = False
         return {"forgotten": True}
 
     def close(self) -> None:
@@ -123,3 +134,58 @@ def test_bind_rolls_back_external_metadata_and_remote_registration(
     assert registration.forgotten is True
     assert registration.closed is True
     assert not state_home.exists()
+
+
+def test_failed_reconnect_keeps_existing_remote_registration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(state_home))
+    runner = FakeSshRunner()
+    remote_state = {"active": False}
+    first_registration = RecordingRemoteRegistration(
+        created=True,
+        remote_state=remote_state,
+    )
+    monkeypatch.setattr(
+        bind_module,
+        "_register_remote_workspace",
+        lambda *args, **kwargs: first_registration,
+    )
+    first = bind_workspace(
+        target="host",
+        remote="/work/remote",
+        local=tmp_path / "local",
+        runner=runner,
+        connection_name="dq",
+    )
+    assert remote_state["active"] is True
+
+    existing_registration = RecordingRemoteRegistration(
+        created=False,
+        remote_state=remote_state,
+    )
+    monkeypatch.setattr(
+        bind_module,
+        "_register_remote_workspace",
+        lambda *args, **kwargs: existing_registration,
+    )
+
+    def fail_registry(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("injected reconnect registry failure")
+
+    monkeypatch.setattr(bind_module, "register_workspace", fail_registry)
+
+    with pytest.raises(BindError, match="reconnect registry"):
+        bind_workspace(
+            target="host",
+            remote="/work/remote",
+            local=tmp_path / "local",
+            runner=runner,
+            connection_name="dq",
+        )
+
+    assert existing_registration.forgotten is False
+    assert remote_state["active"] is True
+    assert workspace_paths(first.workspace.workspace_id).workspace_file.is_file()

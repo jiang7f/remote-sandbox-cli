@@ -127,9 +127,19 @@ class InitialSyncCoordinator:
         self._scan_bytes = 0
         try:
             self._publish("scanning")
-            local_start = self.start_local_watcher() or 0
-            remote_start = self.start_remote_watcher() or 0
-            self._discard_preexisting_events(local_start, remote_start)
+            sampled_local_start = self.start_local_watcher() or 0
+            sampled_remote_start = self.start_remote_watcher() or 0
+            checkpoint = self.store.get_initial_sync_watermarks()
+            if checkpoint is None:
+                self.store.set_initial_sync_watermarks(
+                    sampled_local_start,
+                    sampled_remote_start,
+                )
+                local_start = sampled_local_start
+                remote_start = sampled_remote_start
+                self._discard_preexisting_events(local_start, remote_start)
+            else:
+                local_start, remote_start = checkpoint
             local_snapshot = self._local_snapshot()
             remote_snapshot = self._remote_snapshot()
 
@@ -159,13 +169,16 @@ class InitialSyncCoordinator:
             completed: set[str] = set()
             changed: set[str] = set()
             batch = plan.transfer_batch
+            self._publish(
+                "transferring",
+                files_total=len(batch.items) if batch is not None else 0,
+                bytes_total=(
+                    sum(_item_size(item) for item in batch.items)
+                    if batch is not None
+                    else 0
+                ),
+            )
             if batch is not None:
-                self._publish(
-                    "transferring",
-                    files_total=len(batch.items),
-                    bytes_total=sum(_item_size(item) for item in batch.items),
-                )
-
                 def on_progress(progress: TransferResult) -> None:
                     newly_completed = set(progress.completed) - completed
                     if newly_completed:
@@ -202,6 +215,7 @@ class InitialSyncCoordinator:
 
             self._replay_until_quiet()
             self._publish("ready", phase=WorkspacePhase.READY)
+            self.store.clear_initial_sync_watermarks()
             return InitialSyncResult(
                 direction,
                 len(batch.items) if batch is not None else 0,

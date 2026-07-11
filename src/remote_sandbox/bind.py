@@ -42,9 +42,23 @@ class BindResult:
 
 
 class _RemoteRegistration(Protocol):
+    created: bool
+
     def forget(self) -> dict[str, object]: ...
 
     def close(self) -> None: ...
+
+
+@dataclass(slots=True)
+class _RemoteRegistrationHandle:
+    client: RemoteWorkspaceClient
+    created: bool
+
+    def forget(self) -> dict[str, object]:
+        return self.client.forget()
+
+    def close(self) -> None:
+        self.client.close()
 
 
 ConfirmCallback = Callable[[str], bool]
@@ -140,6 +154,7 @@ def bind_workspace(
             target=safe_target,
             remote=safe_remote,
             workspace_id=spec.workspace_id,
+            created=existing is None,
         )
         write_workspace_spec(paths.workspace_file, spec)
         with WorkspaceStore.open(paths.state_db):
@@ -147,7 +162,7 @@ def bind_workspace(
         connection = register_workspace(spec)
     except BaseException as exc:
         _rollback_local_metadata(paths, metadata_existed, prior_workspace)
-        if remote_registration is not None:
+        if remote_registration is not None and remote_registration.created:
             with contextlib.suppress(BaseException):
                 remote_registration.forget()
         if isinstance(exc, BindError):
@@ -166,6 +181,7 @@ def _register_remote_workspace(
     target: str,
     remote: str,
     workspace_id: str,
+    created: bool,
 ) -> _RemoteRegistration:
     manager = RemoteAgentManager(runner)
     install = manager.ensure(target)
@@ -180,7 +196,7 @@ def _register_remote_workspace(
     except BaseException:
         client.close()
         raise
-    return client
+    return _RemoteRegistrationHandle(client, created)
 
 
 def _existing_workspace(
