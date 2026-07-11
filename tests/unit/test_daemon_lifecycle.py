@@ -8,6 +8,72 @@ import remote_sandbox.daemon as daemon_module
 from remote_sandbox.daemon import DaemonError
 from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
 
+_SATURATED_MUTATION_REQUESTS = 16
+_EXPECTED_MUTATION_WAITER_LIMIT = 12
+
+
+def _pending_mutation_count(supervisor_fixture: SupervisorHarness) -> int:
+    pending = getattr(supervisor_fixture.supervisor, "_pending_mutations", None)
+    if pending is not None:
+        return len(pending)
+    return supervisor_fixture.supervisor._mutations.qsize()  # type: ignore[attr-defined]
+
+
+def _start_socket_mutations(
+    supervisor_fixture: SupervisorHarness,
+    count: int,
+) -> tuple[list[threading.Thread], list[str]]:
+    outcomes: list[str] = []
+    outcomes_lock = threading.Lock()
+
+    def mutate(index: int) -> None:
+        try:
+            supervisor_fixture.client.mutate(
+                "resolve",
+                {"path": f"model-{index}.py"},
+            )
+        except DaemonError as exc:
+            outcome = str(exc)
+        else:
+            outcome = "completed"
+        with outcomes_lock:
+            outcomes.append(outcome)
+
+    threads = [threading.Thread(target=mutate, args=(index,)) for index in range(count)]
+    for thread in threads:
+        thread.start()
+    return threads, outcomes
+
+
+def _wait_for_saturated_mutation_waiters(
+    supervisor_fixture: SupervisorHarness,
+    threads: list[threading.Thread],
+) -> None:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        pending = _pending_mutation_count(supervisor_fixture)
+        finished = sum(not thread.is_alive() for thread in threads)
+        handler_count = len(
+            supervisor_fixture.supervisor._control._connection_threads  # type: ignore[attr-defined]
+        )
+        if handler_count >= _SATURATED_MUTATION_REQUESTS or (
+            pending == _EXPECTED_MUTATION_WAITER_LIMIT - 1
+            and finished
+            >= _SATURATED_MUTATION_REQUESTS - _EXPECTED_MUTATION_WAITER_LIMIT
+        ):
+            return
+        time.sleep(0.001)
+    raise AssertionError(
+        "mutation waiters did not saturate "
+        f"pending={_pending_mutation_count(supervisor_fixture)} "
+        f"handlers={len(supervisor_fixture.supervisor._control._connection_threads)}"  # type: ignore[attr-defined]
+    )
+
+
+def _join_threads(threads: list[threading.Thread], timeout: float = 1.0) -> None:
+    for thread in threads:
+        thread.join(timeout=timeout)
+
 
 def test_supervisor_publishes_starting_before_initial_sync(
     supervisor_fixture: SupervisorHarness,
@@ -165,7 +231,7 @@ def test_queued_mutation_timeout_cancels_before_worker_drain(
 
     supervisor_fixture.supervisor._run_pending_mutations()  # type: ignore[attr-defined]
     assert calls == []
-    assert supervisor_fixture.supervisor._mutations.empty()  # type: ignore[attr-defined]
+    assert _pending_mutation_count(supervisor_fixture) == 0
 
 
 def test_stop_fails_all_queued_mutations_promptly(
@@ -189,7 +255,7 @@ def test_stop_fails_all_queued_mutations_promptly(
         thread.start()
     deadline = time.monotonic() + 1.0
     while (
-        supervisor_fixture.supervisor._mutations.qsize() < 2  # type: ignore[attr-defined]
+        _pending_mutation_count(supervisor_fixture) < 2
         and time.monotonic() < deadline
     ):
         time.sleep(0.001)
@@ -200,7 +266,7 @@ def test_stop_fails_all_queued_mutations_promptly(
 
     assert all(not thread.is_alive() for thread in threads)
     assert errors == ["supervisor stopped before mutation started"] * 2
-    assert supervisor_fixture.supervisor._mutations.empty()  # type: ignore[attr-defined]
+    assert _pending_mutation_count(supervisor_fixture) == 0
 
 
 def test_started_mutation_waits_for_definitive_result_after_timeout(
@@ -227,7 +293,7 @@ def test_started_mutation_waits_for_definitive_result_after_timeout(
     requester.start()
     deadline = time.monotonic() + 1.0
     while (
-        supervisor_fixture.supervisor._mutations.empty()  # type: ignore[attr-defined]
+        _pending_mutation_count(supervisor_fixture) == 0
         and time.monotonic() < deadline
     ):
         time.sleep(0.001)
@@ -272,7 +338,7 @@ def test_timeout_and_worker_claim_have_one_owner(
     requester.start()
     deadline = time.monotonic() + 1.0
     while (
-        supervisor_fixture.supervisor._mutations.empty()  # type: ignore[attr-defined]
+        _pending_mutation_count(supervisor_fixture) == 0
         and time.monotonic() < deadline
     ):
         time.sleep(0.001)
@@ -286,7 +352,7 @@ def test_timeout_and_worker_claim_have_one_owner(
 
     assert outcome in (["cancelled"], ["completed"])
     assert calls == (1 if outcome == ["completed"] else 0)
-    assert supervisor_fixture.supervisor._mutations.empty()  # type: ignore[attr-defined]
+    assert _pending_mutation_count(supervisor_fixture) == 0
 
 
 def test_control_stop_fails_queued_mutation_while_engine_is_busy(
@@ -312,7 +378,7 @@ def test_control_stop_fails_queued_mutation_while_engine_is_busy(
     requester.start()
     deadline = time.monotonic() + 1.0
     while (
-        supervisor_fixture.supervisor._mutations.empty()  # type: ignore[attr-defined]
+        _pending_mutation_count(supervisor_fixture) == 0
         and time.monotonic() < deadline
     ):
         time.sleep(0.001)
@@ -324,3 +390,109 @@ def test_control_stop_fails_queued_mutation_while_engine_is_busy(
 
     assert not requester.is_alive()
     assert errors == ["supervisor stopped before mutation started"]
+
+
+def test_reserved_control_capacity_survives_saturated_mutation_waiters(
+    supervisor_fixture: SupervisorHarness,
+) -> None:
+    mutation_started = threading.Event()
+    release_mutation = threading.Event()
+
+    def block_mutation(
+        _kind: str,
+        _payload: dict[str, object],
+    ) -> dict[str, object]:
+        mutation_started.set()
+        release_mutation.wait()
+        return {}
+
+    supervisor_fixture.supervisor._mutation_handler = block_mutation  # type: ignore[attr-defined]
+    supervisor_fixture.store.mark_initial_sync_completed()
+    supervisor_fixture.start_in_thread()
+    threads, _outcomes = _start_socket_mutations(
+        supervisor_fixture,
+        _SATURATED_MUTATION_REQUESTS,
+    )
+
+    try:
+        assert mutation_started.wait(timeout=1.0)
+        _wait_for_saturated_mutation_waiters(supervisor_fixture, threads)
+        started = time.monotonic()
+        status = supervisor_fixture.client.control_status()
+        status_elapsed = time.monotonic() - started
+        started = time.monotonic()
+        stopped = supervisor_fixture.client.stop()
+        stop_elapsed = time.monotonic() - started
+
+        assert status.running is True
+        assert stopped is True
+        assert status_elapsed < 0.5
+        assert stop_elapsed < 0.5
+    finally:
+        supervisor_fixture.supervisor.stop()
+        release_mutation.set()
+        _join_threads(threads)
+
+
+def test_repeated_queued_timeouts_remove_pending_requests_immediately(
+    supervisor_fixture: SupervisorHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    supervisor_fixture.supervisor._mutation_handler = (  # type: ignore[attr-defined]
+        lambda kind, _payload: calls.append(kind) or {}
+    )
+    monkeypatch.setattr(daemon_module, "_MUTATION_TIMEOUT_S", 0.002)
+
+    for index in range(50):
+        with pytest.raises(DaemonError, match="timed out"):
+            supervisor_fixture.supervisor.request_mutation(
+                "resolve",
+                {"path": f"model-{index}.py"},
+            )
+        assert _pending_mutation_count(supervisor_fixture) == 0
+
+    supervisor_fixture.supervisor._run_pending_mutations()  # type: ignore[attr-defined]
+
+    assert calls == []
+    assert _pending_mutation_count(supervisor_fixture) == 0
+
+
+def test_saturated_shutdown_releases_handlers_and_pending_requests(
+    supervisor_fixture: SupervisorHarness,
+) -> None:
+    mutation_started = threading.Event()
+    release_mutation = threading.Event()
+
+    def block_mutation(
+        _kind: str,
+        _payload: dict[str, object],
+    ) -> dict[str, object]:
+        mutation_started.set()
+        release_mutation.wait()
+        return {}
+
+    supervisor_fixture.supervisor._mutation_handler = block_mutation  # type: ignore[attr-defined]
+    supervisor_fixture.store.mark_initial_sync_completed()
+    supervisor_fixture.start_in_thread()
+    threads, outcomes = _start_socket_mutations(
+        supervisor_fixture,
+        _SATURATED_MUTATION_REQUESTS,
+    )
+
+    try:
+        assert mutation_started.wait(timeout=1.0)
+        _wait_for_saturated_mutation_waiters(supervisor_fixture, threads)
+        assert supervisor_fixture.client.stop() is True
+    finally:
+        supervisor_fixture.supervisor.stop()
+        release_mutation.set()
+        _join_threads(threads)
+    assert supervisor_fixture.thread is not None
+    supervisor_fixture.thread.join(timeout=2.0)
+
+    assert not supervisor_fixture.thread.is_alive()
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(outcomes) == _SATURATED_MUTATION_REQUESTS
+    assert _pending_mutation_count(supervisor_fixture) == 0
+    assert not supervisor_fixture.supervisor._control._connection_threads  # type: ignore[attr-defined]

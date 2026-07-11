@@ -6,13 +6,13 @@ import hashlib
 import json
 import logging
 import os
-import queue
 import socket
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -45,6 +45,8 @@ _READY_TIMEOUT_S = 60.0
 _STOP_TIMEOUT_S = 10.0
 _CONTROL_REQUEST_TIMEOUT_S = 2.0
 _CONTROL_MAX_LINE_BYTES = 64 * 1024
+_CONTROL_HANDLER_LIMIT = 16
+_MUTATION_WAITER_LIMIT = 12
 _MAX_BACKOFF_S = 30.0
 _MUTATION_TIMEOUT_S = 3600.0
 
@@ -144,54 +146,6 @@ class _MutationRequest:
     state: _MutationState = _MutationState.QUEUED
     result: dict[str, object] | None = None
     error: BaseException | None = None
-    condition: threading.Condition = field(default_factory=threading.Condition)
-
-    def wait(self, timeout: float) -> _MutationState:
-        deadline = time.monotonic() + timeout
-        with self.condition:
-            while self.state is _MutationState.QUEUED:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self.state = _MutationState.CANCELLED
-                    self.condition.notify_all()
-                    return self.state
-                self.condition.wait(timeout=remaining)
-            while self.state is _MutationState.STARTED:
-                self.condition.wait()
-            return self.state
-
-    def claim(self) -> bool:
-        with self.condition:
-            if self.state is not _MutationState.QUEUED:
-                return False
-            self.state = _MutationState.STARTED
-            self.condition.notify_all()
-            return True
-
-    def complete(self, result: dict[str, object]) -> None:
-        with self.condition:
-            if self.state is not _MutationState.STARTED:
-                raise RuntimeError("only a started mutation can complete")
-            self.result = result
-            self.state = _MutationState.COMPLETED
-            self.condition.notify_all()
-
-    def fail_started(self, error: BaseException) -> None:
-        with self.condition:
-            if self.state is not _MutationState.STARTED:
-                raise RuntimeError("only a started mutation can fail")
-            self.error = error
-            self.state = _MutationState.FAILED
-            self.condition.notify_all()
-
-    def fail_queued(self, error: BaseException) -> bool:
-        with self.condition:
-            if self.state is not _MutationState.QUEUED:
-                return False
-            self.error = error
-            self.state = _MutationState.FAILED
-            self.condition.notify_all()
-            return True
 
 
 class _SupervisorControlServer:
@@ -217,7 +171,10 @@ class _SupervisorControlServer:
         self._thread: threading.Thread | None = None
         self._connection_threads: set[threading.Thread] = set()
         self._connection_lock = threading.Lock()
-        self._connection_slots = threading.BoundedSemaphore(16)
+        self._handler_slots = threading.BoundedSemaphore(_CONTROL_HANDLER_LIMIT)
+        self._mutation_waiter_slots = threading.BoundedSemaphore(
+            _MUTATION_WAITER_LIMIT
+        )
 
     def start(self) -> None:
         path = str(self._runtime.socket)
@@ -248,7 +205,7 @@ class _SupervisorControlServer:
                 continue
             except OSError:
                 return
-            if not self._connection_slots.acquire(blocking=False):
+            if not self._handler_slots.acquire(blocking=False):
                 with connection, contextlib.suppress(OSError):
                     _send_line(connection, "error")
                 continue
@@ -289,12 +246,24 @@ class _SupervisorControlServer:
                     mutation_payload: object = decoded.get("payload")
                     if not isinstance(kind, str) or not isinstance(mutation_payload, dict):
                         raise ValueError("mutation request is malformed")
-                    try:
-                        result = self._on_mutation(kind, mutation_payload)
-                    except Exception as exc:
-                        response = {"ok": False, "error": " ".join(str(exc).split())}
+                    if not self._mutation_waiter_slots.acquire(blocking=False):
+                        response = {
+                            "ok": False,
+                            "error": "supervisor mutation endpoint is busy",
+                        }
                     else:
-                        response = {"ok": True, "result": result}
+                        try:
+                            try:
+                                result = self._on_mutation(kind, mutation_payload)
+                            except Exception as exc:
+                                response = {
+                                    "ok": False,
+                                    "error": " ".join(str(exc).split()),
+                                }
+                            else:
+                                response = {"ok": True, "result": result}
+                        finally:
+                            self._mutation_waiter_slots.release()
                     _send_line(connection, json.dumps(response, separators=(",", ":")))
                 else:
                     _send_line(connection, "error")
@@ -304,7 +273,7 @@ class _SupervisorControlServer:
             current = threading.current_thread()
             with self._connection_lock:
                 self._connection_threads.discard(current)
-            self._connection_slots.release()
+            self._handler_slots.release()
 
     def stop(self) -> None:
         if self._sock is not None:
@@ -341,9 +310,8 @@ class WorkspaceSupervisor:
         self.local_watcher = local_watcher
         self._component_factory = component_factory
         self._mutation_handler = mutation_handler
-        self._mutations: queue.Queue[_MutationRequest] = queue.Queue()
-        self._mutation_lock = threading.Lock()
-        self._queued_mutations: dict[int, _MutationRequest] = {}
+        self._pending_mutations: deque[_MutationRequest] = deque()
+        self._mutation_condition = threading.Condition()
         self._close_store = close_store
         self._stop_event = threading.Event()
         self._sync_requested = threading.Event()
@@ -457,21 +425,26 @@ class WorkspaceSupervisor:
         if not kind or self._mutation_handler is None:
             raise DaemonError("supervisor mutation is unavailable")
         request = _MutationRequest(kind, payload)
-        with self._mutation_lock:
+        deadline = time.monotonic() + _MUTATION_TIMEOUT_S
+        with self._mutation_condition:
             if self._stop_event.is_set():
                 raise DaemonError("supervisor stopped before mutation started")
-            self._queued_mutations[id(request)] = request
-            self._mutations.put(request)
-        self._sync_requested.set()
-        state = request.wait(_MUTATION_TIMEOUT_S)
-        if state is _MutationState.CANCELLED:
-            with self._mutation_lock:
-                self._queued_mutations.pop(id(request), None)
-            raise DaemonError(f"supervisor mutation timed out: {kind}")
-        if state is _MutationState.FAILED:
+            self._pending_mutations.append(request)
+            self._sync_requested.set()
+            while request.state is _MutationState.QUEUED:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    request.state = _MutationState.CANCELLED
+                    self._pending_mutations.remove(request)
+                    self._mutation_condition.notify_all()
+                    raise DaemonError(f"supervisor mutation timed out: {kind}")
+                self._mutation_condition.wait(timeout=remaining)
+            while request.state is _MutationState.STARTED:
+                self._mutation_condition.wait()
+        if request.state is _MutationState.FAILED:
             assert request.error is not None
             raise DaemonError(str(request.error)) from request.error
-        if state is not _MutationState.COMPLETED or request.result is None:
+        if request.state is not _MutationState.COMPLETED or request.result is None:
             raise DaemonError("supervisor mutation ended without a result")
         return request.result
 
@@ -599,34 +572,38 @@ class WorkspaceSupervisor:
 
     def _run_pending_mutations(self) -> None:
         while True:
-            try:
-                request = self._mutations.get_nowait()
-            except queue.Empty:
-                return
-            with self._mutation_lock:
-                tracked = self._queued_mutations.pop(id(request), None)
-                claimed = tracked is not None and request.claim()
-            if not claimed:
-                continue
+            with self._mutation_condition:
+                if not self._pending_mutations:
+                    return
+                request = self._pending_mutations.popleft()
+                if request.state is not _MutationState.QUEUED:
+                    raise RuntimeError("pending mutation is not queued")
+                request.state = _MutationState.STARTED
+                self._mutation_condition.notify_all()
             try:
                 assert self._mutation_handler is not None
                 result = self._mutation_handler(request.kind, request.payload)
             except BaseException as exc:
-                request.fail_started(exc)
+                with self._mutation_condition:
+                    request.error = exc
+                    request.state = _MutationState.FAILED
+                    self._mutation_condition.notify_all()
             else:
-                request.complete(result)
+                with self._mutation_condition:
+                    request.result = result
+                    request.state = _MutationState.COMPLETED
+                    self._mutation_condition.notify_all()
 
     def _fail_queued_mutations(self, error: BaseException) -> None:
-        with self._mutation_lock:
-            queued = tuple(self._queued_mutations.values())
-            self._queued_mutations.clear()
-            while True:
-                try:
-                    self._mutations.get_nowait()
-                except queue.Empty:
-                    break
-        for request in queued:
-            request.fail_queued(error)
+        with self._mutation_condition:
+            queued = tuple(self._pending_mutations)
+            self._pending_mutations.clear()
+            for request in queued:
+                if request.state is not _MutationState.QUEUED:
+                    raise RuntimeError("pending mutation is not queued")
+                request.error = error
+                request.state = _MutationState.FAILED
+            self._mutation_condition.notify_all()
 
     def _start_subscription(self) -> None:
         if self.remote is None:
