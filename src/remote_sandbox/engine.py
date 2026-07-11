@@ -235,16 +235,27 @@ class SyncEngine:
         batch_paths = {item.path for item in batch.items}
         if not set(completed) <= batch_paths:
             raise ValueError("completed transfer paths must belong to the batch")
-        destination_side = "remote" if batch.direction is TransferDirection.PUSH else "local"
         fingerprints = self._destination_hashes(batch.direction, completed)
-        with self.store.transaction():
-            for path in completed:
-                fingerprint = fingerprints[path]
-                if isinstance(fingerprint, MissingEntry):
-                    raise RuntimeError(f"completed transfer destination is missing: {path}")
-                self.store.upsert_base(fingerprint)
-                self.store.set_expected_echo(destination_side, fingerprint)
-        self.audit_coordinator.refresh(completed)
+        verified: list[EntryFingerprint] = []
+        for path in completed:
+            fingerprint = fingerprints[path]
+            if isinstance(fingerprint, MissingEntry):
+                raise RuntimeError(f"completed transfer destination is missing: {path}")
+            verified.append(fingerprint)
+        self.seed_verified_transfer(batch.direction, tuple(verified))
+
+    def seed_verified_transfer(
+        self,
+        direction: TransferDirection,
+        entries: tuple[EntryFingerprint, ...],
+    ) -> None:
+        if type(direction) is not TransferDirection:
+            raise ValueError("verified transfer direction must be a TransferDirection")
+        if not entries or any(type(entry) is not EntryFingerprint for entry in entries):
+            raise ValueError("verified transfer entries must contain fingerprints")
+        destination_side = "remote" if direction is TransferDirection.PUSH else "local"
+        self.store.seed_verified_transfer(destination_side, entries)
+        self.audit_coordinator.refresh(entry.path for entry in entries)
 
     def requeue_paths(self, paths: Iterable[str], reason: str) -> None:
         self.store.requeue_paths(paths, reason)

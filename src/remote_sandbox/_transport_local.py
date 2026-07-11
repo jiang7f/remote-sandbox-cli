@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 from remote_sandbox._transport_fingerprint import LocalPathChanged, ProtectedLocalRoot
+from remote_sandbox.manifest import EntryFingerprint
 from remote_sandbox.transport import (
     FingerprintState,
     ProgressCallback,
@@ -18,9 +19,9 @@ from remote_sandbox.transport import (
     _directory_operand,
     _extract_tar_archive,
     _normalized_delete_paths,
-    _path_input,
     _require_expected,
     _same_content,
+    _VerifiedProgressBatcher,
 )
 
 
@@ -126,15 +127,12 @@ class LocalPairTransport:
                 "--archive",
                 "--links",
                 "--times",
-                "--itemize-changes",
-                "--files-from=-",
                 _directory_operand(safe_source),
                 _directory_operand(safe_destination),
             ]
             result = subprocess.run(
                 argv,
                 check=False,
-                input=_path_input(batch, source_before),
                 capture_output=True,
             )
             if result.returncode != 0:
@@ -178,27 +176,35 @@ class LocalPairTransport:
         on_progress: ProgressCallback,
     ) -> TransferResult:
         completed: list[str] = []
+        verified: list[EntryFingerprint] = []
         changed: list[str] = []
-        for item in batch.items:
-            try:
-                source_after = source.fingerprint(item.path, with_hash=True)
-            except LocalPathChanged:
-                changed.append(item.path)
-                continue
-            if source_after != before[item.path]:
-                changed.append(item.path)
-                continue
-            try:
-                destination_after = destination.fingerprint(item.path, with_hash=True)
-            except LocalPathChanged as exc:
-                raise TransferError(
-                    f"post-transfer destination changed: {item.path}"
-                ) from exc
-            if not _same_content(source_after, destination_after):
-                raise TransferError(f"post-transfer verification failed: {item.path}")
-            completed.append(item.path)
-            on_progress(TransferResult(tuple(completed), ()))
-        return TransferResult(tuple(completed), tuple(changed))
+        progress = _VerifiedProgressBatcher(on_progress)
+        try:
+            for item in batch.items:
+                try:
+                    source_after = source.fingerprint(item.path, with_hash=True)
+                except LocalPathChanged:
+                    changed.append(item.path)
+                    continue
+                if source_after != before[item.path]:
+                    changed.append(item.path)
+                    continue
+                try:
+                    destination_after = destination.fingerprint(item.path, with_hash=True)
+                except LocalPathChanged as exc:
+                    raise TransferError(
+                        f"post-transfer destination changed: {item.path}"
+                    ) from exc
+                if not _same_content(source_after, destination_after):
+                    raise TransferError(f"post-transfer verification failed: {item.path}")
+                if not isinstance(destination_after, EntryFingerprint):
+                    raise TransferError(f"post-transfer destination is missing: {item.path}")
+                completed.append(item.path)
+                verified.append(destination_after)
+                progress.add(destination_after)
+        finally:
+            progress.flush()
+        return TransferResult(tuple(completed), tuple(changed), tuple(verified))
 
     @staticmethod
     def _delete(root: Path, paths: tuple[str, ...]) -> None:

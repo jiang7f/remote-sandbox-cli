@@ -9,8 +9,9 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, TypeAlias, cast
@@ -134,6 +135,11 @@ class TransferBatch:
 class TransferResult:
     completed: tuple[str, ...]
     changed_during_transfer: tuple[str, ...]
+    verified_fingerprints: tuple[EntryFingerprint, ...] = field(
+        default=(),
+        compare=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if type(self.completed) is not tuple or type(self.changed_during_transfer) is not tuple:
@@ -142,6 +148,52 @@ class TransferResult:
         changed = _validated_result_paths(self.changed_during_transfer, "changed")
         if set(completed) & set(changed):
             raise ValueError("completed and changed paths must be disjoint")
+        verified = self.verified_fingerprints
+        if type(verified) is not tuple or any(
+            type(entry) is not EntryFingerprint for entry in verified
+        ):
+            raise ValueError("verified fingerprints must be an EntryFingerprint tuple")
+        if verified and tuple(entry.path for entry in verified) != completed:
+            raise ValueError("verified fingerprint paths must match completed paths")
+
+
+class _VerifiedProgressBatcher:
+    def __init__(
+        self,
+        callback: ProgressCallback,
+        *,
+        max_items: int = 256,
+        max_seconds: float = 0.25,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if max_items <= 0 or max_seconds <= 0:
+            raise ValueError("verified progress batch limits must be positive")
+        self._callback = callback
+        self._max_items = max_items
+        self._max_seconds = max_seconds
+        self._clock = clock
+        self._last_flush = clock()
+        self._pending: list[EntryFingerprint] = []
+
+    def add(self, fingerprint: EntryFingerprint) -> None:
+        self._pending.append(fingerprint)
+        now = self._clock()
+        if len(self._pending) >= self._max_items or now - self._last_flush >= self._max_seconds:
+            self.flush(now=now)
+
+    def flush(self, *, now: float | None = None) -> None:
+        if not self._pending:
+            return
+        verified = tuple(self._pending)
+        self._pending.clear()
+        self._last_flush = self._clock() if now is None else now
+        self._callback(
+            TransferResult(
+                tuple(entry.path for entry in verified),
+                (),
+                verified,
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -582,25 +634,33 @@ class BatchTransport:
         on_progress: ProgressCallback,
     ) -> TransferResult:
         completed: list[str] = []
+        verified: list[EntryFingerprint] = []
         changed: list[str] = []
-        for item in batch.items:
-            source = local_after[item.path]
-            destination = remote_after[item.path]
-            if batch.direction is TransferDirection.PULL:
-                source, destination = destination, source
-            if isinstance(source, LocalPathChanged):
-                changed.append(item.path)
-                continue
-            if isinstance(destination, LocalPathChanged):
-                raise TransferError(f"post-transfer destination changed: {item.path}")
-            if source != source_before[item.path]:
-                changed.append(item.path)
-                continue
-            if not _same_content(source, destination):
-                raise TransferError(f"post-transfer verification failed: {item.path}")
-            completed.append(item.path)
-            on_progress(TransferResult(tuple(completed), ()))
-        return TransferResult(tuple(completed), tuple(changed))
+        progress = _VerifiedProgressBatcher(on_progress)
+        try:
+            for item in batch.items:
+                source = local_after[item.path]
+                destination = remote_after[item.path]
+                if batch.direction is TransferDirection.PULL:
+                    source, destination = destination, source
+                if isinstance(source, LocalPathChanged):
+                    changed.append(item.path)
+                    continue
+                if isinstance(destination, LocalPathChanged):
+                    raise TransferError(f"post-transfer destination changed: {item.path}")
+                if source != source_before[item.path]:
+                    changed.append(item.path)
+                    continue
+                if not _same_content(source, destination):
+                    raise TransferError(f"post-transfer verification failed: {item.path}")
+                if not isinstance(destination, EntryFingerprint):
+                    raise TransferError(f"post-transfer destination is missing: {item.path}")
+                completed.append(item.path)
+                verified.append(destination)
+                progress.add(destination)
+        finally:
+            progress.flush()
+        return TransferResult(tuple(completed), tuple(changed), tuple(verified))
 
     @staticmethod
     def _local_postflight(

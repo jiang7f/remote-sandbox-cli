@@ -6,7 +6,22 @@ import os
 import secrets
 import shutil
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+_HARDLINK_FALLBACK_ERRORS = {
+    errno.EXDEV,
+    errno.EPERM,
+    errno.EACCES,
+    errno.EMLINK,
+    getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+    errno.EOPNOTSUPP,
+}
+_STAGING_WORKERS = 4
+
+
+class _HardlinkUnavailable(OSError):
+    pass
 
 
 def stage_entries_from_fd(
@@ -17,18 +32,84 @@ def stage_entries_from_fd(
     error_type: type[Exception],
 ) -> None:
     staging.mkdir(mode=0o700, parents=True, exist_ok=False)
+    grouped: dict[tuple[str, ...], list[tuple[str, str]]] = {}
     for relative in paths:
         parts = relative.split("/")
-        parent_fd = _walk_parent(root_fd, parts[:-1], create=False)
+        grouped.setdefault(tuple(parts[:-1]), []).append((parts[-1], relative))
+    try:
+        _stage_grouped_entries(
+            root_fd,
+            grouped,
+            staging,
+            workers=_STAGING_WORKERS,
+            require_hardlinks=True,
+            try_hardlinks=True,
+            error_type=error_type,
+        )
+    except _HardlinkUnavailable:
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(mode=0o700, parents=True, exist_ok=False)
         try:
-            _copy_from_descriptor(
-                parent_fd,
-                parts[-1],
-                staging / relative,
+            _stage_grouped_entries(
+                root_fd,
+                grouped,
+                staging,
+                workers=1,
+                require_hardlinks=False,
+                try_hardlinks=False,
                 error_type=error_type,
             )
-        finally:
-            os.close(parent_fd)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def _stage_grouped_entries(
+    root_fd: int,
+    grouped: dict[tuple[str, ...], list[tuple[str, str]]],
+    staging: Path,
+    *,
+    workers: int,
+    require_hardlinks: bool,
+    try_hardlinks: bool,
+    error_type: type[Exception],
+) -> None:
+    by_depth: dict[int, list[tuple[tuple[str, ...], list[tuple[str, str]]]]] = {}
+    for parent_parts, leaves in grouped.items():
+        by_depth.setdefault(len(parent_parts), []).append((parent_parts, leaves))
+    for depth in sorted(by_depth):
+        groups = sorted(by_depth[depth], key=lambda item: item[0])
+
+        def stage_group(
+            item: tuple[tuple[str, ...], list[tuple[str, str]]],
+        ) -> None:
+            parent_parts, leaves = item
+            parent_fd = _walk_parent(root_fd, list(parent_parts), create=False)
+            try:
+                destination_parent = staging.joinpath(*parent_parts)
+                destination_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                for leaf, relative in leaves:
+                    _copy_from_descriptor(
+                        parent_fd,
+                        leaf,
+                        staging / relative,
+                        parent_ready=True,
+                        require_hardlink=require_hardlinks,
+                        try_hardlink=try_hardlinks,
+                        error_type=error_type,
+                    )
+            finally:
+                os.close(parent_fd)
+
+        if workers == 1 or len(groups) == 1:
+            for group in groups:
+                stage_group(group)
+        else:
+            with ThreadPoolExecutor(max_workers=min(workers, len(groups))) as executor:
+                tuple(executor.map(stage_group, groups))
 
 
 def finalize_entries_from_fd(
@@ -84,13 +165,17 @@ def _copy_from_descriptor(
     leaf: str,
     destination: Path,
     *,
+    parent_ready: bool = False,
+    require_hardlink: bool = False,
+    try_hardlink: bool = True,
     error_type: type[Exception],
 ) -> None:
     try:
         entry = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as exc:
         raise error_type(f"source path became unavailable: {destination}: {exc}") from exc
-    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not parent_ready:
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if stat.S_ISDIR(entry.st_mode):
         destination.mkdir(mode=stat.S_IMODE(entry.st_mode), exist_ok=True)
         return
@@ -99,6 +184,27 @@ def _copy_from_descriptor(
         return
     if not stat.S_ISREG(entry.st_mode):
         raise error_type(f"special files are not transferable: {destination}")
+    if try_hardlink:
+        try:
+            os.link(
+                leaf,
+                destination,
+                src_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            if exc.errno not in _HARDLINK_FALLBACK_ERRORS:
+                raise error_type(
+                    f"source path became unavailable: {destination}: {exc}"
+                ) from exc
+            if require_hardlink:
+                raise _HardlinkUnavailable(exc.errno, str(exc)) from exc
+        else:
+            staged = destination.stat(follow_symlinks=False)
+            if (staged.st_dev, staged.st_ino) != (entry.st_dev, entry.st_ino):
+                destination.unlink(missing_ok=True)
+                raise error_type(f"source changed while staging: {destination}")
+            return
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(leaf, flags, dir_fd=parent_fd)
     try:

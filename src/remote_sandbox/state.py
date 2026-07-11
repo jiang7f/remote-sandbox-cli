@@ -175,6 +175,42 @@ class WorkspaceStore:
                 (entry.path, _encode_fingerprint(entry)),
             )
 
+    def seed_verified_transfer(
+        self,
+        side: str,
+        entries: Iterable[EntryFingerprint],
+    ) -> None:
+        _validate_side(side)
+        verified = tuple(entries)
+        if not verified or any(type(entry) is not EntryFingerprint for entry in verified):
+            raise ValueError("verified transfer entries must contain fingerprints")
+        paths = tuple(entry.path for entry in verified)
+        if len(paths) != len(set(paths)):
+            raise ValueError("verified transfer entries must have unique paths")
+        now = time.time()
+        base_rows = tuple((entry.path, _encode_fingerprint(entry)) for entry in verified)
+        echo_rows = tuple(
+            (side, entry.path, _encode_expected_echo(entry), now) for entry in verified
+        )
+        with self.transaction():
+            self._connection.executemany(
+                """
+                INSERT INTO base_entries(path, fingerprint_json) VALUES (?, ?)
+                ON CONFLICT(path) DO UPDATE SET fingerprint_json = excluded.fingerprint_json
+                """,
+                base_rows,
+            )
+            self._connection.executemany(
+                """
+                INSERT INTO expected_echoes(side, path, fingerprint_json, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(side, path) DO UPDATE SET
+                    fingerprint_json = excluded.fingerprint_json,
+                    created_at = excluded.created_at
+                """,
+                echo_rows,
+            )
+
     def delete_base(self, path: str) -> None:
         normalized = normalize_relative_path(path)
         with self.transaction():

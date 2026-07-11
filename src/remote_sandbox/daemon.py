@@ -1230,7 +1230,7 @@ def _daemon_status_from_payload(payload: object) -> DaemonStatus:
             if workspace_status_payload is not None
             else None
         )
-    except (TypeError, ValueError) as exc:
+    except (DaemonError, TypeError, ValueError) as exc:
         raise DaemonError("malformed supervisor status") from exc
     return DaemonStatus(
         running,

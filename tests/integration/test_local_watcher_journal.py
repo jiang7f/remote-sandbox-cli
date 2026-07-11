@@ -74,14 +74,21 @@ def test_real_watchdog_preserves_a_move_as_one_journal_event(tmp_path: Path) -> 
     finally:
         watcher.stop()
 
-    relevant = [
+    moves = [
         event
         for event in recorded
-        if event.path == "before.py" or event.destination_path == "after.py"
+        if event.kind is EventKind.MOVE
+        and event.path == "before.py"
+        and event.destination_path == "after.py"
     ]
-    assert relevant == [
-        JournalEvent("local", relevant[0].sequence, EventKind.MOVE, "before.py", "after.py")
+    assert moves == [
+        JournalEvent("local", moves[0].sequence, EventKind.MOVE, "before.py", "after.py")
     ]
+    assert not any(
+        event.kind in {EventKind.CREATE, EventKind.DELETE}
+        and (event.path == "before.py" or event.path == "after.py")
+        for event in recorded
+    )
 
 
 def test_real_watchdog_never_emits_hard_ignored_metadata(tmp_path: Path) -> None:

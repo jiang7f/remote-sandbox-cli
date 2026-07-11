@@ -4,6 +4,7 @@ import hashlib
 import multiprocessing
 import os
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -13,6 +14,7 @@ from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Literal
 
+from remote_sandbox._transport_fingerprint import ProtectedLocalRoot
 from remote_sandbox.cli import (
     CapturedCliResult,
     CliServices,
@@ -55,8 +57,10 @@ from remote_sandbox.shell import ConnectResponse, ManagedShellSession
 from remote_sandbox.state import AuditSignature, WorkspaceStore
 from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
 from remote_sandbox.transport import (
+    LocalPairTransport,
     TransferBatch,
     TransferDirection,
+    TransferItem,
     TransferResult,
 )
 from remote_sandbox.watch import PollingLocalWatcher
@@ -392,6 +396,8 @@ class ControllableLocalPairTransport:
         self.transfer_call_number: int | None = None
         self._progress_triggered = False
         self.fail_after_first_progress = False
+        self.fail_after_progress_count: int | None = None
+        self._progress_count = 0
 
     def change_source_before_commit(self, path: str) -> None:
         self._mutate_before_commit.add(path)
@@ -438,14 +444,30 @@ class ControllableLocalPairTransport:
             if _content_identity(before) != _content_identity(destination_after):
                 raise RuntimeError(f"verification failed for {item.path}")
             completed.append(item.path)
-            on_progress(TransferResult(tuple(completed), ()))  # type: ignore[operator]
+            if not isinstance(destination_after, EntryFingerprint):
+                raise RuntimeError(f"verified destination is missing for {item.path}")
+            on_progress(  # type: ignore[operator]
+                TransferResult((item.path,), (), (destination_after,))
+            )
+            self._progress_count += 1
             if not self._progress_triggered and self.on_first_progress is not None:
                 self._progress_triggered = True
                 self.on_first_progress()
             if self.fail_after_first_progress:
                 self.fail_after_first_progress = False
                 raise RuntimeError("injected transfer interruption")
-        return TransferResult(tuple(completed), tuple(changed))
+            if self.fail_after_progress_count == self._progress_count:
+                self.fail_after_progress_count = None
+                raise RuntimeError("injected transfer interruption")
+        verified = tuple(
+            entry
+            for path in completed
+            if isinstance(
+                (entry := fingerprint_local(destination, path, with_hash=True)),
+                EntryFingerprint,
+            )
+        )
+        return TransferResult(tuple(completed), tuple(changed), verified)
 
     def delete_local(
         self,
@@ -527,6 +549,198 @@ class SyncPair:
     def append_remote_delete(self, path: str) -> None:
         (self.remote / path).unlink()
         self.remote_client.append_event(EventKind.DELETE, path)
+
+
+class CountingLocalPairTransport(LocalPairTransport):
+    def __init__(self, local: Path, remote: Path) -> None:
+        super().__init__(local, remote, engine="rsync")
+        self.ssh_process_count = 0
+        self.progress_payload_sizes: list[int] = []
+        self.transfer_seconds = 0.0
+
+    def transfer(
+        self,
+        batch: TransferBatch,
+        on_progress: Callable[[TransferResult], None],
+    ) -> TransferResult:
+        self.ssh_process_count += 1
+
+        def record_progress(progress: TransferResult) -> None:
+            self.progress_payload_sizes.append(len(progress.completed))
+            on_progress(progress)
+
+        return super().transfer(batch, record_progress)
+
+    def _transfer_rsync(
+        self,
+        batch: TransferBatch,
+        source: ProtectedLocalRoot,
+        destination: ProtectedLocalRoot,
+        source_before: Mapping[str, FingerprintState],
+    ) -> None:
+        started = time.monotonic()
+        try:
+            super()._transfer_rsync(batch, source, destination, source_before)
+        finally:
+            self.transfer_seconds += time.monotonic() - started
+
+
+@dataclass(slots=True)
+class SqlTransactionCounter:
+    commits: int = 0
+    measurement_started_at: float | None = None
+    first_progress_seconds: float | None = None
+
+    def trace(self, statement: str) -> None:
+        normalized = statement.lstrip().upper()
+        if normalized.startswith("COMMIT"):
+            self.commits += 1
+        if (
+            self.measurement_started_at is not None
+            and self.first_progress_seconds is None
+            and "INSERT INTO WORKSPACE_STATUS" in normalized
+        ):
+            self.first_progress_seconds = time.monotonic() - self.measurement_started_at
+
+    def start_measurement(self) -> None:
+        self.measurement_started_at = time.monotonic()
+        self.first_progress_seconds = None
+
+
+@dataclass(slots=True)
+class CountingHashProvider:
+    client: LocalReplicaClient
+    _baseline: int = 0
+
+    @property
+    def count(self) -> int:
+        return sum(len(call) for call in self.client.hash_calls[self._baseline :])
+
+    def reset(self) -> None:
+        self._baseline = len(self.client.hash_calls)
+
+
+@dataclass(slots=True)
+class PerformancePair(SyncPair):
+    transport: CountingLocalPairTransport
+    coordinator: InitialSyncCoordinator
+    hash_counter: CountingHashProvider
+    direct: Path
+    transaction_counter: SqlTransactionCounter
+
+    def close(self) -> None:
+        self.store._connection.set_trace_callback(None)
+        self.remote_client.close()
+        self.store.close()
+
+    def populate(self, files: int) -> None:
+        if files <= 0:
+            raise ValueError("performance population must be positive")
+        for index in range(files):
+            path = self.local / f"files/{index // 100:03d}/file-{index:05d}.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = f"{index:08d}".encode("ascii").ljust(128, b"x")
+            path.write_bytes(payload)
+
+    def initial_sync(self) -> None:
+        self.coordinator.run()
+
+    def initial_transfer_batch(self) -> TransferBatch:
+        entries = snapshot_tree(self.local, with_hash=False)
+        return TransferBatch(
+            TransferDirection.PUSH,
+            tuple(
+                TransferItem(path, entry, MissingEntry(path))
+                for path, entry in entries.items()
+            ),
+        )
+
+    def measure_direct_rsync(self, destination: Path | None = None) -> float:
+        target = destination or self.direct
+        shutil.rmtree(target, ignore_errors=True)
+        target.mkdir(parents=True)
+        started = time.monotonic()
+        subprocess.run(
+            ["rsync", "-a", f"{self.local}/", f"{target}/"],
+            check=True,
+            capture_output=True,
+            timeout=120.0,
+        )
+        return time.monotonic() - started
+
+    def measure_batch_transport(
+        self,
+        batch: TransferBatch,
+        destination: Path,
+    ) -> tuple[float, int, int]:
+        shutil.rmtree(destination, ignore_errors=True)
+        destination.mkdir(parents=True)
+        transport = CountingLocalPairTransport(self.local, destination)
+        result = transport.transfer(batch, lambda _progress: None)
+        assert result.completed == tuple(item.path for item in batch.items)
+        return (
+            transport.transfer_seconds,
+            transport.ssh_process_count,
+            max(transport.progress_payload_sizes),
+        )
+
+    def measure_initial_sync(self) -> float:
+        self.transaction_counter.start_measurement()
+        assert self.transaction_counter.measurement_started_at is not None
+        started = self.transaction_counter.measurement_started_at
+        self.initial_sync()
+        return time.monotonic() - started
+
+    def assert_final_base_and_echoes(self) -> None:
+        local = snapshot_tree(self.local, with_hash=True)
+        remote = snapshot_tree(self.remote, with_hash=True)
+        assert set(local) == set(remote)
+        assert all(
+            _content_identity(local[path]) == _content_identity(remote[path])
+            for path in local
+        )
+        assert self.store.list_base() == remote
+        assert all(
+            self.store.get_expected_echo("remote", path) == entry
+            for path, entry in remote.items()
+        )
+
+    def wait_until_synced(self, remote_path: Path, timeout: float = 5.0) -> None:
+        relative = remote_path.relative_to(self.remote).as_posix()
+        self.remote_client.append_event(EventKind.MODIFY, relative)
+        self.engine.run_once("performance-remote-change")
+        self._wait_until(
+            lambda: (self.local / relative).is_file(),
+            f"local replica of {relative}",
+            timeout,
+        )
+
+    def wait_until_missing(self, local_path: Path, timeout: float = 5.0) -> None:
+        relative = local_path.relative_to(self.local).as_posix()
+        self.remote_client.append_event(EventKind.DELETE, relative)
+        self.engine.run_once("performance-remote-delete")
+        self._wait_until(
+            lambda: not local_path.exists(),
+            f"local deletion of {relative}",
+            timeout,
+        )
+
+    def _wait_until(
+        self,
+        predicate: Callable[[], bool],
+        label: str,
+        timeout: float,
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        status = self.store.get_status()
+        raise AssertionError(
+            f"timed out waiting for {label}. Last status was "
+            f"{status.phase.value}/{status.progress.stage}, error={status.error!r}"
+        )
 
 
 @dataclass(slots=True)
@@ -1322,6 +1536,50 @@ def make_sync_pair(tmp_path: Path) -> SyncPair:
     return SyncPair(local, remote, store, remote_client, transport, engine)
 
 
+def make_performance_pair(tmp_path: Path) -> PerformancePair:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    direct = tmp_path / "direct"
+    local.mkdir()
+    remote.mkdir()
+    direct.mkdir()
+    store = WorkspaceStore.open(tmp_path / "state.sqlite3")
+    remote_client = LocalReplicaClient(remote, tmp_path / "remote-state.sqlite3")
+    transport = CountingLocalPairTransport(local, remote)
+    engine = SyncEngine(
+        store=store,
+        local_root=local,
+        remote=remote_client,
+        transport=transport,
+        policy=StaticPolicyEngine(),
+    )
+    coordinator = InitialSyncCoordinator(
+        store=store,
+        local_root=local,
+        remote=remote_client,
+        transport=transport,
+        engine=engine,
+        start_local_watcher=lambda: store.latest_sequence("local"),
+        start_remote_watcher=remote_client.latest_sequence,
+        quiet_seconds=0.0,
+        poll_interval=0.001,
+    )
+    transaction_counter = SqlTransactionCounter()
+    store._connection.set_trace_callback(transaction_counter.trace)
+    return PerformancePair(
+        local,
+        remote,
+        store,
+        remote_client,
+        transport,
+        engine,
+        coordinator,
+        CountingHashProvider(remote_client),
+        direct,
+        transaction_counter,
+    )
+
+
 def make_initial_pair(tmp_path: Path) -> InitialPairHarness:
     pair = make_sync_pair(tmp_path)
     order = OperationOrder()
@@ -1404,7 +1662,8 @@ def _copy_entry(source: Path, destination: Path) -> None:
     if source.is_symlink():
         destination.symlink_to(source.readlink())
     elif source.is_dir():
-        shutil.copytree(source, destination, symlinks=True)
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copystat(source, destination, follow_symlinks=False)
     else:
         shutil.copy2(source, destination, follow_symlinks=False)
 

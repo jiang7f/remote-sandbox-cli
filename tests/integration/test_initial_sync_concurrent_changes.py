@@ -4,6 +4,7 @@ import pytest
 from helpers.sync_harness import InitialPairHarness
 
 from remote_sandbox.journal import EventKind
+from remote_sandbox.manifest import EntryFingerprint, fingerprint_local
 
 
 def test_change_created_during_bulk_copy_is_replayed(
@@ -58,6 +59,46 @@ def test_restart_mid_transfer_only_copies_unfinished_paths(
     assert [item.path for item in initial_pair.transport.batches[1].items] == ["b.txt"]
     assert (initial_pair.local / "a.txt").read_text(encoding="utf-8") == "a"
     assert (initial_pair.local / "b.txt").read_text(encoding="utf-8") == "b"
+
+
+def test_mid_transfer_exception_persists_every_reported_fingerprint(
+    initial_pair: InitialPairHarness,
+) -> None:
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (initial_pair.remote / name).write_text(name, encoding="utf-8")
+    initial_pair.transport.fail_after_progress_count = 2
+
+    with pytest.raises(RuntimeError, match="interruption"):
+        initial_pair.coordinator.run()
+
+    for name in ("a.txt", "b.txt"):
+        observed = fingerprint_local(initial_pair.local, name, with_hash=True)
+        assert isinstance(observed, EntryFingerprint)
+        assert initial_pair.store.get_base(name) == observed
+        assert initial_pair.store.get_expected_echo("local", name) == observed
+    assert initial_pair.store.get_base("c.txt").path == "c.txt"
+
+    initial_pair.coordinator.run()
+
+    assert [item.path for item in initial_pair.transport.batches[1].items] == ["c.txt"]
+
+
+def test_initial_batch_persists_verified_fingerprints_without_rehash_drift(
+    initial_pair: InitialPairHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (initial_pair.remote / "pkg").mkdir()
+    (initial_pair.remote / "value.txt").write_text("value", encoding="utf-8")
+    (initial_pair.remote / "link").symlink_to("value.txt")
+    monkeypatch.setattr(initial_pair.coordinator, "_replay_until_quiet", lambda: None)
+
+    initial_pair.coordinator.run()
+
+    for name in ("link", "pkg", "value.txt"):
+        observed = fingerprint_local(initial_pair.local, name, with_hash=True)
+        assert isinstance(observed, EntryFingerprint)
+        assert initial_pair.store.get_base(name) == observed
+        assert initial_pair.store.get_expected_echo("local", name) == observed
 
 
 def test_restart_preserves_edit_to_completed_destination(

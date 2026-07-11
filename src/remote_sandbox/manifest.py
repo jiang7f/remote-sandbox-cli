@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ntpath
 import os
 import posixpath
 import stat
@@ -106,7 +107,7 @@ EntryState = FileEntry | MissingEntry
 def normalize_relative_path(path: str) -> str:
     if not path or _has_control_char(path):
         raise ValueError("Invalid relative path")
-    if path.startswith("/") or path.startswith("../") or path == "..":
+    if ntpath.isabs(path) or path.startswith("/") or path.startswith("../") or path == "..":
         raise ValueError("Invalid relative path")
     normalized = posixpath.normpath(path.replace("\\", "/"))
     if (

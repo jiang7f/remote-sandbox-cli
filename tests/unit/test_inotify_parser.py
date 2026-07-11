@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import os
 import struct
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,8 @@ from remote_sandbox.remote_agent.inotify import (
     IN_ATTRIB,
     IN_CREATE,
     IN_DELETE,
+    IN_DELETE_SELF,
+    IN_IGNORED,
     IN_ISDIR,
     IN_MOVED_FROM,
     IN_MOVED_TO,
@@ -273,3 +276,92 @@ def test_recursive_setup_bounds_open_descriptors_by_depth(
 
     assert peak <= 2
     assert not tracked
+
+
+def test_inotify_router_handles_modify_delete_ignored_and_unknown_watch(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    with RemoteStore(tmp_path / "state.sqlite3") as store:
+        backend = _router(root, store)
+        backend._process_events(
+            [
+                InotifyEvent(99, IN_CREATE, 0, "unknown", False),
+                InotifyEvent(1, IN_ATTRIB, 0, "value.txt", False),
+                InotifyEvent(1, IN_DELETE, 0, "value.txt", False),
+                InotifyEvent(1, IN_IGNORED, 0, "", False),
+            ]
+        )
+
+        assert [(event.kind, event.path) for event in store.events_after(0)] == [
+            ("delete", "value.txt")
+        ]
+        assert backend._watch_paths == {}
+
+
+def test_inotify_root_loss_and_expired_move_request_recovery(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    with RemoteStore(tmp_path / "state.sqlite3") as store:
+        backend = _router(root, store)
+        backend._process_events(
+            [
+                InotifyEvent(1, IN_MOVED_FROM | IN_ISDIR, 31, "gone", False),
+                InotifyEvent(1, IN_DELETE_SELF, 0, "", False),
+            ]
+        )
+        backend._forget_subtree = lambda _path: None
+        backend._flush_expired_moves(float("inf"))
+
+        assert [(event.kind, event.path) for event in store.events_after(0)] == [
+            ("rescan-required", "*"),
+            ("delete", "gone"),
+        ]
+
+
+def test_directory_move_updates_descendant_watch_paths(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    source = root / "old"
+    child = source / "child"
+    destination = root / "new"
+    root.mkdir()
+    backend = object.__new__(InotifyBackend)
+    backend._root = root
+    backend._watch_paths = {1: root, 2: source, 3: child}
+    backend._path_watches = {root: 1, source: 2, child: 3}
+
+    backend._move_watch_paths(source, destination)
+
+    assert backend._watch_paths == {1: root, 2: destination, 3: destination / "child"}
+
+
+def test_created_directory_emits_existing_descendants(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    created = root / "created"
+    (created / "nested").mkdir(parents=True)
+    (created / "nested" / "value.txt").write_text("x", encoding="utf-8")
+    with RemoteStore(tmp_path / "state.sqlite3") as store:
+        backend = _router(root, store)
+        backend._emit_created_descendants(created)
+
+        assert [event.path for event in store.events_after(0)] == [
+            "created/nested",
+            "created/nested/value.txt",
+        ]
+
+
+def test_inotify_close_is_idempotent(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    descriptor = os.open(root, os.O_RDONLY)
+    backend = object.__new__(InotifyBackend)
+    backend._fd = descriptor
+    backend._watch_paths = {1: root}
+    backend._path_watches = {root: 1}
+
+    backend._close()
+    backend._close()
+
+    assert backend._fd == -1
+    assert backend._watch_paths == {}

@@ -1,0 +1,9 @@
+Port 2222
+ListenAddress 0.0.0.0
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitRootLogin no
+UsePAM no
+AllowUsers test
+PidFile /run/sshd.pid
+Subsystem sftp internal-sftp

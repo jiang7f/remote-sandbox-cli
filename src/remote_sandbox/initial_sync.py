@@ -171,6 +171,12 @@ class InitialSyncCoordinator:
             completed: set[str] = set()
             changed: set[str] = set()
             batch = plan.transfer_batch
+            item_sizes = (
+                {item.path: _item_size(item) for item in batch.items}
+                if batch is not None
+                else {}
+            )
+            completed_bytes = 0
             self._publish(
                 "transferring",
                 files_total=len(batch.items) if batch is not None else 0,
@@ -182,22 +188,34 @@ class InitialSyncCoordinator:
             )
             if batch is not None:
                 def on_progress(progress: TransferResult) -> None:
-                    newly_completed = set(progress.completed) - completed
-                    if newly_completed:
+                    nonlocal completed_bytes
+                    newly_completed = tuple(
+                        path for path in progress.completed if path not in completed
+                    )
+                    if progress.verified_fingerprints:
+                        verified = tuple(
+                            entry
+                            for entry in progress.verified_fingerprints
+                            if entry.path in newly_completed
+                        )
+                        if len(verified) != len(newly_completed):
+                            raise InitialSyncError(
+                                "verified progress fingerprints do not match completed paths"
+                            )
+                        if verified:
+                            self.engine.seed_verified_transfer(batch.direction, verified)
+                    elif newly_completed:
                         self.engine.seed_base_from_transfer(batch, newly_completed)
-                    completed.update(progress.completed)
+                    completed.update(newly_completed)
+                    completed_bytes += sum(item_sizes[path] for path in newly_completed)
                     changed.update(progress.changed_during_transfer)
-                    current = progress.completed[-1] if progress.completed else None
+                    current = newly_completed[-1] if newly_completed else None
                     self._publish_progress(
                         "transferring",
                         files_done=len(completed),
                         files_total=len(batch.items),
-                        bytes_done=sum(
-                            _item_size(item)
-                            for item in batch.items
-                            if item.path in completed
-                        ),
-                        bytes_total=sum(_item_size(item) for item in batch.items),
+                        bytes_done=completed_bytes,
+                        bytes_total=sum(item_sizes.values()),
                         current_path=current,
                         force=len(completed) == len(batch.items),
                     )

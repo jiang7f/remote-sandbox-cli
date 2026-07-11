@@ -117,7 +117,7 @@ def format_size(size: int) -> str:
 def _settings_from_dict(data: dict[str, Any], path: Path) -> Settings:
     raw_limit = data.get("placeholder_limit", DEFAULT_PLACEHOLDER_LIMIT)
     try:
-        if isinstance(raw_limit, int):
+        if type(raw_limit) is int:
             placeholder_limit = raw_limit
         elif isinstance(raw_limit, str):
             placeholder_limit = parse_size(raw_limit)
