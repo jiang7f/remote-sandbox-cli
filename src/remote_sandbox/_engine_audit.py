@@ -152,11 +152,11 @@ class AuditCoordinator:
         dirty: set[str] = set()
         for path in normalized:
             base_entry = base.get(path)
-            if _observation_matches_base(local_entries[path], base_entry):
+            if _observation_matches_base(local_entries[path], base_entry, side="local"):
                 local_updates[path] = local_signatures[path]
             else:
                 dirty.add(path)
-            if _observation_matches_base(remote_entries[path], base_entry):
+            if _observation_matches_base(remote_entries[path], base_entry, side="remote"):
                 remote_updates[path] = remote_signatures[path]
             else:
                 dirty.add(path)
@@ -201,7 +201,18 @@ def _side_quick_matches(
 def _observation_matches_base(
     current: FingerprintState,
     base: EntryFingerprint | None,
+    *,
+    side: str,
 ) -> bool:
-    if base is not None and base.kind is EntryKind.FILE and not base.is_placeholder:
+    if base is not None and base.is_placeholder:
+        if side == "local":
+            return current == base
+        return (
+            isinstance(current, EntryFingerprint)
+            and current.kind is EntryKind.FILE
+            and current.content_hash is not None
+            and current.content_hash == base.content_hash
+        )
+    if base is not None and base.kind is EntryKind.FILE:
         return _strong_matches_base(current, base)
     return quick_matches_base(current, base)

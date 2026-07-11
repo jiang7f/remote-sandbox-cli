@@ -1,3 +1,4 @@
+import hashlib
 import os
 import shutil
 
@@ -7,6 +8,7 @@ from helpers.sync_harness import EngineHarness
 from remote_sandbox.engine import SyncEngine
 from remote_sandbox.journal import EventKind
 from remote_sandbox.manifest import EntryFingerprint, EntryKind, MissingEntry, fingerprint_local
+from remote_sandbox.placeholder import PlaceholderMetadata, encode_placeholder
 from remote_sandbox.policy import StaticPolicyEngine
 from remote_sandbox.state import WorkspaceStore
 from remote_sandbox.transport import (
@@ -578,13 +580,27 @@ def test_seed_base_from_transfer_registers_destination_echo(
 def test_apply_initial_placeholders_updates_base_and_expected_local_echo(
     engine_fixture: EngineHarness,
 ) -> None:
+    content = b"remote-real-content"
+    content_hash = hashlib.sha256(content).hexdigest()
+    (engine_fixture.remote / "large.bin").write_bytes(content)
+    remote_stat = (engine_fixture.remote / "large.bin").stat(follow_symlinks=False)
+    (engine_fixture.local / "large.bin").write_bytes(
+        encode_placeholder(
+            PlaceholderMetadata(
+                "large.bin",
+                len(content),
+                remote_stat.st_mtime_ns,
+                content_hash,
+            )
+        )
+    )
     placeholder = EntryFingerprint(
         "large.bin",
         EntryKind.FILE,
-        10_000,
-        12,
-        0o100644,
-        content_hash="digest",
+        len(content),
+        remote_stat.st_mtime_ns,
+        remote_stat.st_mode,
+        content_hash=content_hash,
         is_placeholder=True,
     )
 
@@ -592,6 +608,42 @@ def test_apply_initial_placeholders_updates_base_and_expected_local_echo(
 
     assert engine_fixture.store.get_base("large.bin") == placeholder
     assert engine_fixture.store.get_expected_echo("local", "large.bin") == placeholder
+    assert engine_fixture.store.list_requeued_paths() == ()
+    assert "large.bin" in engine_fixture.store.list_audit_signatures("local")
+    assert "large.bin" in engine_fixture.store.list_audit_signatures("remote")
+
+
+def test_apply_initial_placeholders_requeues_remote_content_mismatch(
+    engine_fixture: EngineHarness,
+) -> None:
+    expected_content = b"expected-content"
+    remote_content = b"mismatch-content"
+    content_hash = hashlib.sha256(expected_content).hexdigest()
+    (engine_fixture.remote / "large.bin").write_bytes(remote_content)
+    remote_stat = (engine_fixture.remote / "large.bin").stat(follow_symlinks=False)
+    (engine_fixture.local / "large.bin").write_bytes(
+        encode_placeholder(
+            PlaceholderMetadata(
+                "large.bin",
+                len(expected_content),
+                remote_stat.st_mtime_ns,
+                content_hash,
+            )
+        )
+    )
+    placeholder = EntryFingerprint(
+        "large.bin",
+        EntryKind.FILE,
+        len(expected_content),
+        remote_stat.st_mtime_ns,
+        remote_stat.st_mode,
+        content_hash=content_hash,
+        is_placeholder=True,
+    )
+
+    engine_fixture.engine.apply_initial_placeholders({"large.bin": placeholder})
+
+    assert engine_fixture.store.list_requeued_paths() == ("large.bin",)
 
 
 def test_requeue_paths_public_helper_is_durable(engine_fixture: EngineHarness) -> None:
