@@ -7,7 +7,7 @@ import subprocess
 import threading
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO, Protocol, cast
+from typing import Any, BinaryIO, Literal, Protocol, cast
 
 from remote_sandbox.agent import AgentInstall, RemoteAgentManager
 from remote_sandbox.journal import EventKind, JournalEvent
@@ -110,15 +110,24 @@ class RemoteWorkspaceClient:
     ) -> None:
         if agent_path is not None and agent_manager is not None:
             raise ValueError("provide either agent_path or agent_manager")
-        if agent_path is None:
-            manager = agent_manager or RemoteAgentManager(cast(SshRunner, runner))
-            agent_path = manager.ensure(target).remote_path
         self._runner = runner
         self._target = target
         self._workspace_id = workspace_id
         self._agent_path = agent_path
+        self._agent_manager = agent_manager or (
+            RemoteAgentManager(cast(SshRunner, runner)) if agent_path is None else None
+        )
         self._subscriptions: set[RemoteEventSubscription] = set()
         self._closed = False
+
+    def ensure_agent(self) -> None:
+        self._ensure_agent_path()
+
+    def clear_master(self) -> None:
+        cast(SshRunner, self._runner).clear_master(self._target)
+
+    def probe_connection(self) -> Literal["ok", "auth", "network"]:
+        return cast(SshRunner, self._runner).probe_connection(self._target)
 
     def register(self, root: str) -> dict[str, Any]:
         return self._call("register", {"root": root})
@@ -231,7 +240,7 @@ class RemoteWorkspaceClient:
         )
         result = self._runner.run_python_file_bytes(
             self._target,
-            self._agent_path,
+            self._ensure_agent_path(),
             encode_request(request),
             ("events",),
         )
@@ -332,7 +341,7 @@ class RemoteWorkspaceClient:
             request_payload.update(payload)
         result = self._runner.run_python_file_bytes(
             self._target,
-            self._agent_path,
+            self._ensure_agent_path(),
             encode_request(AgentRequest(command, request_payload)),
         )
         try:
@@ -355,10 +364,18 @@ class RemoteWorkspaceClient:
         )
         return self._runner.stream_python_file(
             self._target,
-            self._agent_path,
+            self._ensure_agent_path(),
             encode_request(request),
             ("events",),
         )
+
+    def _ensure_agent_path(self) -> str:
+        if self._agent_path is not None:
+            return self._agent_path
+        if self._agent_manager is None:
+            raise RuntimeError("remote agent manager is unavailable")
+        self._agent_path = self._agent_manager.ensure(self._target).remote_path
+        return self._agent_path
 
     def _discard_subscription(self, subscription: RemoteEventSubscription) -> None:
         self._subscriptions.discard(subscription)

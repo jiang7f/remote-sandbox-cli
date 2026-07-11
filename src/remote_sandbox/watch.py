@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, overload
+from typing import Any, Protocol
 
 from remote_sandbox.journal import EventKind
 from remote_sandbox.manifest import normalize_relative_path
@@ -68,42 +68,6 @@ class LocalEventWatcher(Protocol):
     def start(self) -> None: ...
 
     def stop(self) -> None: ...
-
-
-# Temporary name retained until the daemon migration replaces its old watcher annotations.
-LocalWatcher = LocalEventWatcher
-
-
-class LocalChangeDetector:
-    """Compatibility wrapper for callers that still construct the old detector."""
-
-    def __init__(self, root: Path, policy: PolicySource) -> None:
-        self._root = root.expanduser().resolve()
-        self._policy = policy
-        self._snapshot = self._scan()
-
-    @property
-    def root(self) -> Path:
-        return self._root
-
-    def current_policy(self) -> PolicyEngine:
-        return _current_policy(self._policy)
-
-    def changed(self) -> bool:
-        current = self._scan()
-        if current == self._snapshot:
-            return False
-        self._snapshot = current
-        return True
-
-    def peek_changed(self) -> bool:
-        return self._scan() != self._snapshot
-
-    def commit(self) -> None:
-        self._snapshot = self._scan()
-
-    def _scan(self) -> dict[str, LocalSignature]:
-        return _scan_snapshot(self._root, self.current_policy())
 
 
 class PollingLocalWatcher:
@@ -576,51 +540,12 @@ def map_watchdog_event(
     return None if kind is None else (kind, source, None)
 
 
-@overload
 def create_local_watcher(
     root: Path,
     policy: PolicySource,
     on_event: EventCallback,
-) -> LocalEventWatcher: ...
-
-
-@overload
-def create_local_watcher(
-    *,
-    detector: LocalChangeDetector,
-    on_change: Callable[[], None],
-) -> LocalEventWatcher: ...
-
-
-def create_local_watcher(
-    root: Path | None = None,
-    policy: PolicySource | None = None,
-    on_event: EventCallback | None = None,
-    *,
-    detector: LocalChangeDetector | None = None,
-    on_change: Callable[[], None] | None = None,
 ) -> LocalEventWatcher:
     """Create a native path watcher, or a path-emitting polling fallback."""
-
-    if detector is not None or on_change is not None:
-        if detector is None or on_change is None:
-            raise TypeError("detector and on_change must be provided together")
-        if root is not None or policy is not None or on_event is not None:
-            raise TypeError("legacy and path-event watcher arguments cannot be mixed")
-        root = detector.root
-        policy = detector.current_policy
-
-        def notify_legacy_caller(
-            kind: EventKind,
-            path: str,
-            destination: str | None,
-        ) -> None:
-            del kind, path, destination
-            on_change()
-
-        on_event = notify_legacy_caller
-    if root is None or policy is None or on_event is None:
-        raise TypeError("root, policy, and on_event are required")
     if _watchdog_available():
         return WatchdogLocalWatcher(root, policy, on_event)
     return PollingLocalWatcher(root, policy, on_event)

@@ -49,6 +49,17 @@ def test_initial_sync_watermarks_survive_store_restart_until_cleared(tmp_path: P
         assert store.get_initial_sync_watermarks() is None
 
 
+def test_initial_sync_completion_survives_reopen(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    with WorkspaceStore.open(database) as store:
+        assert store.initial_sync_completed() is False
+        store.mark_initial_sync_completed()
+        assert store.initial_sync_completed() is True
+
+    with WorkspaceStore.open(database) as reopened:
+        assert reopened.initial_sync_completed() is True
+
+
 def test_v4_store_migrates_initial_sync_checkpoint_table(tmp_path: Path) -> None:
     db = tmp_path / "state.sqlite3"
     with WorkspaceStore.open(db):

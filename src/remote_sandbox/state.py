@@ -24,7 +24,7 @@ from remote_sandbox.manifest import (
 )
 from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _JSON_SCHEMA_VERSION = 1
 _SIDES = frozenset({"local", "remote"})
 
@@ -336,6 +336,27 @@ class WorkspaceStore:
         with self.transaction():
             self._connection.execute(
                 "DELETE FROM initial_sync_checkpoint WHERE singleton = 1"
+            )
+
+    def initial_sync_completed(self) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'initial_sync_completed'"
+            ).fetchone()
+        if row is None:
+            return False
+        value = _expect_str(row["value"], "initial sync completed")
+        if value not in {"0", "1"}:
+            raise RuntimeError("invalid initial sync completion state")
+        return value == "1"
+
+    def mark_initial_sync_completed(self) -> None:
+        with self.transaction():
+            self._connection.execute(
+                """
+                INSERT INTO schema_meta(key, value) VALUES ('initial_sync_completed', '1')
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """
             )
 
     def acknowledged_sequence(self, side: str) -> int:
@@ -692,7 +713,7 @@ class WorkspaceStore:
             elif version == 1:
                 self._migrate_legacy_base_entries()
                 self._create_current_schema()
-            elif version in {2, 3, 4}:
+            elif version in {2, 3, 4, 5}:
                 self._create_current_schema()
             self._connection.execute(
                 """

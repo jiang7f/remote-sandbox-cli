@@ -3,11 +3,22 @@ from pathlib import Path
 
 import pytest
 from helpers.sync_harness import (
+    DaemonPairHarness,
     InitialPairHarness,
     SyncPair,
+    make_daemon_pair,
     make_initial_pair,
     make_sync_pair,
 )
+
+
+@pytest.fixture
+def daemon_pair(tmp_path: Path) -> Iterator[DaemonPairHarness]:
+    harness = make_daemon_pair(tmp_path)
+    try:
+        yield harness
+    finally:
+        harness.close()
 
 
 @pytest.fixture
