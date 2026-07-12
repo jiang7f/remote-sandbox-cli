@@ -181,6 +181,45 @@ def finalize_entries_from_fd(
     str,
     tuple[EntryFingerprint | MissingEntry, AuditSignature | None],
 ]:
+    directory_entries = _staged_directory_entries(staging, paths)
+    if directory_entries is not None:
+        remaining = dict(directory_entries)
+        for relative in _top_level_paths(paths):
+            parts = relative.split("/")
+            parent_fd = _walk_parent(root_fd, parts[:-1], create=True)
+            try:
+                try:
+                    destination = os.stat(
+                        parts[-1],
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISDIR(destination.st_mode) and not stat.S_ISLNK(
+                    destination.st_mode
+                ):
+                    continue
+                _install_at(
+                    staging / relative,
+                    parent_fd,
+                    parts[-1],
+                    error_type=error_type,
+                )
+                remaining = {
+                    path: entry
+                    for path, entry in remaining.items()
+                    if path != relative and not path.startswith(f"{relative}/")
+                }
+            finally:
+                os.close(parent_fd)
+        apply_directory_metadata_from_fd(
+            root_fd,
+            remaining,
+            create=True,
+            error_type=error_type,
+        )
+        return _installed_observations(root_fd, paths)
     for relative in _top_level_paths(paths):
         parts = relative.split("/")
         parent_fd = _walk_parent(root_fd, parts[:-1], create=True)
@@ -194,6 +233,85 @@ def finalize_entries_from_fd(
         finally:
             os.close(parent_fd)
     return _installed_observations(root_fd, paths)
+
+
+def apply_directory_metadata_from_fd(
+    root_fd: int,
+    entries: Mapping[str, EntryFingerprint],
+    *,
+    create: bool = False,
+    error_type: type[Exception],
+) -> None:
+    for relative, expected in sorted(
+        entries.items(),
+        key=lambda item: (len(item[0].split("/")), item[0]),
+    ):
+        if expected.kind is not EntryKind.DIR or expected.mode is None:
+            raise ValueError(f"directory metadata entry is invalid: {relative}")
+        parts = relative.split("/")
+        parent_fd = _walk_parent(root_fd, parts[:-1], create=create)
+        try:
+            try:
+                descriptor = _open_directory(parts[-1], dir_fd=parent_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(parts[-1], stat.S_IMODE(expected.mode), dir_fd=parent_fd)
+                descriptor = _open_directory(parts[-1], dir_fd=parent_fd)
+            try:
+                os.fchmod(descriptor, stat.S_IMODE(expected.mode))
+            finally:
+                os.close(descriptor)
+        except OSError as exc:
+            raise error_type(
+                f"directory metadata update failed: {relative}: {exc}"
+            ) from exc
+        finally:
+            os.close(parent_fd)
+    for relative, expected in sorted(
+        entries.items(),
+        key=lambda item: (-len(item[0].split("/")), item[0]),
+    ):
+        if expected.mtime_ns is None:
+            continue
+        parts = relative.split("/")
+        parent_fd = _walk_parent(root_fd, parts[:-1], create=False)
+        try:
+            descriptor = _open_directory(parts[-1], dir_fd=parent_fd)
+            try:
+                observed = os.fstat(descriptor)
+                os.utime(
+                    descriptor,
+                    ns=(observed.st_atime_ns, expected.mtime_ns),
+                )
+            finally:
+                os.close(descriptor)
+        except OSError as exc:
+            raise error_type(
+                f"directory metadata update failed: {relative}: {exc}"
+            ) from exc
+        finally:
+            os.close(parent_fd)
+
+
+def _staged_directory_entries(
+    staging: Path,
+    paths: tuple[str, ...],
+) -> dict[str, EntryFingerprint] | None:
+    entries: dict[str, EntryFingerprint] = {}
+    for relative in paths:
+        candidate = staging / relative
+        metadata = candidate.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            return None
+        entries[relative] = EntryFingerprint(
+            relative,
+            EntryKind.DIR,
+            None,
+            metadata.st_mtime_ns,
+            metadata.st_mode,
+        )
+    return entries
 
 
 def verify_and_cleanup_stage_from_fd(

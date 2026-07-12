@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import remote_sandbox.transport as transport_module
+from remote_sandbox._transport_fingerprint import ProtectedLocalRoot
 from remote_sandbox._transport_remote import (
     REMOTE_DELETE_EXPECTED_CODE,
     REMOTE_FINALIZE_RSYNC_CODE,
@@ -58,6 +59,32 @@ def test_rsync_directory_item_creates_only_the_listed_directory(tmp_path: Path) 
     )
     assert (destination / "tree").is_dir()
     assert not (destination / "tree" / "child.txt").exists()
+
+
+def test_directory_only_finalize_preserves_existing_descendants_and_mode(
+    tmp_path: Path,
+) -> None:
+    local = tmp_path / "local"
+    staging = tmp_path / "staging"
+    (local / "tree").mkdir(parents=True, mode=0o700)
+    (local / "tree" / "keep.txt").write_text("keep", encoding="utf-8")
+    (staging / "tree").mkdir(parents=True, mode=0o775)
+    (staging / "tree").chmod(0o775)
+    old_ns = 1_700_000_000_123_456_789
+    os.utime(staging / "tree", ns=(old_ns, old_ns))
+
+    with ProtectedLocalRoot(local) as protected:
+        observed = protected.finalize(
+            staging,
+            ("tree",),
+            error_type=TransferError,
+        )
+
+    assert (local / "tree" / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert (local / "tree").stat().st_mode & 0o777 == 0o775
+    assert (local / "tree").stat().st_mtime_ns == old_ns
+    assert observed["tree"][0].mode is not None
+    assert observed["tree"][0].mode & 0o777 == 0o775
 
 
 @pytest.mark.parametrize("direction", [TransferDirection.PUSH, TransferDirection.PULL])
@@ -366,12 +393,17 @@ def test_remote_rsync_stage_and_finalize_programs_use_workspace_descriptors(
     destination.mkdir()
     (source / "nested").mkdir()
     (source / "nested" / "value.txt").write_text("value", encoding="utf-8")
+    (source / "nested" / "value.txt").chmod(0o754)
+    old_ns = 1_700_000_000_123_456_789
+    os.utime(source / "nested" / "value.txt", ns=(old_ns, old_ns))
+    os.utime(source / "nested", ns=(old_ns, old_ns))
     staged = subprocess.run(
         [
             sys.executable,
             "-c",
             REMOTE_STAGE_RSYNC_CODE,
             str(source),
+            "nested",
             "nested/value.txt",
         ],
         check=False,
@@ -379,6 +411,10 @@ def test_remote_rsync_stage_and_finalize_programs_use_workspace_descriptors(
     )
     assert staged.returncode == 0, staged.stderr.decode(errors="replace")
     stage_path = staged.stdout.decode().strip()
+    staged_file = Path(stage_path) / "nested" / "value.txt"
+    assert staged_file.stat().st_mode & 0o777 == 0o754
+    assert staged_file.stat().st_mtime_ns == old_ns
+    assert (Path(stage_path) / "nested").stat().st_mtime_ns == old_ns
     finalized = subprocess.run(
         [
             sys.executable,
@@ -386,6 +422,7 @@ def test_remote_rsync_stage_and_finalize_programs_use_workspace_descriptors(
             REMOTE_FINALIZE_RSYNC_CODE,
             str(destination),
             stage_path,
+            "nested",
             "nested/value.txt",
         ],
         check=False,
@@ -393,6 +430,8 @@ def test_remote_rsync_stage_and_finalize_programs_use_workspace_descriptors(
     )
     assert finalized.returncode == 0, finalized.stderr.decode(errors="replace")
     assert (destination / "nested" / "value.txt").read_text(encoding="utf-8") == "value"
+    assert (destination / "nested" / "value.txt").stat().st_mode & 0o777 == 0o754
+    assert (destination / "nested" / "value.txt").stat().st_mtime_ns == old_ns
     assert not Path(stage_path).exists()
 
 

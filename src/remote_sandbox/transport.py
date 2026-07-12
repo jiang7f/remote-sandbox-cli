@@ -393,6 +393,22 @@ class BatchTransport:
                                 for path in paths
                             }
                         else:
+                            directory_sources = {
+                                path: entry
+                                for path, entry in source_before.items()
+                                if isinstance(entry, EntryFingerprint)
+                                and entry.kind is EntryKind.DIR
+                            }
+                            if directory_sources:
+                                local.apply_directory_metadata(
+                                    directory_sources,
+                                    error_type=TransferError,
+                                )
+                                for path in directory_sources:
+                                    rsync_audit.destination_observations[path] = local.observe(
+                                        path,
+                                        with_hash=False,
+                                    )
                             remote_entries, remote_signatures_after = (
                                 self._remote_observations(
                                     paths,
@@ -411,6 +427,19 @@ class BatchTransport:
                             on_progress,
                         )
                 self._transfer_tar(batch, local)
+
+            if batch.direction is TransferDirection.PULL:
+                directory_sources = {
+                    path: entry
+                    for path, entry in source_before.items()
+                    if isinstance(entry, EntryFingerprint)
+                    and entry.kind is EntryKind.DIR
+                }
+                if directory_sources:
+                    local.apply_directory_metadata(
+                        directory_sources,
+                        error_type=TransferError,
+                    )
 
             local_after = self._local_postflight(local, paths)
             remote_after, _remote_after_signatures = self._remote_observations(

@@ -243,10 +243,19 @@ REMOTE_STAGE_RSYNC_CODE = textwrap.dedent(
         entry = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
         os.makedirs(os.path.dirname(destination), mode=0o700, exist_ok=True)
         if stat.S_ISDIR(entry.st_mode):
-            os.mkdir(destination, stat.S_IMODE(entry.st_mode))
+            os.makedirs(destination, mode=stat.S_IMODE(entry.st_mode), exist_ok=True)
+            os.chmod(destination, stat.S_IMODE(entry.st_mode))
+            directories.append(
+                (destination, entry.st_atime_ns, entry.st_mtime_ns, entry.st_mode)
+            )
             return
         if stat.S_ISLNK(entry.st_mode):
             os.symlink(os.readlink(leaf, dir_fd=parent_fd), destination)
+            os.utime(
+                destination,
+                ns=(entry.st_atime_ns, entry.st_mtime_ns),
+                follow_symlinks=False,
+            )
             return
         if not stat.S_ISREG(entry.st_mode):
             raise ValueError("special files are not transferable")
@@ -259,6 +268,12 @@ REMOTE_STAGE_RSYNC_CODE = textwrap.dedent(
             with os.fdopen(descriptor, "rb", closefd=False) as source:
                 with open(destination, "xb") as output:
                     shutil.copyfileobj(source, output, length=1024 * 1024)
+            os.chmod(destination, stat.S_IMODE(opened.st_mode))
+            os.utime(
+                destination,
+                ns=(opened.st_atime_ns, opened.st_mtime_ns),
+                follow_symlinks=False,
+            )
         finally:
             os.close(descriptor)
 
@@ -266,6 +281,7 @@ REMOTE_STAGE_RSYNC_CODE = textwrap.dedent(
     paths = sys.argv[2:]
     root_fd = open_dir(None, root)
     staging = tempfile.mkdtemp(prefix="remote-sandbox-rsync-")
+    directories = []
     try:
         for relative in paths:
             parts = valid(relative)
@@ -278,6 +294,17 @@ REMOTE_STAGE_RSYNC_CODE = textwrap.dedent(
                 copy_entry(descriptor, parts[-1], os.path.join(staging, *parts))
             finally:
                 os.close(descriptor)
+        for destination, atime_ns, mtime_ns, mode in sorted(
+            directories,
+            key=lambda item: item[0].count(os.sep),
+            reverse=True,
+        ):
+            os.chmod(destination, stat.S_IMODE(mode))
+            os.utime(
+                destination,
+                ns=(atime_ns, mtime_ns),
+                follow_symlinks=False,
+            )
         print(staging, flush=True)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)

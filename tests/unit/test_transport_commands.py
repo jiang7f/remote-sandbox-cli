@@ -372,6 +372,58 @@ def test_batch_transport_runs_one_verified_rsync_session(
     assert result.verified_fingerprints == (source,)
 
 
+def test_pull_restores_directory_mode_narrowed_by_receiver_umask(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    source = EntryFingerprint("tree", EntryKind.DIR, None, 1_700_000_000_000_000_000, 0o40775)
+    source_signature = AuditSignature("tree", EntryKind.DIR, 100, 1, 1)
+    remote = _RemoteFingerprinter(
+        [{"tree": source}, {"tree": source}],
+        signatures=[{"tree": source_signature}, {"tree": source_signature}],
+    )
+
+    def finalize(
+        _self: object,
+        _staging: Path,
+        _paths: tuple[str, ...],
+        **_kwargs: object,
+    ) -> dict[str, tuple[EntryFingerprint, AuditSignature]]:
+        (local_root / "tree").mkdir(mode=0o755)
+        narrowed = dataclasses.replace(source, mode=0o40755)
+        return {"tree": (narrowed, AuditSignature("tree", EntryKind.DIR, 200, 2, 2))}
+
+    monkeypatch.setattr(
+        "remote_sandbox.transport.subprocess.run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, b"", b""),
+    )
+    monkeypatch.setattr(
+        "remote_sandbox.transport.ProtectedLocalRoot.finalize",
+        finalize,
+    )
+
+    result = BatchTransport(
+        local_root,
+        "host",
+        "/remote",
+        remote,
+        runner=_TransportRunner(),
+        capabilities=RsyncCapabilities(False, False),
+        remote_rsync_available=True,
+    ).transfer(
+        TransferBatch(
+            TransferDirection.PULL,
+            (TransferItem("tree", source, MissingEntry("tree")),),
+        ),
+        lambda _progress: None,
+    )
+
+    assert (local_root / "tree").stat().st_mode & 0o777 == 0o775
+    assert result.verified_fingerprints[0].mode & 0o777 == 0o775
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (("size", 0), ("mode", 0o100600), ("mtime_ns", 1)),

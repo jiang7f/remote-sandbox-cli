@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from remote_sandbox._transport_paths import (
+    apply_directory_metadata_from_fd,
     delete_entries_from_fd,
     finalize_entries_from_fd,
     stage_entries_from_fd,
@@ -239,6 +240,18 @@ class ProtectedLocalRoot:
             self._descriptor,
             staging,
             paths,
+            error_type=error_type,
+        )
+
+    def apply_directory_metadata(
+        self,
+        entries: Mapping[str, EntryFingerprint],
+        *,
+        error_type: type[Exception],
+    ) -> None:
+        apply_directory_metadata_from_fd(
+            self._descriptor,
+            entries,
             error_type=error_type,
         )
 
