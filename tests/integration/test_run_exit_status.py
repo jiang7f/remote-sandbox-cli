@@ -200,6 +200,16 @@ def test_status_renders_every_workspace_phase(
     assert phase in result.stdout
 
 
+def test_status_paths_shows_both_workspace_directories(cli_fixture: CliHarness) -> None:
+    result = cli_fixture.run(["status", "dq", "--paths"])
+
+    assert result.exit_code == 0
+    assert "LOCAL" in result.stdout
+    assert "REMOTE" in result.stdout
+    assert cli_fixture.record.local_path in result.stdout
+    assert f"{cli_fixture.record.target}:{cli_fixture.record.remote_path}" in result.stdout
+
+
 def test_status_watch_redraws_one_table(cli_fixture: CliHarness) -> None:
     cli_fixture.set_workspace_state("dq", "starting")
     cli_fixture.services.watch_limit = 2

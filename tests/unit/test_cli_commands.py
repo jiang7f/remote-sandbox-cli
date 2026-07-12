@@ -11,10 +11,11 @@ from remote_sandbox.cli import build_parser
 def test_parser_exposes_confirmed_commands_and_debug_flag() -> None:
     parser = build_parser()
 
-    status = parser.parse_args(["--debug", "status", "dq", "--watch"])
+    status = parser.parse_args(["--debug", "status", "dq", "--watch", "--paths"])
     assert status.debug is True
     assert status.name == "dq"
     assert status.watch is True
+    assert status.paths is True
     assert parser.parse_args(["conflicts", "dq"]).command == "conflicts"
     resolved = parser.parse_args(["resolve", "model.py", "--use-local"])
     assert resolved.use_local is True

@@ -169,7 +169,7 @@ def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
         while True:
             if iteration:
                 print("\x1b[H\x1b[2J", end="")
-            print(_service_status_table(records, services))
+            print(_service_status_table(records, services, include_paths=args.paths))
             iteration += 1
             if not args.watch or (
                 services.watch_limit is not None and iteration >= services.watch_limit
@@ -335,30 +335,36 @@ def _service_record(services: CliServices, name: str | None) -> BindingRecord:
     return record
 
 
-def _service_status_table(records: list[BindingRecord], services: CliServices) -> str:
+def _service_status_table(
+    records: list[BindingRecord],
+    services: CliServices,
+    *,
+    include_paths: bool = False,
+) -> str:
     rows: list[list[str]] = []
     guidance: list[str] = []
     for record in records:
         status = services.workspace_status(record)
-        rows.append(
-            [
-                record.name,
-                status.phase.value,
-                status.progress.stage,
-                str(status.pending),
-                str(status.conflicts),
-                _one_line(status.last_error or "", max_len=100),
-            ]
-        )
+        row = [
+            record.name,
+            status.phase.value,
+            status.progress.stage,
+            str(status.pending),
+            str(status.conflicts),
+            _one_line(status.last_error or "", max_len=100),
+        ]
+        if include_paths:
+            row.extend((record.local_path, f"{record.target}:{record.remote_path}"))
+        rows.append(row)
         if status.phase.value == "disconnected":
             guidance.append(
                 f"{record.name} is disconnected. Run `rsb reconnect {record.name}` "
                 "in the foreground to re-enter authentication."
             )
-    table = _format_table(
-        ["NAME", "PHASE", "PROGRESS", "PENDING", "CONFLICTS", "ERROR"],
-        rows,
-    )
+    headers = ["NAME", "PHASE", "PROGRESS", "PENDING", "CONFLICTS", "ERROR"]
+    if include_paths:
+        headers.extend(("LOCAL", "REMOTE"))
+    table = _format_table(headers, rows)
     return table if not guidance else table + "\n\n" + "\n".join(guidance)
 
 
@@ -591,6 +597,11 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="List local workspace bindings")
     status.add_argument("name", nargs="?", help="Connection name; defaults to all workspaces")
     status.add_argument("--watch", action="store_true", help="Refresh the status table")
+    status.add_argument(
+        "--paths",
+        action="store_true",
+        help="Show the local and remote workspace paths",
+    )
 
     start = subparsers.add_parser("start", help="Start the sync daemon for a binding")
     start.add_argument("name", nargs="?", help="Connection name; defaults to current workspace")

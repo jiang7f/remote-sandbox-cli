@@ -74,7 +74,7 @@ uv run rsb enter ZJU_2
 
 ```bash
 uv run rsb list
-uv run rsb status [name] [--watch]
+uv run rsb status [name] [--watch] [--paths]
 uv run rsb start [name]
 uv run rsb stop [name]
 uv run rsb shell [name]
@@ -91,9 +91,52 @@ uv run rsb forget <name>
 uv run rsb forget <name> --local-only
 ```
 
+查看绑定的本地和远程目录。
+
+```bash
+rsb status --paths
+rsb status project --paths
+```
+
+`REMOTE` 列使用 `<SSH target>:<remote path>` 格式。
+
 `forget <name>` 会停止本地 supervisor，停止远程 watcher，删除远程工具元数据，删除本地工具元数据，并删除连接记录。它不会删除本地或远程项目文件。
 
 `forget <name> --local-only` 用于远程服务器不可达的情况。它只删除本地元数据和连接记录，并明确报告仍然存在的远程工具元数据路径。
+
+## 给 AI 编码助手使用
+
+不需要专门的 skill。AI 只编辑本地工作区，需要运行测试、训练或其他项目命令时，通过 `rsb run` 在远程工作区执行。
+
+临时使用时，可以直接把下面这段发给 AI。
+
+```text
+这个项目通过 remote-sandbox 绑定，绑定名是 dq。
+只读写当前本地项目目录。
+先用 rsb status dq --paths 确认绑定。
+运行项目命令时使用 rsb run dq -- <command>。
+不要直接通过 SSH 修改远程项目文件。
+```
+
+经常使用时，把同样的规则放进项目根目录的 `AGENTS.md`。
+
+```markdown
+## Remote execution
+
+This project is bound through remote-sandbox as `dq`.
+- Read and edit only the local working tree.
+- Check the binding with `rsb status dq --paths`.
+- Run project commands with `rsb run dq -- <command>`.
+- Do not edit the remote workspace directly over SSH.
+```
+
+例如，AI 要在远程运行测试时执行。
+
+```bash
+rsb run dq -- pytest -q
+```
+
+`rsb shell dq` 适合人工交互操作。对 AI 来说，可返回退出状态的 `rsb run` 更简单也更稳定。
 
 ## 元数据隔离
 
