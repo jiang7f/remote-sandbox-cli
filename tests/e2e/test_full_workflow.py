@@ -45,6 +45,7 @@ def test_remote_watcher_subscription_propagates_within_two_seconds(ssh_fixture) 
     created_at = time.monotonic()
     ssh_fixture.write_remote(remote_path, b"observed")
     ssh_fixture.wait_for_local_file(local_path, timeout=2.0)
+    ssh_fixture.wait_for_state("remote-latency", "ready", timeout=2.0)
     create_elapsed = time.monotonic() - created_at
 
     deleted_at = time.monotonic()
