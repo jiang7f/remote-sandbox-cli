@@ -1,8 +1,8 @@
-# Codex Remote Sandbox Redesign Implementation Plan
+# Remote Sandbox Redesign Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build an isolated `codex-rsb` development tool with out-of-tree metadata, persistent local and remote filesystem journals, fast batched synchronization, truthful lifecycle state, and a same-session remote shell with a live prompt.
+**Goal:** Build an isolated `rsb` development tool with out-of-tree metadata, persistent local and remote filesystem journals, fast batched synchronization, truthful lifecycle state, and a same-session remote shell with a live prompt.
 
 **Architecture:** A local supervisor owns three-way reconciliation. A local watchdog watcher and a versioned Python 3.10-compatible remote inotify agent persist ordered events in SQLite. The supervisor consumes dirty paths, requests hashes only when needed, transfers same-direction batches through rsync with a validated tar fallback, and exposes status to the CLI and managed shell.
 
@@ -14,9 +14,9 @@
 - Preserve the existing unstaged changes in `src/remote_sandbox/cli.py`, `src/remote_sandbox/daemon.py`, and `src/remote_sandbox/ssh.py`. Do not reset or discard them.
 - Fold the existing reconnect and authentication-classification behavior into Tasks 8, 13, and 16 with regression tests before staging those files.
 - Stage explicit task files only. Do not use `git add .`.
-- The distribution is `codex-remote-sandbox`; commands are `codex-rsb` and `codex-remote-sandbox`.
-- Development state is isolated under `~/.codex-remote-sandbox/` locally and remotely.
-- Runtime and SSH control files are isolated under `/tmp/codex-remote-sandbox-<uid>/`.
+- The distribution is `remote-sandbox`; commands are `rsb` and `remote-sandbox`.
+- Development state is isolated under `~/.remote-sandbox/` locally and remotely.
+- Runtime and SSH control files are isolated under `/tmp/remote-sandbox-<uid>/`.
 - Never read, modify, stop, migrate, or delete the installed `rsb` tool's state.
 - Never create `.remote-sandbox` control metadata inside a local or remote workspace.
 - `.git/` is a hard ignore. Git operations are local-only.
@@ -26,7 +26,7 @@
 - Symlinks are copied as links and never dereferenced for scanning or transfer.
 - Ordinary sync must not hash every unchanged file.
 - A conflict must preserve both versions and must never become a silent skip.
-- `codex-rsb run` returns the remote command's exit code even when follow-up sync fails.
+- `rsb run` returns the remote command's exit code even when follow-up sync fails.
 - Tracebacks are hidden unless `--debug` is present.
 - Prompt refresh is capped at four updates per second and must preserve Readline input and cursor state.
 - Use TDD for every production behavior. Observe each new test fail before implementing it.
@@ -101,12 +101,12 @@
 **Files:**
 - Create: `src/remote_sandbox/namespace.py`
 - Create: `tests/unit/test_namespace.py`
-- Create: `tests/unit/test_development_entry_points.py`
+- Create: `tests/unit/test_entry_points.py`
 - Modify: `pyproject.toml:1-64`
 - Modify: `src/remote_sandbox/settings.py:1-140`
 
 **Interfaces:**
-- Produces: `DEV_NAMESPACE: ToolNamespace`
+- Produces: `TOOL_NAMESPACE: ToolNamespace`
 - Produces: `tool_home(env: Mapping[str, str] | None = None) -> Path`
 - Produces: `runtime_dir(env: Mapping[str, str] | None = None) -> Path`
 - Produces: `ssh_control_dir(env: Mapping[str, str] | None = None) -> Path`
@@ -118,18 +118,18 @@
 # tests/unit/test_namespace.py
 from pathlib import Path
 
-from remote_sandbox.namespace import DEV_NAMESPACE, runtime_dir, ssh_control_dir, tool_home
+from remote_sandbox.namespace import TOOL_NAMESPACE, runtime_dir, ssh_control_dir, tool_home
 
 
-def test_development_namespace_is_fully_isolated(tmp_path: Path) -> None:
+def test_remote_sandbox_namespace_honors_formal_overrides(tmp_path: Path) -> None:
     env = {
         "HOME": str(tmp_path),
-        "CODEX_REMOTE_SANDBOX_HOME": str(tmp_path / "state"),
-        "CODEX_REMOTE_SANDBOX_RUNTIME_DIR": str(tmp_path / "runtime"),
+        "REMOTE_SANDBOX_HOME": str(tmp_path / "state"),
+        "REMOTE_SANDBOX_RUNTIME_DIR": str(tmp_path / "runtime"),
     }
 
-    assert DEV_NAMESPACE.distribution == "codex-remote-sandbox"
-    assert DEV_NAMESPACE.command == "codex-rsb"
+    assert TOOL_NAMESPACE.distribution == "remote-sandbox"
+    assert TOOL_NAMESPACE.command == "rsb"
     assert tool_home(env) == tmp_path / "state"
     assert runtime_dir(env) == tmp_path / "runtime"
     assert ssh_control_dir(env) == tmp_path / "runtime" / "cm"
@@ -137,17 +137,17 @@ def test_development_namespace_is_fully_isolated(tmp_path: Path) -> None:
 ```
 
 ```python
-# tests/unit/test_development_entry_points.py
+# tests/unit/test_entry_points.py
 import tomllib
 from pathlib import Path
 
 
-def test_project_exposes_only_development_commands() -> None:
+def test_project_exposes_only_rsb_command() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
-    assert project["name"] == "codex-remote-sandbox"
+    assert project["name"] == "remote-sandbox"
     assert project["scripts"] == {
-        "codex-remote-sandbox": "remote_sandbox.cli:main",
-        "codex-rsb": "remote_sandbox.cli:main",
+        "remote-sandbox": "remote_sandbox.cli:main",
+        "rsb": "remote_sandbox.cli:main",
     }
     assert "rsb" not in project["scripts"]
 ```
@@ -157,7 +157,7 @@ def test_project_exposes_only_development_commands() -> None:
 Run:
 
 ```bash
-uv run pytest tests/unit/test_namespace.py tests/unit/test_development_entry_points.py -v
+uv run pytest tests/unit/test_namespace.py tests/unit/test_entry_points.py -v
 ```
 
 Expected: FAIL because `remote_sandbox.namespace` does not exist and the project still exposes the
@@ -184,29 +184,29 @@ class ToolNamespace:
     runtime_prefix: str
 
 
-DEV_NAMESPACE = ToolNamespace(
-    distribution="codex-remote-sandbox",
-    command="codex-rsb",
-    long_command="codex-remote-sandbox",
-    home_dirname=".codex-remote-sandbox",
-    runtime_prefix="codex-remote-sandbox",
+TOOL_NAMESPACE = ToolNamespace(
+    distribution="remote-sandbox",
+    command="rsb",
+    long_command="remote-sandbox",
+    home_dirname=".remote-sandbox",
+    runtime_prefix="remote-sandbox",
 )
 
 
 def tool_home(env: Mapping[str, str] | None = None) -> Path:
     values = os.environ if env is None else env
-    override = values.get("CODEX_REMOTE_SANDBOX_HOME")
+    override = values.get("REMOTE_SANDBOX_HOME")
     if override:
         return Path(override).expanduser()
-    return Path(values.get("HOME", str(Path.home()))) / DEV_NAMESPACE.home_dirname
+    return Path(values.get("HOME", str(Path.home()))) / TOOL_NAMESPACE.home_dirname
 
 
 def runtime_dir(env: Mapping[str, str] | None = None) -> Path:
     values = os.environ if env is None else env
-    override = values.get("CODEX_REMOTE_SANDBOX_RUNTIME_DIR")
+    override = values.get("REMOTE_SANDBOX_RUNTIME_DIR")
     if override:
         return Path(override).expanduser()
-    return Path("/tmp") / f"{DEV_NAMESPACE.runtime_prefix}-{os.getuid()}"
+    return Path("/tmp") / f"{TOOL_NAMESPACE.runtime_prefix}-{os.getuid()}"
 
 
 def ssh_control_dir(env: Mapping[str, str] | None = None) -> Path:
@@ -214,18 +214,18 @@ def ssh_control_dir(env: Mapping[str, str] | None = None) -> Path:
 
 
 def program_name() -> str:
-    return DEV_NAMESPACE.command
+    return TOOL_NAMESPACE.command
 ```
 
 Update `pyproject.toml` so the project and scripts are exactly:
 
 ```toml
 [project]
-name = "codex-remote-sandbox"
+name = "remote-sandbox"
 
 [project.scripts]
-codex-remote-sandbox = "remote_sandbox.cli:main"
-codex-rsb = "remote_sandbox.cli:main"
+remote-sandbox = "remote_sandbox.cli:main"
+rsb = "remote_sandbox.cli:main"
 ```
 
 Add `pytest-cov` and `pytest-timeout` to the existing dev dependency group. Add:
@@ -249,7 +249,7 @@ tests before staging the complete files.
 Run:
 
 ```bash
-uv run pytest tests/unit/test_namespace.py tests/unit/test_development_entry_points.py -v
+uv run pytest tests/unit/test_namespace.py tests/unit/test_entry_points.py -v
 uv run ruff check src tests
 uv run mypy src
 ```
@@ -262,7 +262,7 @@ Run:
 
 ```bash
 uv sync --all-groups
-uv run python -c 'import shutil; assert shutil.which("codex-rsb")'
+uv run python -c 'import shutil; assert shutil.which("rsb")'
 command -v rsb
 ```
 
@@ -274,8 +274,8 @@ and daemon namespace isolation are completed in Tasks 8 and 13.
 
 ```bash
 git add pyproject.toml uv.lock src/remote_sandbox/namespace.py src/remote_sandbox/settings.py \
-  tests/unit/test_namespace.py tests/unit/test_development_entry_points.py
-git commit -m "chore: isolate codex remote sandbox namespace"
+  tests/unit/test_namespace.py tests/unit/test_entry_points.py
+git commit -m "chore: isolate rsb remote sandbox namespace"
 ```
 
 ### Task 2: Add Workspace Identity, External Metadata Paths, and Marker-free Registry Lookup
@@ -317,7 +317,7 @@ from remote_sandbox.workspace import (
 
 
 def test_workspace_paths_live_outside_working_tree(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(tmp_path / "home"))
     local_root = tmp_path / "project"
     local_root.mkdir()
     spec = new_workspace_spec(
@@ -339,7 +339,7 @@ def test_workspace_metadata_is_created_with_user_only_permissions(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(tmp_path / "home"))
     local_root = tmp_path / "project"
     local_root.mkdir()
     spec = new_workspace_spec(
@@ -1190,7 +1190,7 @@ def test_agent_zipapp_self_check(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
     )
-    assert result.stdout.startswith("codex-remote-sandbox-agent ")
+    assert result.stdout.startswith("remote-sandbox-agent ")
 ```
 
 - [ ] **Step 2: Run tests and observe missing protocol/package failure**
@@ -1269,7 +1269,7 @@ from remote_agent import AGENT_VERSION
 
 def main(argv: list[str]) -> int:
     if argv == ["self-check"]:
-        print("codex-remote-sandbox-agent " + AGENT_VERSION)
+        print("remote-sandbox-agent " + AGENT_VERSION)
         return 0
     request = json.loads(sys.stdin.buffer.readline().decode("utf-8"))
     print(json.dumps({"ok": False, "payload": {}, "error": "unsupported command: " + str(request.get("command"))}))
@@ -1283,7 +1283,7 @@ if __name__ == "__main__":
 `build_agent_zipapp()` must copy the `remote_agent` package into a temporary staging directory,
 name the package `remote_agent` inside the archive, and call `zipapp.create_archive()` with
 `interpreter="/usr/bin/env python3"`. `RemoteAgentManager.ensure()` uploads to
-`~/.codex-remote-sandbox/agents/<version>/agent.pyz`, writes atomically, and verifies `self-check`.
+`~/.remote-sandbox/agents/<version>/agent.pyz`, writes atomically, and verifies `self-check`.
 
 Do not modify `ssh.py` in this task because it contains pre-existing reconnect changes. Task 8 adds
 the structured stdin runner method and streaming process API together with authentication regression
@@ -1304,9 +1304,9 @@ uv run mypy src
 When `python3.10` is available, also run:
 
 ```bash
-uv run python -c 'from pathlib import Path; from remote_sandbox.agent import build_agent_zipapp; build_agent_zipapp(Path("/tmp/codex-agent-test.pyz"))'
+uv run python -c 'from pathlib import Path; from remote_sandbox.agent import build_agent_zipapp; build_agent_zipapp(Path("/tmp/rsb-agent-test.pyz"))'
 if command -v python3.10 >/dev/null 2>&1; then
-  python3.10 /tmp/codex-agent-test.pyz self-check
+  python3.10 /tmp/rsb-agent-test.pyz self-check
 fi
 ```
 
@@ -2462,8 +2462,8 @@ def test_two_unrelated_non_empty_trees_are_rejected_before_metadata_commit(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    state_home = tmp_path / "codex-home"
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(state_home))
+    state_home = tmp_path / "rsb-home"
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(state_home))
     local = tmp_path / "local"
     local.mkdir()
     (local / "local.txt").write_text("local", encoding="utf-8")
@@ -2482,7 +2482,7 @@ def test_two_unrelated_non_empty_trees_are_rejected_before_metadata_commit(
 
     assert not state_home.exists()
     remote_paths = [path for _target, path in [*runner.files, *runner.binary_files, *runner.dirs]]
-    assert not any(".codex-remote-sandbox" in path for path in remote_paths)
+    assert not any(".remote-sandbox" in path for path in remote_paths)
 ```
 
 ```python
@@ -2900,7 +2900,7 @@ Configure `logging.handlers.RotatingFileHandler` at each workspace `daemon.log` 
 
 On subscription failure, call the existing `clear_master()` and `probe_connection()`. Network and
 key-auth failures retry with bounded exponential backoff. Password auth remains disconnected until
-`codex-rsb reconnect` establishes a foreground master and sends a resume control request.
+`rsb reconnect` establishes a foreground master and sends a resume control request.
 
 - [ ] **Step 4: Run lifecycle and existing connection tests**
 
@@ -2955,7 +2955,7 @@ def test_connect_request_does_not_emit_exit_or_close_session() -> None:
     script = command[-1]
     assert "connect-request" in script
     assert "exit 0" not in script
-    assert "read -r __codex_response" in script
+    assert "read -r __rsb_response" in script
 
 
 def test_success_response_activates_managed_prompt() -> None:
@@ -2973,7 +2973,7 @@ def test_binding_success_reuses_the_original_pty(
 ) -> None:
     session = fake_pty_backend.open_enter_shell()
     original_pid = session.remote_shell_pid
-    session.type("codex-rsb connect --name dq\n")
+    session.type("rsb connect --name dq\n")
     session.accept_binding()
     assert session.remote_shell_pid == original_pid
     assert "Shared connection" not in session.output
@@ -3084,12 +3084,12 @@ class ConnectResponse:
         return "\t".join(("error", self.error or "binding failed"))
 ```
 
-The remote `codex-rsb` shell function must:
+The remote `rsb` shell function must:
 
 1. Parse local, remote, and name arguments.
 2. Emit the nonce-authenticated connect request marker.
 3. Disable terminal echo for the response read.
-4. `read -r __codex_response` from the PTY.
+4. `read -r __rsb_response` from the PTY.
 5. Restore echo in a trap-safe block.
 6. On `ok`, export workspace fields, change prompt mode, and return without exiting.
 7. On `error`, print one line and return to browsing prompt.
@@ -3254,7 +3254,7 @@ class PromptRenderer:
 
     def render(self, target: str, name: str, status: WorkspaceStatus) -> str:
         suffix = _status_suffix(status)
-        value = f"[codex:{target}:{name}{suffix}]"
+        value = f"[{target}:{name}{suffix}]"
         if len(value) > self.width:
             value = value[: self.width - 2] + "]"
         return value.ljust(self.width)
@@ -3293,7 +3293,7 @@ The injected Bash rc binds the private escape sequence to `redraw-current-line` 
 Readline keymaps. The prompt contains a sentinel with the same display width. The local parser
 replaces only that sentinel. PTY state markers distinguish prompt input from a foreground command.
 On transition to ready, the current line may remain padded; the next normal prompt switches to the
-compact `[codex:target:name]` form.
+compact `[target:name]` form.
 
 - [ ] **Step 4: Run prompt and same-session shell tests**
 
@@ -3379,7 +3379,7 @@ def test_status_explains_foreground_reconnect_for_password_auth(cli_fixture: Cli
     result = cli_fixture.run(["status", "dq"])
     assert result.exit_code == 0
     assert "disconnected" in result.stdout
-    assert "codex-rsb reconnect dq" in result.stdout
+    assert "rsb reconnect dq" in result.stdout
 
 
 def test_init_writes_only_user_ignore_configuration(cli_fixture: CliHarness) -> None:
@@ -3412,7 +3412,7 @@ def test_no_shell_connect_returns_after_supervisor_start_while_sync_continues(
     assert result.exit_code == 0
     assert "Connected dq" in result.stdout
     assert "initial sync continues in background" in result.stdout
-    assert "codex-rsb status dq --watch" in result.stdout
+    assert "rsb status dq --watch" in result.stdout
     assert cli_fixture.store.get_status().phase is WorkspacePhase.INITIAL_SYNCING
 ```
 
@@ -3471,7 +3471,7 @@ def test_local_only_forget_removes_local_state_and_reports_remote_residue(
     result = cli_fixture.run(["forget", "dq", "--local-only"])
     assert result.exit_code == 0
     assert not cli_fixture.registry_has("dq")
-    assert "~/.codex-remote-sandbox/workspaces/" in result.stdout
+    assert "~/.remote-sandbox/workspaces/" in result.stdout
 
 
 def test_normal_forget_uses_double_ended_cleanup_order(cli_fixture: CliHarness) -> None:
@@ -3583,7 +3583,7 @@ so neither command imports the legacy workspace `lock.py`.
 
 Preserve `connect --no-shell`, but change it to return immediately after the supervisor publishes
 `initial-syncing`. It prints `Connected <name>`, says that initial sync continues in the background,
-and names `codex-rsb status <name> --watch`; it never waits for the initial transfer.
+and names `rsb status <name> --watch`; it never waits for the initial transfer.
 
 Normal `forget` follows local-supervisor-stop, remote-watcher-stop, remote-workspace-delete,
 unused-remote-agent-prune, local-workspace-delete, registry-delete order. Each completed step is
@@ -3597,12 +3597,12 @@ Wrap `main()` errors in one-line messages. Use `traceback.print_exc()` only when
 ```bash
 uv run pytest tests/unit/test_cli_commands.py tests/integration/test_conflict_resolution.py \
   tests/integration/test_forget_cleanup.py tests/integration/test_run_exit_status.py -v
-uv run codex-rsb --help | head -n 2
+uv run rsb --help | head -n 2
 uv run ruff check src tests
 uv run mypy src
 ```
 
-Expected: tests and static checks PASS, and help begins with `usage: codex-rsb`.
+Expected: tests and static checks PASS, and help begins with `usage: rsb`.
 
 - [ ] **Step 5: Commit the complete CLI service surface**
 
@@ -3612,7 +3612,7 @@ git add src/remote_sandbox/cli.py src/remote_sandbox/fetch.py src/remote_sandbox
   tests/helpers/sync_harness.py tests/integration/conftest.py \
   tests/unit/test_cli_commands.py tests/integration/test_conflict_resolution.py \
   tests/integration/test_forget_cleanup.py tests/integration/test_run_exit_status.py
-git commit -m "feat: expose codex workspace commands"
+git commit -m "feat: expose rsb workspace commands"
 ```
 
 ### Task 17: Add SSH E2E, Security, Performance, CI, Documentation, and Retire Legacy Sync Modules
@@ -3663,7 +3663,7 @@ from remote_sandbox.shell import ShellOutputParser
 
 def test_connect_marker_with_wrong_nonce_is_printed_as_plain_output() -> None:
     parser = ShellOutputParser("expected")
-    data = b"\x1b]777;codex-remote-sandbox;connect-request;forged;b64:e30=\x07"
+    data = b"\x1b]777;remote-sandbox;connect-request;forged;b64:e30=\x07"
     events = parser.feed(data)
     assert len(events) == 1
     assert getattr(events[0], "data") == data
@@ -3743,8 +3743,8 @@ Implement these exact methods on `SshFixture`: `local_workspace() -> Path`,
 Every subprocess call uses an argument list and `check=` explicitly. `start_ssh_fixture()` generates
 a temporary Ed25519 client key, builds the Dockerfile, publishes container port 2222 to a random
 loopback port, installs the public key into `/home/test/.ssh/authorized_keys`, waits for
-`python3 --version` to report 3.10, and sets `CODEX_REMOTE_SANDBOX_HOME` and
-`CODEX_REMOTE_SANDBOX_RUNTIME_DIR` below `tmp_path`. It never reads the user's production SSH keys
+`python3 --version` to report 3.10, and sets `REMOTE_SANDBOX_HOME` and
+`REMOTE_SANDBOX_RUNTIME_DIR` below `tmp_path`. It never reads the user's production SSH keys
 or `~/.remote-sandbox` state.
 
 ```python
@@ -3763,7 +3763,7 @@ def test_connect_sync_run_and_forget_without_workspace_metadata(ssh_fixture) -> 
     (local / ".git" / "index").write_bytes(b"local-only-git")
     shell = ssh_fixture.enter()
     shell.connect(remote=remote, local=local, name="dq")
-    shell.wait_for_prompt("[codex:")
+    shell.wait_for_prompt("[")
     ssh_fixture.wait_for_remote_file(remote / "train.py")
     result = ssh_fixture.cli("run", "dq", "--", "python3", "train.py")
     assert result.returncode == 0
@@ -3875,7 +3875,7 @@ def test_foreground_program_receives_no_prompt_redraw_bytes(ssh_fixture) -> None
     shell.run_foreground_probe(seconds=2.0)
     shell.trigger_remote_change("during-command.txt", b"x")
     assert shell.foreground_probe_received_private_redraw() is False
-    shell.wait_for_prompt_text("[codex:", timeout=5.0)
+    shell.wait_for_prompt_text("[", timeout=5.0)
 
 
 @pytest.mark.e2e
@@ -3934,8 +3934,8 @@ def test_noop_cycle_hashes_no_unchanged_files(performance_pair) -> None:
 def test_initial_batch_is_close_to_direct_rsync_and_uses_one_session(performance_pair) -> None:
     performance_pair.populate(5_000)
     direct_seconds = performance_pair.measure_direct_rsync()
-    codex_seconds = performance_pair.measure_initial_sync()
-    assert codex_seconds <= max(direct_seconds * 1.5, direct_seconds + 1.0)
+    rsb_seconds = performance_pair.measure_initial_sync()
+    assert rsb_seconds <= max(direct_seconds * 1.5, direct_seconds + 1.0)
     assert performance_pair.transport.ssh_process_count == 1
 ```
 
@@ -3991,7 +3991,7 @@ Expected: no production or test imports. Then delete the five legacy modules and
 
 - [ ] **Step 7: Update documentation and run final local verification**
 
-README must document only `codex-rsb` for the development build, both external metadata layouts,
+README must document only `rsb` for the development build, both external metadata layouts,
 same-session connect, live prompt states, default ignores, conflicts, reconnect, status watch,
 double-ended forget, and the eventual rename-back procedure. It must state that `.git` is not
 synchronized.
@@ -4014,16 +4014,16 @@ Expected: all verification commands PASS and no workspace contains control metad
 Use only the development command and disposable directories:
 
 ```bash
-uv run codex-rsb enter ZJU_2
-uv run codex-rsb status dq --watch
-uv run codex-rsb reconnect dq
-uv run codex-rsb forget dq
+uv run rsb enter ZJU_2
+uv run rsb status dq --watch
+uv run rsb reconnect dq
+uv run rsb forget dq
 ```
 
 Verify:
 
 - The existing `rsb` executable and its state remain untouched.
-- `codex-rsb connect` keeps the same SSH shell.
+- `rsb connect` keeps the same SSH shell.
 - The prompt updates dynamically while text is partially entered.
 - Initial progress appears within one second.
 - A local edit and remote delete each reach the other side within the target latency.
@@ -4043,7 +4043,7 @@ git add .github/workflows/test.yml README.md pyproject.toml uv.lock \
 git add -u src/remote_sandbox/marker.py src/remote_sandbox/lock.py \
   src/remote_sandbox/scan.py src/remote_sandbox/sync.py \
   src/remote_sandbox/syncsession.py
-git commit -m "test: verify codex remote sandbox workflow"
+git commit -m "test: verify rsb remote sandbox workflow"
 ```
 
 ## Final Verification Checklist
@@ -4057,7 +4057,7 @@ git commit -m "test: verify codex remote sandbox workflow"
 - [ ] Performance smoke tests meet the one-second progress and two-second small-change targets.
 - [ ] No normal no-op cycle hashes unchanged file contents.
 - [ ] No in-tree `.remote-sandbox` control directory is created.
-- [ ] `codex-rsb run` preserves the remote command exit code.
+- [ ] `rsb run` preserves the remote command exit code.
 - [ ] Conflicts preserve both versions and remain visible until resolved.
-- [ ] `codex-rsb forget` cleans both sides, while `--local-only` is explicit.
+- [ ] `rsb forget` cleans both sides, while `--local-only` is explicit.
 - [ ] Production `rsb` state, processes, sockets, and installation are untouched.

@@ -25,7 +25,7 @@ def test_binding_success_reuses_the_original_pty(
     session = fake_pty_backend.open_enter_shell()
     original_pid = session.remote_shell_pid
 
-    session.type("codex-rsb connect --name dq\n")
+    session.type("rsb connect --name dq\n")
     session.accept_binding()
 
     assert session.remote_shell_pid == original_pid
@@ -73,7 +73,7 @@ def test_binding_cancellation_keeps_browsing_in_the_original_pty(
     session = fake_pty_backend.open_enter_shell()
     original_pid = session.remote_shell_pid
 
-    session.type("codex-rsb connect --name dq\n")
+    session.type("rsb connect --name dq\n")
     session.reject_binding("Binding cancelled")
 
     assert session.remote_shell_pid == original_pid
@@ -98,16 +98,16 @@ def test_real_pty_ready_preserves_partial_readline_buffer_and_shell_process(
     probe_log = tmp_path / "probe.log"
     rcfile = tmp_path / "bashrc"
     rc_script = _enter_rcfile(nonce).replace(
-        "__codex_rsb_publish_ready() {",
-        "__codex_rsb_publish_ready_impl() {",
+        "__rsb_publish_ready() {",
+        "__rsb_publish_ready_impl() {",
         1,
     )
     rcfile.write_text(
-        "CODEX_RSB_DISPLAY_LABEL=host\n"
-        f"__codex_nonce={shlex.quote(nonce)}\n{rc_script}\n"
-        "__codex_rsb_publish_ready() {\n"
+        "RSB_DISPLAY_LABEL=host\n"
+        f"__rsb_nonce={shlex.quote(nonce)}\n{rc_script}\n"
+        "__rsb_publish_ready() {\n"
         f"  printf 'ready\\n' >> {shlex.quote(str(ready_log))}\n"
-        "  __codex_rsb_publish_ready_impl\n"
+        "  __rsb_publish_ready_impl\n"
         "}\n",
         encoding="utf-8",
     )
@@ -209,7 +209,7 @@ def test_real_pty_ready_preserves_partial_readline_buffer_and_shell_process(
         _read_pty_until(
             frontend_master,
             output,
-            b"[codex:host:dq",
+            b"[host:dq",
             timeout=3.0,
             start=command_start,
         )
@@ -290,7 +290,7 @@ def test_real_pty_ready_preserves_partial_readline_buffer_and_shell_process(
         assert foreground_line.removeprefix("FOREGROUND:") == str(Path.home())
         assert "ok\tw1\tdq" not in text
         assert "cd --" not in text
-        assert "__codex_rsb_publish_ready" not in text
+        assert "__rsb_publish_ready" not in text
         assert "bash_execute_unix_command" not in text
     finally:
         if not child_reaped:
@@ -313,8 +313,8 @@ def test_blocked_ready_probe_does_not_block_pty_passthrough(tmp_path: Path) -> N
     release_probe = tmp_path / "release-probe"
     rcfile = tmp_path / "bashrc"
     rcfile.write_text(
-        "CODEX_RSB_DISPLAY_LABEL=host\n"
-        f"__codex_nonce={shlex.quote(nonce)}\n{_enter_rcfile(nonce)}\n",
+        "RSB_DISPLAY_LABEL=host\n"
+        f"__rsb_nonce={shlex.quote(nonce)}\n{_enter_rcfile(nonce)}\n",
         encoding="utf-8",
     )
     frontend_master, frontend_slave = _open_frontend_pty()
@@ -400,16 +400,16 @@ def test_successful_reconnect_invalidates_in_flight_ready_probe(
     ready_log = tmp_path / "ready.log"
     rcfile = tmp_path / "bashrc"
     rc_script = _enter_rcfile(nonce).replace(
-        "__codex_rsb_publish_ready() {",
-        "__codex_rsb_publish_ready_impl() {",
+        "__rsb_publish_ready() {",
+        "__rsb_publish_ready_impl() {",
         1,
     )
     rcfile.write_text(
-        "CODEX_RSB_DISPLAY_LABEL=host\n"
-        f"__codex_nonce={shlex.quote(nonce)}\n{rc_script}\n"
-        "__codex_rsb_publish_ready() {\n"
+        "RSB_DISPLAY_LABEL=host\n"
+        f"__rsb_nonce={shlex.quote(nonce)}\n{rc_script}\n"
+        "__rsb_publish_ready() {\n"
         f"  printf 'ready\\n' >> {shlex.quote(str(ready_log))}\n"
-        "  __codex_rsb_publish_ready_impl\n"
+        "  __rsb_publish_ready_impl\n"
         "}\n",
         encoding="utf-8",
     )
@@ -482,7 +482,7 @@ def test_successful_reconnect_invalidates_in_flight_ready_probe(
             output,
             f"\r\nNEW:{workspace}".encode(),
             start=command_start,
-            prompt=b"[codex:host:next",
+            prompt=b"[host:next",
         )
         text = output.decode("utf-8", errors="replace")
         assert "bash_execute_unix_command" not in text
@@ -514,12 +514,12 @@ def _connect_remote(
     output_start = len(output)
     os.write(
         fd,
-        f"codex-rsb connect --remote {shlex.quote(str(workspace))}\n".encode(),
+        f"rsb connect --remote {shlex.quote(str(workspace))}\n".encode(),
     )
     _read_pty_until(
         fd,
         output,
-        f"\r\n\x1b[01;36m[codex:host:{name}".encode(),
+        f"\r\n\x1b[01;36m[host:{name}".encode(),
         timeout=3.0,
         start=output_start,
     )
@@ -532,7 +532,7 @@ def _read_command_until_prompt(
     *,
     start: int,
     timeout: float = 3.0,
-    prompt: bytes = b"[codex:host:dq",
+    prompt: bytes = b"[host:dq",
 ) -> None:
     _read_pty_until(fd, output, expected, timeout=timeout, start=start)
     expected_at = output.index(expected, start) + len(expected)

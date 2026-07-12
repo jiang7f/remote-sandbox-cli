@@ -129,7 +129,7 @@ def invoke_cli(argv: list[str], *, services: CliServices) -> CapturedCliResult:
             if debug:
                 traceback.print_exc()
             else:
-                print(f"codex-rsb: {_one_line(str(exc), max_len=500)}", file=sys.stderr)
+                print(f"rsb: {_one_line(str(exc), max_len=500)}", file=sys.stderr)
             exit_code = 2
     return CapturedCliResult(exit_code, stdout.getvalue(), stderr.getvalue())
 
@@ -200,7 +200,7 @@ def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
                 traceback.print_exc()
             else:
                 print(
-                    "codex-rsb: sync after run failed: "
+                    "rsb: sync after run failed: "
                     + _one_line(str(exc), max_len=500),
                     file=sys.stderr,
                 )
@@ -236,7 +236,7 @@ def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
         existing = services.find_record(args.name, services.registry)
         if existing is None:
             raise RegistryError(
-                f"no connection named {args.name!r}; run codex-rsb status"
+                f"no connection named {args.name!r}; run rsb status"
             )
         local = Path(args.local) if args.local is not None else Path(existing.local_path)
         connection = services.connect_workspace(
@@ -311,7 +311,7 @@ def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
         if args.local_only:
             services.delete_local_workspace(record)
             services.delete_registry_record(record)
-            residue = f"~/.codex-remote-sandbox/workspaces/{record.workspace_id}"
+            residue = f"~/.remote-sandbox/workspaces/{record.workspace_id}"
             print(f"Forgot {record.name} locally. Remote residue remains at {residue}")
             return 0
         services.stop_remote_watcher(record)
@@ -354,7 +354,7 @@ def _service_status_table(records: list[BindingRecord], services: CliServices) -
         )
         if status.phase.value == "disconnected":
             guidance.append(
-                f"{record.name} is disconnected. Run `codex-rsb reconnect {record.name}` "
+                f"{record.name} is disconnected. Run `rsb reconnect {record.name}` "
                 "in the foreground to re-enter authentication."
             )
     table = _format_table(
@@ -490,7 +490,7 @@ def default_cli_services() -> CliServices:
         runner = _connected_runner(record.target)
         runner.delete_path(
             record.target,
-            f"~/.codex-remote-sandbox/agents/{AGENT_VERSION}/agent.pyz",
+            f"~/.remote-sandbox/agents/{AGENT_VERSION}/agent.pyz",
         )
 
     def delete_local(record: BindingRecord) -> None:
@@ -578,7 +578,7 @@ def _with_remote_client(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="codex-rsb")
+    parser = argparse.ArgumentParser(prog="rsb")
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -633,7 +633,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote workspace path: /abs, ~, or ~/path",
     )
     connect.add_argument("-l", "--local", default=".", help="Local workspace path; defaults to cwd")
-    connect.add_argument("--name", default=None, help="Connection name for codex-rsb reconnect")
+    connect.add_argument("--name", default=None, help="Connection name for rsb reconnect")
     connect.add_argument(
         "--no-shell",
         action="store_true",
@@ -641,7 +641,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     reconnect = subparsers.add_parser("reconnect", help="Reconnect a named workspace")
-    reconnect.add_argument("name", help="Connection name shown by codex-rsb list/status")
+    reconnect.add_argument("name", help="Connection name shown by rsb list/status")
     reconnect.add_argument(
         "-l",
         "--local",
@@ -780,6 +780,8 @@ def _open_wrapped_shell_for_record(record: BindingRecord) -> int:
         record.target,
         record.remote_path,
         on_barrier=on_barrier,
+        name=record.name,
+        workspace_id=record.workspace_id,
     )
     if not barrier_seen:
         _poke_or_restart_daemon(local_root, "shell")
@@ -815,7 +817,7 @@ def _record_for_execution(name: str | None) -> BindingRecord:
     if name is not None:
         record = find_binding_record(name)
         if record is None:
-            raise RegistryError(f"no connection named {name!r}; run codex-rsb status")
+            raise RegistryError(f"no connection named {name!r}; run rsb status")
         return record
     record = current_workspace_record(None, Path.cwd())
     if record is None:
@@ -847,8 +849,8 @@ def _require_live_workspace(record: BindingRecord) -> Path:
         raise RegistryError(
             f"connection {record.name!r} points to a missing local path: "
             f"{record.local_path}. "
-            f"Run `codex-rsb reconnect {record.name} --local <new-path>` to repair it, "
-            f"or `codex-rsb forget {record.name}` to remove it from {registry_path()}"
+            f"Run `rsb reconnect {record.name} --local <new-path>` to repair it, "
+            f"or `rsb forget {record.name}` to remove it from {registry_path()}"
         )
     try:
         spec = read_workspace_spec(workspace_paths(record.workspace_id).workspace_file)
@@ -1012,7 +1014,7 @@ def main(argv: list[str] | None = None) -> int:
             existing = services.find_record(args.name, services.registry)
             if existing is None:
                 raise RegistryError(
-                    f"no connection named {args.name!r}; run codex-rsb status"
+                    f"no connection named {args.name!r}; run rsb status"
                 )
             local = Path(args.local) if args.local is not None else Path(existing.local_path)
             if not args.no_shell and not _has_tty():
@@ -1042,7 +1044,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.debug:
             traceback.print_exc()
         else:
-            print(f"codex-rsb: {_one_line(str(exc), max_len=500)}", file=sys.stderr)
+            print(f"rsb: {_one_line(str(exc), max_len=500)}", file=sys.stderr)
         return 2
     return 2
 
@@ -1183,7 +1185,7 @@ def _print_no_shell_status(
 ) -> None:
     if status.phase is WorkspacePhase.INITIAL_SYNCING:
         print("The initial sync continues in background.")
-        print(f"Watch progress with `codex-rsb status {record.name} --watch`.")
+        print(f"Watch progress with `rsb status {record.name} --watch`.")
     elif status.phase is WorkspacePhase.READY:
         print("Initial sync completed." if initial else "Workspace is ready.")
     else:
@@ -1195,7 +1197,7 @@ def _has_tty() -> bool:
 
 
 def _error_prefix() -> str:
-    return "codex-rsb:"
+    return "rsb:"
 
 
 if __name__ == "__main__":

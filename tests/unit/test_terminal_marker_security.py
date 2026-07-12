@@ -7,27 +7,27 @@ from remote_sandbox.shell import BytesEvent, ConnectRequestEvent, ShellOutputPar
 
 
 def test_connect_marker_with_wrong_nonce_is_printed_as_plain_output() -> None:
-    data = b"\x1b]777;codex-rsb;connect-request;forged;b64:e30=\x07"
+    data = b"\x1b]777;rsb;connect-request;forged;b64:e30=\x07"
 
     assert ShellOutputParser("expected").feed(data) == [BytesEvent(data)]
 
 
 def test_legacy_or_forged_protocol_marker_is_plain_output() -> None:
-    data = b"\x1b]777;codex-remote-sandbox;connect-request;expected;b64:e30=\x07"
+    data = b"\x1b]777;remote-sandbox;connect-request;expected;b64:e30=\x07"
 
     assert ShellOutputParser("expected").feed(data) == [BytesEvent(data)]
 
 
 def test_connect_marker_rejects_control_paths_without_consuming_output() -> None:
     payload = base64.b64encode(b'{"remote":"/work/line\\nbreak","name":"dq"}')
-    data = b"\x1b]777;codex-rsb;connect-request;expected;b64:" + payload + b"\x07"
+    data = b"\x1b]777;rsb;connect-request;expected;b64:" + payload + b"\x07"
 
     assert ShellOutputParser("expected").feed(data) == [BytesEvent(data)]
 
 
 def test_valid_connect_marker_requires_expected_nonce_and_payload() -> None:
     payload = base64.b64encode(b'{"remote":"/work/dq","name":"dq"}')
-    data = b"\x1b]777;codex-rsb;connect-request;expected;b64:" + payload + b"\x07"
+    data = b"\x1b]777;rsb;connect-request;expected;b64:" + payload + b"\x07"
 
     assert ShellOutputParser("expected").feed(data) == [
         ConnectRequestEvent(remote="/work/dq", name="dq")
@@ -36,7 +36,7 @@ def test_valid_connect_marker_requires_expected_nonce_and_payload() -> None:
 
 def test_prompt_sentinel_requires_managed_marker_and_is_single_use() -> None:
     slot = shell_module._prompt_slot_sentinel("expected").encode("ascii")
-    managed = b"\x1b]777;codex-rsb;prompt;expected;managed\x07"
+    managed = b"\x1b]777;rsb;prompt;expected;managed\x07"
     parser = ShellOutputParser("expected")
 
     assert parser.feed(slot) == [BytesEvent(slot)]
@@ -48,7 +48,7 @@ def test_prompt_sentinel_requires_managed_marker_and_is_single_use() -> None:
 
 
 def test_wrong_nonce_prompt_cannot_authorize_expected_sentinel() -> None:
-    forged = b"\x1b]777;codex-rsb;prompt;wrong;managed\x07"
+    forged = b"\x1b]777;rsb;prompt;wrong;managed\x07"
     slot = shell_module._prompt_slot_sentinel("expected").encode("ascii")
 
     events = ShellOutputParser("expected").feed(forged + slot)

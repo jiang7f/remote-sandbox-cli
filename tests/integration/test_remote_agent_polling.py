@@ -160,8 +160,8 @@ def test_zipapp_hash_paths_returns_only_requested_strong_fingerprints(tmp_path: 
     env = {
         **os.environ,
         "HOME": str(home),
-        "CODEX_REMOTE_SANDBOX_HOME": str(control),
-        "CODEX_REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
+        "REMOTE_SANDBOX_HOME": str(control),
+        "REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
     }
     workspace_id = "00000000-0000-4000-8000-000000000108"
     registered = _agent_call(
@@ -249,8 +249,8 @@ def test_zipapp_manages_detached_watcher_journal_and_safe_forget(tmp_path: Path)
     env = {
         **os.environ,
         "HOME": str(home),
-        "CODEX_REMOTE_SANDBOX_HOME": str(control),
-        "CODEX_REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
+        "REMOTE_SANDBOX_HOME": str(control),
+        "REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
     }
     workspace_id = "00000000-0000-4000-8000-000000000007"
 
@@ -349,13 +349,13 @@ def test_zipapp_manages_detached_watcher_journal_and_safe_forget(tmp_path: Path)
     assert root.exists()
 
 
-def test_default_remote_runtime_uses_isolated_codex_tmp_tree(
+def test_default_remote_runtime_uses_isolated_rsb_tmp_tree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("REMOTE_SANDBOX_RUNTIME_DIR", raising=False)
 
     assert remote_agent_main._runtime_root() == (
-        Path("/tmp") / f"codex-remote-sandbox-{os.getuid()}"
+        Path("/tmp") / f"remote-sandbox-{os.getuid()}"
     )
 
 
@@ -372,27 +372,25 @@ def test_default_remote_runtime_uses_isolated_codex_tmp_tree(
         "xdg-runtime",
     ],
 )
-def test_register_rejects_installed_rsb_state_before_codex_control_creation(
+def test_register_rejects_protected_remote_sandbox_state(
     tmp_path: Path,
     location: str,
 ) -> None:
     archive = build_agent_zipapp(tmp_path / "agent.pyz")
     home = tmp_path / "home"
-    control = tmp_path / "codex-control"
-    runtime = tmp_path / "codex-runtime"
-    installed_home = tmp_path / "installed-home"
-    installed_runtime = tmp_path / "installed-runtime"
-    installed_control = tmp_path / "installed-control"
+    configured_home = tmp_path / "configured-home"
+    configured_runtime = tmp_path / "configured-runtime"
+    configured_control = tmp_path / "configured-control"
     xdg_runtime = tmp_path / "xdg"
     home.mkdir()
     candidates = {
         "default-home": home / ".remote-sandbox",
         "default-home-child": home / ".remote-sandbox" / "workspaces",
-        "home-override": installed_home,
-        "home-override-child": installed_home / "workspaces",
-        "runtime-override": installed_runtime,
-        "runtime-override-child": installed_runtime / "workspace",
-        "control-override": installed_control,
+        "home-override": configured_home,
+        "home-override-child": configured_home / "workspaces",
+        "runtime-override": configured_runtime,
+        "runtime-override-child": configured_runtime / "workspace",
+        "control-override": configured_control,
         "xdg-runtime": xdg_runtime / "remote-sandbox",
     }
     root = candidates[location]
@@ -400,13 +398,14 @@ def test_register_rejects_installed_rsb_state_before_codex_control_creation(
     env = {
         **os.environ,
         "HOME": str(home),
-        "CODEX_REMOTE_SANDBOX_HOME": str(control),
-        "CODEX_REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
-        "REMOTE_SANDBOX_HOME": str(installed_home),
-        "REMOTE_SANDBOX_RUNTIME_DIR": str(installed_runtime),
-        "REMOTE_SANDBOX_CONTROL_DIR": str(installed_control),
+        "REMOTE_SANDBOX_RUNTIME_DIR": str(configured_runtime),
+        "REMOTE_SANDBOX_CONTROL_DIR": str(configured_control),
         "XDG_RUNTIME_DIR": str(xdg_runtime),
     }
+    if location.startswith("default-home"):
+        env.pop("REMOTE_SANDBOX_HOME", None)
+    else:
+        env["REMOTE_SANDBOX_HOME"] = str(configured_home)
 
     result = _agent_call(
         archive,
@@ -421,46 +420,35 @@ def test_register_rejects_installed_rsb_state_before_codex_control_creation(
     )
 
     assert result.returncode == 2
-    assert "installed rsb state" in (decode_response(result.stdout).error or "")
-    assert not control.exists()
-    assert not runtime.exists()
+    assert "remote-sandbox state" in (decode_response(result.stdout).error or "")
 
 
-def test_register_rejects_default_installed_runtime_before_codex_control_creation(
+def test_register_rejects_configured_runtime_before_home_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    actual_uid = os.getuid()
-    fake_uid = actual_uid + 1_000_000 + os.getpid()
-    installed_runtime = Path("/tmp").resolve() / f"remote-sandbox-{fake_uid}"
-    root = installed_runtime / "workspace"
-    assert not installed_runtime.exists()
+    runtime = tmp_path / "runtime"
+    root = runtime / "workspace"
     root.mkdir(parents=True)
     home = tmp_path / "home"
-    control = tmp_path / "codex-control"
-    runtime = tmp_path / "codex-runtime"
-    home.mkdir()
+    state_home = tmp_path / "state"
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(control))
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
-    monkeypatch.delenv("REMOTE_SANDBOX_HOME", raising=False)
-    monkeypatch.delenv("REMOTE_SANDBOX_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(state_home))
+    monkeypatch.setenv("REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
     monkeypatch.delenv("REMOTE_SANDBOX_CONTROL_DIR", raising=False)
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    monkeypatch.setattr(remote_agent_main.os, "getuid", lambda: fake_uid)
     try:
-        with pytest.raises(ValueError, match="installed rsb state"):
+        with pytest.raises(ValueError, match="remote-sandbox state"):
             remote_agent_main._handle_register(
                 {
                     "workspace_id": "00000000-0000-4000-8000-000000000083",
                     "root": str(root),
                 }
             )
-        assert not control.exists()
-        assert not runtime.exists()
+        assert not state_home.exists()
     finally:
         root.rmdir()
-        installed_runtime.rmdir()
+        runtime.rmdir()
 
 
 def test_runtime_root_rejects_symlink_without_modifying_target(
@@ -472,7 +460,7 @@ def test_runtime_root_rejects_symlink_without_modifying_target(
     target.chmod(0o755)
     runtime = tmp_path / "runtime"
     runtime.symlink_to(target, target_is_directory=True)
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
 
     with pytest.raises(OSError):
         remote_agent_main._runtime_root()
@@ -491,7 +479,7 @@ def test_runtime_component_rejects_symlink_without_modifying_target(
     outside.mkdir(mode=0o755)
     outside.chmod(0o755)
     (runtime / "workspaces").symlink_to(outside, target_is_directory=True)
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
 
     with pytest.raises(OSError):
         remote_agent_main._workspace_runtime("00000000-0000-4000-8000-000000000084")
@@ -506,7 +494,7 @@ def test_runtime_lock_rejects_symlink_without_modifying_target(
 ) -> None:
     workspace_id = "00000000-0000-4000-8000-000000000085"
     runtime = tmp_path / "runtime"
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
     workspace = remote_agent_main._workspace_runtime(workspace_id)
     target = tmp_path / "outside.lock"
     target.write_text("do not change", encoding="utf-8")
@@ -532,8 +520,8 @@ def test_watcher_log_rejects_symlink_before_spawning_or_modifying_target(
     root.mkdir()
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(control))
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(control))
+    monkeypatch.setenv("REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
     workspace_id = "00000000-0000-4000-8000-000000000086"
     remote_agent_main._handle_register({"workspace_id": workspace_id, "root": str(root)})
     log_path = remote_agent_main._workspace_runtime(workspace_id) / "watcher.log"
@@ -566,7 +554,7 @@ def test_runtime_root_rejects_directory_owned_by_another_uid(
     runtime.mkdir(mode=0o755)
     runtime.chmod(0o755)
     actual_uid = os.getuid()
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
     monkeypatch.setattr(remote_agent_main.os, "getuid", lambda: actual_uid + 1)
 
     with pytest.raises(PermissionError):
@@ -585,7 +573,7 @@ def test_register_conflict_does_not_leave_unreachable_workspace_metadata(tmp_pat
     env = {
         **os.environ,
         "HOME": str(home),
-        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+        "REMOTE_SANDBOX_HOME": str(control),
     }
     first_id = "00000000-0000-4000-8000-000000000071"
     conflicting_id = "00000000-0000-4000-8000-000000000072"
@@ -615,13 +603,13 @@ def test_register_rejects_control_home_inside_workspace_before_creating_it(tmp_p
     archive = build_agent_zipapp(tmp_path / "agent.pyz")
     root = tmp_path / "workspace"
     home = tmp_path / "home"
-    control = root / ".codex-remote-sandbox"
+    control = root / ".remote-sandbox"
     root.mkdir()
     home.mkdir()
     env = {
         **os.environ,
         "HOME": str(home),
-        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+        "REMOTE_SANDBOX_HOME": str(control),
     }
 
     registered = _agent_call(
@@ -651,7 +639,7 @@ def test_stop_never_signals_a_reused_unrelated_pid(tmp_path: Path) -> None:
     env = {
         **os.environ,
         "HOME": str(home),
-        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+        "REMOTE_SANDBOX_HOME": str(control),
     }
     workspace_id = "00000000-0000-4000-8000-000000000073"
     registered = _agent_call(
@@ -710,7 +698,7 @@ def test_commands_reject_workspace_state_that_disagrees_with_protected_index(
     env = {
         **os.environ,
         "HOME": str(home),
-        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+        "REMOTE_SANDBOX_HOME": str(control),
     }
     workspace_id = "00000000-0000-4000-8000-000000000074"
     registered = _agent_call(
@@ -745,7 +733,7 @@ def test_concurrent_start_calls_share_one_watcher_generation(tmp_path: Path) -> 
     env = {
         **os.environ,
         "HOME": str(home),
-        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+        "REMOTE_SANDBOX_HOME": str(control),
     }
     workspace_id = "00000000-0000-4000-8000-000000000075"
     assert (
@@ -795,8 +783,8 @@ def test_concurrent_start_and_forget_never_recreate_persistent_metadata(tmp_path
     env = {
         **os.environ,
         "HOME": str(home),
-        "CODEX_REMOTE_SANDBOX_HOME": str(control),
-        "CODEX_REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
+        "REMOTE_SANDBOX_HOME": str(control),
+        "REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
     }
     workspace_id = "00000000-0000-4000-8000-000000000079"
     assert (
@@ -865,8 +853,8 @@ def test_start_lookup_cannot_outlive_forget_and_recreate_persistent_metadata(
     root.mkdir()
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(control))
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(control))
+    monkeypatch.setenv("REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
     workspace_id = "00000000-0000-4000-8000-000000000087"
     remote_agent_main._handle_register({"workspace_id": workspace_id, "root": str(root)})
     stable_lock = runtime / "workspaces" / workspace_id / "control.lock"
@@ -956,8 +944,8 @@ def test_status_leaves_running_state_unchanged_when_identity_is_unknown(
     root.mkdir()
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(control))
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(control))
+    monkeypatch.setenv("REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
     workspace_id = "00000000-0000-4000-8000-000000000080"
     remote_agent_main._handle_register({"workspace_id": workspace_id, "root": str(root)})
     state_path = control / "workspaces" / workspace_id / "state.sqlite3"
@@ -990,8 +978,8 @@ def test_status_cannot_overwrite_a_new_start_generation(
     root.mkdir()
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(control))
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(control))
+    monkeypatch.setenv("REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
     workspace_id = "00000000-0000-4000-8000-000000000081"
     remote_agent_main._handle_register({"workspace_id": workspace_id, "root": str(root)})
     state_path = control / "workspaces" / workspace_id / "state.sqlite3"
@@ -1078,7 +1066,7 @@ def test_forget_restores_index_and_metadata_when_deletion_fails(
     root.mkdir()
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(control))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(control))
     workspace_id = "00000000-0000-4000-8000-000000000076"
     remote_agent_main._handle_register({"workspace_id": workspace_id, "root": str(root)})
     metadata = control / "workspaces" / workspace_id
@@ -1109,7 +1097,7 @@ def test_non_follow_event_stream_drains_multiple_bounded_batches(tmp_path: Path)
     env = {
         **os.environ,
         "HOME": str(home),
-        "CODEX_REMOTE_SANDBOX_HOME": str(control),
+        "REMOTE_SANDBOX_HOME": str(control),
     }
     workspace_id = "00000000-0000-4000-8000-000000000078"
     assert (

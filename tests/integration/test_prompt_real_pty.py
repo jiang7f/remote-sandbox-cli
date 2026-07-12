@@ -35,8 +35,8 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
     probe_log = tmp_path / "probe.log"
     rcfile = tmp_path / "bashrc"
     rcfile.write_text(
-        "CODEX_RSB_DISPLAY_LABEL=ZJU_2\n"
-        f"__codex_nonce={shlex.quote(nonce)}\n{_enter_rcfile(nonce)}\n",
+        "RSB_DISPLAY_LABEL=ZJU_2\n"
+        f"__rsb_nonce={shlex.quote(nonce)}\n{_enter_rcfile(nonce)}\n",
         encoding="utf-8",
     )
     frontend_master, frontend_slave = pty.openpty()
@@ -122,9 +122,9 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
         _read_until(frontend_master, output, b":enter]", timeout=2.0)
         os.write(
             frontend_master,
-            f"codex-rsb connect --remote {shlex.quote(str(workspace))}\n".encode(),
+            f"rsb connect --remote {shlex.quote(str(workspace))}\n".encode(),
         )
-        _read_until(frontend_master, output, b"[codex:ZJU_2:dq scanning]", timeout=3.0)
+        _read_until(frontend_master, output, b"[ZJU_2:dq scanning]", timeout=3.0)
 
         slot = shell_module._prompt_slot_sentinel(nonce).encode()
         ps1_start = len(output)
@@ -132,7 +132,7 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
         _read_until(frontend_master, output, b"PS1-COPY:", timeout=2.0, start=ps1_start)
         _read_until(frontend_master, output, slot, timeout=2.0, start=ps1_start)
         assert (
-            b"\\[\\e]777;codex-rsb;prompt;${__codex_nonce};managed\\a\\]"
+            b"\\[\\e]777;rsb;prompt;${__rsb_nonce};managed\\a\\]"
             in output[ps1_start:]
         )
 
@@ -151,7 +151,7 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
         os.write(frontend_master, b"M\n")
         _read_until(frontend_master, output, b"\r\nCURSOR:AMD", timeout=2.0, start=typing_start)
         typing_output = bytes(output[typing_start:])
-        assert typing_output.count(b"\r\n[codex:") == 0
+        assert typing_output.count(b"\r\n[") == 0
         assert b"CURSOR:AMD" in typing_output
         assert b"CURSOR:AAMD" not in typing_output
 
@@ -176,7 +176,7 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
         _read_until(
             frontend_master,
             output,
-            b"[codex:ZJU_2:dq]",
+            b"[ZJU_2:dq]",
             timeout=2.0,
             start=compact_start,
         )
@@ -191,7 +191,7 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
         _read_until(
             frontend_master,
             output,
-            b"[codex:ZJU_2:dq]",
+            b"[ZJU_2:dq]",
             timeout=2.0,
             start=ready_typing_start,
         )
@@ -215,11 +215,11 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
         _read_until(
             frontend_master,
             output,
-            b"[codex:ZJU_2:dq offline]",
+            b"[ZJU_2:dq offline]",
             timeout=2.0,
             start=offline_start,
         )
-        assert b"\r\n[codex:" not in output[offline_start:]
+        assert b"\r\n[" not in output[offline_start:]
         status_file.write_text("conflict", encoding="utf-8")
         _read_until(frontend_master, output, b"conflict 3", timeout=2.0, start=offline_start)
         status_file.write_text("degraded", encoding="utf-8")
@@ -234,7 +234,7 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
             for earlier, later in zip(probe_times, probe_times[1:], strict=False)
         )
         for mode in ("enter", "managed"):
-            prompt_marker = f"\x1b]777;codex-rsb;prompt;{nonce};{mode}\x07".encode()
+            prompt_marker = f"\x1b]777;rsb;prompt;{nonce};{mode}\x07".encode()
             assert prompt_marker not in output
         text = output.decode("utf-8", errors="replace")
         assert "connect-request" not in text
@@ -271,8 +271,8 @@ def test_lifecycle_phase_has_a_distinct_real_pty_prompt_token(
     workspace.mkdir()
     rcfile = tmp_path / "bashrc"
     rcfile.write_text(
-        "CODEX_RSB_DISPLAY_LABEL=host\n"
-        f"__codex_nonce={shlex.quote(nonce)}\n{_enter_rcfile(nonce)}\n",
+        "RSB_DISPLAY_LABEL=host\n"
+        f"__rsb_nonce={shlex.quote(nonce)}\n{_enter_rcfile(nonce)}\n",
         encoding="utf-8",
     )
     frontend_master, frontend_slave = pty.openpty()
@@ -313,7 +313,7 @@ def test_lifecycle_phase_has_a_distinct_real_pty_prompt_token(
     output = bytearray()
     try:
         _read_until(frontend_master, output, b":enter]", timeout=2.0)
-        os.write(frontend_master, b"codex-rsb connect --remote /tmp\n")
+        os.write(frontend_master, b"rsb connect --remote /tmp\n")
         _read_until(frontend_master, output, token, timeout=3.0)
     finally:
         with suppress(OSError):

@@ -100,7 +100,7 @@ def test_conflicts_take_priority_over_offline_and_progress() -> None:
 def test_ready_prompt_is_compact() -> None:
     status = _status(WorkspacePhase.READY, "idle")
 
-    assert PromptRenderer(width=34).render("ZJU_2", "dq", status) == "[codex:ZJU_2:dq]"
+    assert PromptRenderer(width=34).render("ZJU_2", "dq", status) == "[ZJU_2:dq]"
 
 
 def test_long_unicode_labels_truncate_to_display_width_and_close_bracket() -> None:

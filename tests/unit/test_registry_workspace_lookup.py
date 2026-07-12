@@ -99,72 +99,59 @@ def _record(name: str, workspace_suffix: int, local_root: Path) -> BindingRecord
     )
 
 
-def test_registry_path_ignores_legacy_installed_override(
+def test_registry_path_honors_explicit_override(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    development_home = tmp_path / "codex-home"
-    installed_registry = tmp_path / "installed" / "connections.toml"
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(development_home))
-    monkeypatch.setenv("REMOTE_SANDBOX_CONNECTIONS", str(installed_registry))
+    registry = tmp_path / "state" / "connections.toml"
+    monkeypatch.setenv("REMOTE_SANDBOX_CONNECTIONS", str(registry))
 
-    assert registry_path() == development_home / "connections.toml"
+    assert registry_path() == registry
 
 
-def test_registry_path_honors_development_override(
+def test_registry_path_uses_formal_home_without_explicit_registry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    development_registry = tmp_path / "development" / "connections.toml"
-    monkeypatch.setenv(
-        "CODEX_REMOTE_SANDBOX_CONNECTIONS",
-        str(development_registry),
-    )
+    home = tmp_path / "state"
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(home))
+    monkeypatch.delenv("REMOTE_SANDBOX_CONNECTIONS", raising=False)
 
-    assert registry_path() == development_registry
+    assert registry_path() == home / "connections.toml"
 
 
-def test_default_registry_reads_and_writes_ignore_installed_registry(
+def test_default_registry_reads_and_writes_formal_registry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    development_home = tmp_path / "codex-home"
-    installed_registry = tmp_path / "installed" / "connections.toml"
-    installed = _record("installed", 81, tmp_path / "installed-project")
-    development = _record("development", 82, tmp_path / "development-project")
-    upsert_binding_record(installed_registry, installed)
-    installed_before = installed_registry.read_bytes()
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(development_home))
-    monkeypatch.setenv("REMOTE_SANDBOX_CONNECTIONS", str(installed_registry))
+    home = tmp_path / "state"
+    record = _record("workspace", 82, tmp_path / "project")
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(home))
+    monkeypatch.delenv("REMOTE_SANDBOX_CONNECTIONS", raising=False)
 
     assert list_binding_records() == []
-    upsert_binding_record(None, development)
+    upsert_binding_record(None, record)
 
-    assert list_binding_records() == [development]
-    assert installed_registry.read_bytes() == installed_before
+    assert list_binding_records() == [record]
+    assert (home / "connections.toml").exists()
 
 
-def test_connect_registration_does_not_write_installed_registry(
+def test_connect_registration_writes_explicit_registry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    development_home = tmp_path / "codex-home"
-    installed_registry = tmp_path / "installed" / "connections.toml"
-    installed = _record("installed", 83, tmp_path / "installed-project")
-    upsert_binding_record(installed_registry, installed)
-    installed_before = installed_registry.read_bytes()
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(development_home))
-    monkeypatch.setenv("REMOTE_SANDBOX_CONNECTIONS", str(installed_registry))
+    registry = tmp_path / "state" / "connections.toml"
+    monkeypatch.setenv("REMOTE_SANDBOX_CONNECTIONS", str(registry))
     spec = _workspace_spec(
         workspace_id="00000000-0000-4000-8000-000000000084",
-        name="development",
-        local_root=tmp_path / "development-project",
+        name="workspace",
+        local_root=tmp_path / "project",
     )
 
     record = register_workspace(spec)
 
     assert list_binding_records() == [record]
-    assert installed_registry.read_bytes() == installed_before
+    assert registry.exists()
 
 
 def test_register_workspace_persists_binding_record(tmp_path: Path) -> None:
@@ -294,7 +281,7 @@ def test_current_workspace_does_not_read_in_tree_marker(
 def test_concurrent_upserts_preserve_both_records(
     tmp_path: Path,
 ) -> None:
-    registry = tmp_path / "codex-home" / "connections.toml"
+    registry = tmp_path / "rsb-home" / "connections.toml"
     upsert_binding_record(registry, _record("seed", 1, tmp_path / "seed"))
     context = multiprocessing.get_context("spawn")
     barrier = context.Barrier(2)
@@ -324,7 +311,7 @@ def test_concurrent_upserts_preserve_both_records(
 def test_concurrent_upsert_and_delete_preserve_both_mutations(
     tmp_path: Path,
 ) -> None:
-    registry = tmp_path / "codex-home" / "connections.toml"
+    registry = tmp_path / "rsb-home" / "connections.toml"
     seed = _record("seed", 1, tmp_path / "seed")
     upsert_binding_record(registry, seed)
     context = multiprocessing.get_context("spawn")
@@ -349,7 +336,7 @@ def test_concurrent_upsert_and_delete_preserve_both_mutations(
 
 
 def test_delete_binding_record_does_not_delete_rebound_name(tmp_path: Path) -> None:
-    registry = tmp_path / "codex-home" / "connections.toml"
+    registry = tmp_path / "rsb-home" / "connections.toml"
     replacement = _record("dq", 2, tmp_path / "replacement")
     upsert_binding_record(registry, replacement)
 
@@ -364,7 +351,7 @@ def test_delete_binding_record_does_not_delete_rebound_name(tmp_path: Path) -> N
 
 
 def test_registry_transaction_files_have_private_permissions(tmp_path: Path) -> None:
-    registry = tmp_path / "codex-home" / "connections.toml"
+    registry = tmp_path / "rsb-home" / "connections.toml"
 
     upsert_binding_record(registry, _record("dq", 1, tmp_path / "dq"))
 

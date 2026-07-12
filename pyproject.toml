@@ -1,5 +1,5 @@
 [project]
-name = "codex-remote-sandbox"
+name = "remote-sandbox"
 version = "0.1.0"
 description = "Editor-agnostic remote workspace sandbox with SSH-backed execution and sync"
 readme = "README.md"
@@ -35,8 +35,7 @@ Repository = "https://github.com/jiang7f/remote-sandbox"
 Issues = "https://github.com/jiang7f/remote-sandbox/issues"
 
 [project.scripts]
-codex-remote-sandbox = "remote_sandbox.cli:main"
-codex-rsb = "remote_sandbox.cli:main"
+rsb = "remote_sandbox.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.26,<0.12.0"]

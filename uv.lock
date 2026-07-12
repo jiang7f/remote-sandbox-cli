@@ -48,7 +48,7 @@ wheels = [
 ]
 
 [[package]]
-name = "codex-remote-sandbox"
+name = "remote-sandbox"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

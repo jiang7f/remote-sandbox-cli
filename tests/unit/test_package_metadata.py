@@ -2,10 +2,10 @@ import importlib
 import importlib.metadata
 
 import remote_sandbox
-from remote_sandbox.namespace import DEV_NAMESPACE
+from remote_sandbox.namespace import TOOL_NAMESPACE
 
 
-def test_package_version_uses_development_distribution(monkeypatch) -> None:
+def test_package_version_uses_formal_distribution(monkeypatch) -> None:
     requested_distributions: list[str] = []
 
     def fake_version(distribution_name: str) -> str:
@@ -19,5 +19,5 @@ def test_package_version_uses_development_distribution(monkeypatch) -> None:
     finally:
         importlib.reload(remote_sandbox)
 
-    assert requested_distributions == [DEV_NAMESPACE.distribution]
+    assert requested_distributions == [TOOL_NAMESPACE.distribution]
     assert reported_version == "1.2.3.dev0"

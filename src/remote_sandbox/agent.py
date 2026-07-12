@@ -10,7 +10,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from remote_sandbox.namespace import DEV_NAMESPACE
+from remote_sandbox.namespace import TOOL_NAMESPACE
 from remote_sandbox.remote_agent import AGENT_VERSION
 from remote_sandbox.ssh import SshRunner
 
@@ -60,7 +60,7 @@ def build_agent_zipapp(destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     package_source = Path(__file__).with_name("remote_agent")
 
-    with tempfile.TemporaryDirectory(prefix="codex-remote-agent-build-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="rsb-remote-agent-build-") as temporary:
         staging = Path(temporary) / "staging"
         package_destination = staging / "remote_agent"
         shutil.copytree(
@@ -82,21 +82,21 @@ class RemoteAgentManager:
         self._runner = runner
 
     def ensure(self, target: str) -> AgentInstall:
-        with tempfile.TemporaryDirectory(prefix="codex-remote-agent-build-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rsb-remote-agent-build-") as temporary:
             archive = build_agent_zipapp(Path(temporary) / "agent.pyz")
             content = archive.read_bytes()
 
         digest = hashlib.sha256(content).hexdigest()
         remote_path = posixpath.join(
             "~",
-            DEV_NAMESPACE.home_dirname,
+            TOOL_NAMESPACE.home_dirname,
             "agents",
             AGENT_VERSION,
             "agent.pyz",
         )
         self._runner.write_bytes_atomic(target, remote_path, content)
         output = self._runner.run_python_file(target, remote_path, ("self-check",))
-        expected = f"codex-remote-sandbox-agent {AGENT_VERSION} {digest}"
+        expected = f"remote-sandbox-agent {AGENT_VERSION} {digest}"
         if output.strip() != expected:
             raise RuntimeError(
                 f"Remote agent self-check failed: expected {expected!r}, got {output.strip()!r}"

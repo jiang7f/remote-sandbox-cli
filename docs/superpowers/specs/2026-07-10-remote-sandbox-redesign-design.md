@@ -1,4 +1,4 @@
-# Codex Remote Sandbox Redesign
+# Remote Sandbox Redesign
 
 Date: 2026-07-10
 
@@ -49,7 +49,7 @@ The redesign must:
 10. Separate remote command exit status from follow-up sync status.
 11. Expose truthful lifecycle states, logs, progress, pending changes, and conflicts.
 12. Provide automated unit, integration, E2E, performance, and security coverage.
-13. Run as an isolated development tool named `codex-rsb` until the redesign is accepted.
+13. Run as an isolated development tool named `rsb` until the redesign is accepted.
 
 ## 3. Non-goals
 
@@ -69,16 +69,16 @@ The development build must coexist with the installed tool and must not read, mo
 clean any existing `rsb` state.
 
 ```text
-Distribution name    codex-remote-sandbox
-Primary command      codex-rsb
-Long command         codex-remote-sandbox
-Local home           ~/.codex-remote-sandbox/
-Remote home          ~/.codex-remote-sandbox/
-Runtime directory    /tmp/codex-remote-sandbox-<uid>/
-SSH control path     /tmp/codex-remote-sandbox-<uid>/cm/%C
+Distribution name    remote-sandbox
+Primary command      rsb
+Long command         remote-sandbox
+Local home           ~/.remote-sandbox/
+Remote home          ~/.remote-sandbox/
+Runtime directory    /tmp/remote-sandbox-<uid>/
+SSH control path     /tmp/remote-sandbox-<uid>/cm/%C
 ```
 
-The injected command inside `codex-rsb enter` is `codex-rsb connect`, never `rsb connect`.
+The injected command inside `rsb enter` is `rsb connect`, never `rsb connect`.
 Remote agents, ControlMaster sockets, daemon sockets, workspace identifiers, logs, and registries
 all use the isolated namespace.
 
@@ -111,7 +111,7 @@ core.
 
 ```mermaid
 flowchart LR
-    CLI["codex-rsb CLI"] --> Supervisor["Local supervisor"]
+    CLI["rsb CLI"] --> Supervisor["Local supervisor"]
     Shell["Managed SSH shell"] --> Supervisor
     LocalWatch["Local watchdog watcher"] --> LocalJournal[("Local event journal")]
     RemoteWatch["Remote inotify watcher"] --> RemoteJournal[("Remote event journal")]
@@ -136,7 +136,7 @@ No control file is created below either workspace root.
 ### 7.1 Local
 
 ```text
-~/.codex-remote-sandbox/
+~/.remote-sandbox/
   connections.toml
   agents/
   workspaces/<workspace-id>/
@@ -148,7 +148,7 @@ No control file is created below either workspace root.
 ### 7.2 Remote
 
 ```text
-~/.codex-remote-sandbox/
+~/.remote-sandbox/
   index.sqlite3
   agents/<agent-version>/agent.pyz
   workspaces/<workspace-id>/
@@ -249,7 +249,7 @@ Responsibilities:
 
 Responsibilities:
 
-- Keep `codex-rsb enter` and the connected workspace in one SSH PTY.
+- Keep `rsb enter` and the connected workspace in one SSH PTY.
 - Handle binding requests through authenticated terminal control markers.
 - Render a fixed-width status slot in the Bash prompt.
 - Redraw the current Readline input line when progress changes.
@@ -306,7 +306,7 @@ Both initial directions enter a shell immediately.
 Example development prompt:
 
 ```text
-[codex:ZJU_2:dq sync 40%] user@2ndserver:~ % python tra
+[ZJU_2:dq sync 40%] user@2ndserver:~ % python tra
 ```
 
 The bracketed status is one live prompt field. It does not print historical progress lines.
@@ -314,12 +314,12 @@ The bracketed status is one live prompt field. It does not print historical prog
 Prompt states include:
 
 ```text
-[codex:ZJU_2:dq scanning]
-[codex:ZJU_2:dq planning]
-[codex:ZJU_2:dq sync 40%]
-[codex:ZJU_2:dq conflict 1]
-[codex:ZJU_2:dq offline]
-[codex:ZJU_2:dq]
+[ZJU_2:dq scanning]
+[ZJU_2:dq planning]
+[ZJU_2:dq sync 40%]
+[ZJU_2:dq conflict 1]
+[ZJU_2:dq offline]
+[ZJU_2:dq]
 ```
 
 The remote prompt contains a fixed-width sentinel. The local PTY output parser replaces that
@@ -333,7 +333,7 @@ The supervisor knows whether the shell is at a prompt through authenticated cont
 does not inject redraw input while `top`, `vim`, or another foreground command is running. The next
 prompt immediately displays the newest state.
 
-Inside the browsing shell, `codex-rsb connect` sends a binding request and waits for a local
+Inside the browsing shell, `rsb connect` sends a binding request and waits for a local
 response instead of calling `exit`. On success, the same remote shell switches from `enter` mode
 to managed-workspace mode. On cancellation or binding failure, it remains in browsing mode and
 shows a concise error without closing SSH.
@@ -397,9 +397,9 @@ Conflict handling is non-destructive:
 Resolution commands are:
 
 ```bash
-codex-rsb conflicts
-codex-rsb resolve <path> --use-local
-codex-rsb resolve <path> --use-remote
+rsb conflicts
+rsb resolve <path> --use-local
+rsb resolve <path> --use-remote
 ```
 
 Clock-based last-writer-wins behavior is explicitly rejected.
@@ -442,7 +442,7 @@ common editor swap and temporary files
 Git operations are local-only. `.git` is not synchronized. The remote working tree receives
 normal project files and may not be treated as an independently managed Git repository.
 
-`codex-rsb init` writes an explanatory default `.rsbignore` that users may extend. `.git/`, hard
+`rsb init` writes an explanatory default `.rsbignore` that users may extend. `.git/`, hard
 control metadata, and path-safety rules cannot be re-enabled through `.rsbignore`. Environment and
 cache defaults may be explicitly overridden when a user accepts their portability cost.
 
@@ -467,7 +467,7 @@ stopped
 `Connected <name>` is a binding event rather than a durable state.
 
 The pid and `starting` status are published before agent startup, scanning, hashing, or transfer.
-`codex-rsb status` reads durable status and verifies process liveness, so a running startup process
+`rsb status` reads durable status and verifies process liveness, so a running startup process
 is never reported as `stopped`.
 
 Example status output:
@@ -477,23 +477,23 @@ NAME  STATE            PROGRESS       PENDING  CONFLICTS  LAST_SYNC
 dq    initial-syncing  421/3626 40%   18       0          2s
 ```
 
-`codex-rsb status <name> --watch` redraws this status in place.
+`rsb status <name> --watch` redraws this status in place.
 
 ### 14.1 Disconnection
 
 - The local and remote journals continue recording their respective local events.
 - Key-based SSH reconnects automatically with bounded exponential backoff.
 - Password-based SSH that cannot authenticate in the background becomes `disconnected`.
-- `codex-rsb reconnect <name>` prompts in the foreground and resumes from acknowledged journal
+- `rsb reconnect <name>` prompts in the foreground and resumes from acknowledged journal
   sequences.
 - Every reconnect performs a metadata audit before returning to normal incremental mode.
 
 ### 14.2 Start and stop
 
-`codex-rsb start` starts both watchers, replays journals, and audits current state. It does not
+`rsb start` starts both watchers, replays journals, and audits current state. It does not
 repeat a completed initial sync.
 
-`codex-rsb stop` stops both the local daemon and remote watcher. A later start audits both trees
+`rsb stop` stops both the local daemon and remote watcher. A later start audits both trees
 because changes made while stopped were not journaled.
 
 ### 14.3 Failures and logging
@@ -509,29 +509,29 @@ Logs use size-based rotation and bounded retention.
 The development command set includes:
 
 ```text
-codex-rsb init
-codex-rsb enter
-codex-rsb connect
-codex-rsb reconnect
-codex-rsb status [name] [--watch]
-codex-rsb start [name]
-codex-rsb stop [name]
-codex-rsb shell [name]
-codex-rsb run [name] -- <command>
-codex-rsb conflicts [name]
-codex-rsb resolve <path> --use-local|--use-remote
-codex-rsb fetch
-codex-rsb peek
-codex-rsb forget <name> [--local-only]
+rsb init
+rsb enter
+rsb connect
+rsb reconnect
+rsb status [name] [--watch]
+rsb start [name]
+rsb stop [name]
+rsb shell [name]
+rsb run [name] -- <command>
+rsb conflicts [name]
+rsb resolve <path> --use-local|--use-remote
+rsb fetch
+rsb peek
+rsb forget <name> [--local-only]
 ```
 
-`codex-rsb run` always returns the remote command's exit code. Follow-up synchronization is a
+`rsb run` always returns the remote command's exit code. Follow-up synchronization is a
 separate best-effort wait. A sync failure produces a warning and daemon retry but never replaces
 the command result or emits an uncaught traceback.
 
 ## 16. Forget and Cleanup
 
-`codex-rsb forget <name>` performs double-ended cleanup:
+`rsb forget <name>` performs double-ended cleanup:
 
 1. Stop the local supervisor.
 2. Stop the remote watcher.
@@ -627,7 +627,7 @@ authentication fixtures. Automated tests never depend on ZJU_2.
 
 Critical flows include:
 
-- `codex-rsb enter`, remote browsing, and same-session `codex-rsb connect`.
+- `rsb enter`, remote browsing, and same-session `rsb connect`.
 - Binding failure or cancellation without closing the browsing shell.
 - Dynamic prompt percentage changes while a partial command remains intact.
 - No prompt injection during `top`, `vim`, or another foreground program.
@@ -689,7 +689,7 @@ The redesign is not complete until:
 ## 21. Implementation Sequencing Constraints
 
 The implementation plan must preserve testable boundaries and should be divided into stages that
-leave the repository in a working state. The sequence must begin with the isolated `codex`
+leave the repository in a working state. The sequence must begin with the isolated `rsb`
 namespace and a test harness, then establish identity and durable state, remote journaling,
 incremental reconciliation, transport, lifecycle, shell integration, and finally real-host
 acceptance.
@@ -758,7 +758,7 @@ Decision: `.git/` is a built-in ignore. Git operations are local-only.
 Consequence: Git maintenance cannot corrupt the sync state. The remote tree is a compute replica,
 not an independently managed Git repository.
 
-### ADR-007: Isolate the redesign as `codex-rsb`
+### ADR-007: Isolate the redesign as `rsb`
 
 Status: Accepted
 

@@ -97,7 +97,6 @@ def test_real_watchdog_never_emits_hard_ignored_metadata(tmp_path: Path) -> None
     ignored_directories = [
         root / ".git",
         root / ".remote-sandbox",
-        root / ".codex-remote-sandbox",
     ]
     for directory in ignored_directories:
         directory.mkdir()

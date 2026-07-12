@@ -131,8 +131,8 @@ def test_default_services_adapters_use_isolated_runtime_boundaries(
     runtime = tmp_path / "runtime"
     local = tmp_path / "local"
     local.mkdir()
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(state_home))
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(state_home))
+    monkeypatch.setenv("REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
     record = BindingRecord(
         "dq",
         "00000000-0000-4000-8000-000000000180",
@@ -225,7 +225,7 @@ def test_default_stop_adapter_reports_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(tmp_path / "state"))
     services = cli.default_cli_services()
     record = BindingRecord(
         "dq",

@@ -32,14 +32,11 @@ from .store import (
 )
 from .watcher import WatcherService, snapshot_entries
 
-_HOME_ENV = "CODEX_REMOTE_SANDBOX_HOME"
-_HOME_DIRNAME = ".codex-remote-sandbox"
-_RUNTIME_ENV = "CODEX_REMOTE_SANDBOX_RUNTIME_DIR"
-_RUNTIME_PREFIX = "codex-remote-sandbox"
-_INSTALLED_HOME_ENV = "REMOTE_SANDBOX_HOME"
-_INSTALLED_RUNTIME_ENV = "REMOTE_SANDBOX_RUNTIME_DIR"
-_INSTALLED_CONTROL_ENV = "REMOTE_SANDBOX_CONTROL_DIR"
-_INSTALLED_RUNTIME_PREFIX = "remote-sandbox"
+_HOME_ENV = "REMOTE_SANDBOX_HOME"
+_HOME_DIRNAME = ".remote-sandbox"
+_RUNTIME_ENV = "REMOTE_SANDBOX_RUNTIME_DIR"
+_RUNTIME_PREFIX = "remote-sandbox"
+_CONTROL_ENV = "REMOTE_SANDBOX_CONTROL_DIR"
 _EVENT_BATCH_SIZE = 256
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -54,7 +51,7 @@ def _archive_sha256() -> str:
 
 def main(argv: list[str]) -> int:
     if argv == ["self-check"]:
-        print("codex-remote-sandbox-agent " + AGENT_VERSION + " " + _archive_sha256())
+        print("remote-sandbox-agent " + AGENT_VERSION + " " + _archive_sha256())
         return 0
     if len(argv) == 4 and argv[0] == "_watch":
         return _run_watcher(argv[1], Path(argv[2]), argv[3])
@@ -669,27 +666,20 @@ def _workspace_directory(home: Path, workspace_id: str) -> Path:
 
 def _validate_registration_root(root: Path) -> Path:
     canonical = validate_workspace_root(root, home=Path.home())
-    for state_root in _installed_rsb_state_roots():
+    for state_root in _protected_state_roots():
         if canonical == state_root or state_root in canonical.parents:
-            raise ValueError("workspace root cannot use installed rsb state")
+            raise ValueError("workspace root cannot use remote-sandbox state")
     return canonical
 
 
-def _installed_rsb_state_roots() -> tuple[Path, ...]:
-    default_runtime = Path("/tmp") / f"{_INSTALLED_RUNTIME_PREFIX}-{os.getuid()}"
-    candidates = [Path.home() / ".remote-sandbox", default_runtime]
-    configured_home = os.environ.get(_INSTALLED_HOME_ENV)
-    configured_runtime = os.environ.get(_INSTALLED_RUNTIME_ENV)
-    configured_control = os.environ.get(_INSTALLED_CONTROL_ENV)
+def _protected_state_roots() -> tuple[Path, ...]:
+    candidates = [_remote_home(), _runtime_root_path()]
+    configured_control = os.environ.get(_CONTROL_ENV)
     xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
-    if configured_home:
-        candidates.append(Path(configured_home))
-    if configured_runtime:
-        candidates.append(Path(configured_runtime))
     if configured_control:
         candidates.append(Path(configured_control))
     if xdg_runtime:
-        candidates.append(Path(xdg_runtime) / _INSTALLED_RUNTIME_PREFIX)
+        candidates.append(Path(xdg_runtime) / _RUNTIME_PREFIX)
     return tuple(dict.fromkeys(_canonical_state_boundary(path) for path in candidates))
 
 
@@ -1034,7 +1024,7 @@ def _expect_relative_paths(payload: dict[str, Any], key: str) -> list[str]:
             or item.startswith("/")
             or "\\" in item
             or any(part in {"", ".", ".."} for part in parts)
-            or any(part in {".git", ".remote-sandbox", ".codex-remote-sandbox"} for part in parts)
+            or any(part in {".git", ".remote-sandbox"} for part in parts)
             or any(ord(character) < 32 or ord(character) == 127 for character in item)
         ):
             raise ValueError(f"invalid relative path: {item}")

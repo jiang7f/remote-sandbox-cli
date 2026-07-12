@@ -36,7 +36,7 @@ class TerminalState:
 
 
 class PtyShell:
-    """Small deadline-based PTY driver for one real `codex-rsb enter` session."""
+    """Small deadline-based PTY driver for one real `rsb enter` session."""
 
     def __init__(self, fixture: SshFixture, *, password: bool = False) -> None:
         self._fixture = fixture
@@ -71,7 +71,7 @@ class PtyShell:
     def connect(self, *, remote: Path, local: Path, name: str) -> None:
         command = shlex.join(
             (
-                "codex-rsb",
+                "rsb",
                 "connect",
                 "--remote",
                 str(remote),
@@ -84,7 +84,7 @@ class PtyShell:
         started = time.monotonic()
         output_start = len(self._output)
         self._send(command.encode() + b"\n")
-        self._wait_for(b"[codex:", timeout=20.0, start=output_start)
+        self._wait_for(b"[", timeout=20.0, start=output_start)
         if self.first_sync_status_at == float("inf"):
             self.first_sync_status_at = time.monotonic()
         if self.first_sync_status_at < started:
@@ -95,7 +95,7 @@ class PtyShell:
         local = self._fixture.local_workspace()
         command = shlex.join(
             (
-                "codex-rsb",
+                "rsb",
                 "connect",
                 "--remote",
                 str(remote),
@@ -205,7 +205,7 @@ class PtyShell:
 
     def foreground_probe_received_private_redraw(self) -> bool:
         self._wait_for(b"__E2E_FOREGROUND__", timeout=10.0, start=self._foreground_start)
-        self._wait_for(b"[codex:", timeout=10.0, start=self._foreground_start)
+        self._wait_for(b"[", timeout=10.0, start=self._foreground_start)
         match = re.search(
             rb"__E2E_FOREGROUND__([0-9a-f]*)",
             bytes(self._output[self._foreground_start :]),
@@ -245,9 +245,9 @@ class PtyShell:
     def _install_terminal_probe(self) -> None:
         binding = (
             '"\\C-x\\C-o":'
-            '__codex_e2e_line=$(printf %s "$READLINE_LINE" | base64 | tr -d "\\n"); '
+            '__rsb_e2e_line=$(printf %s "$READLINE_LINE" | base64 | tr -d "\\n"); '
             'printf "\\n__E2E_TERMINAL__%s:%s:%s\\n" '
-            '"$__codex_e2e_line" "$READLINE_POINT" "$$"'
+            '"$__rsb_e2e_line" "$READLINE_POINT" "$$"'
         )
         start = len(self._output)
         self._send(f"bind -x {shlex.quote(binding)}\n".encode())
@@ -457,20 +457,20 @@ class SshFixture:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes((f"{index:012d}".encode() * 11)[:128])
 
-    def create_production_state_sentinel(self, content: bytes) -> Path:
-        path = self._tmp_path / "production-state" / ".remote-sandbox" / "sentinel"
+    def create_local_state_sentinel(self, content: bytes) -> Path:
+        path = self.state_home / "sentinel"
         path.parent.mkdir(parents=True)
         path.write_bytes(content)
         return path
 
-    def create_remote_production_state_sentinel(self, content: bytes) -> Path:
+    def create_remote_state_sentinel(self, content: bytes) -> Path:
         path = Path("/home/test/.remote-sandbox/sentinel")
         self.write_remote(path, content)
         return path
 
     def remote_metadata_path(self, name: str) -> Path:
         workspace_id = self._workspace_id(name)
-        return Path(f"/home/test/.codex-remote-sandbox/workspaces/{workspace_id}")
+        return Path(f"/home/test/.remote-sandbox/workspaces/{workspace_id}")
 
     def local_metadata_path(self, name: str) -> Path:
         return self.state_home / "workspaces" / self._workspace_id(name)
@@ -833,18 +833,17 @@ def _cleanup_failed_ssh_fixture_startup(
 def start_ssh_fixture(tmp_path: Path) -> SshFixture:
     docker = shutil.which("docker")
     if docker is None:
-        if os.environ.get("CODEX_E2E_REQUIRED") == "1":
-            raise RuntimeError("Docker is required because CODEX_E2E_REQUIRED=1")
+        if os.environ.get("RSB_E2E_REQUIRED") == "1":
+            raise RuntimeError("Docker is required because RSB_E2E_REQUIRED=1")
         pytest.skip("Docker is unavailable. SSH E2E requires the disposable Ubuntu fixture")
     ssh_executable = shutil.which("ssh")
     if ssh_executable is None:
         raise RuntimeError("OpenSSH is required for SSH E2E")
-    image = f"codex-rsb-e2e:{uuid.uuid4().hex}"
+    image = f"rsb-e2e:{uuid.uuid4().hex}"
     key_file = tmp_path / "client-key"
     home = tmp_path / "home"
-    state_home = tmp_path / "codex-state"
-    runtime = tmp_path / "codex-runtime"
-    production_home = tmp_path / "production-state"
+    state_home = tmp_path / "rsb-state"
+    runtime = tmp_path / "rsb-runtime"
     container_id = ""
     try:
         subprocess.run(
@@ -911,22 +910,20 @@ def start_ssh_fixture(tmp_path: Path) -> SshFixture:
             {
                 **os.environ,
                 "HOME": str(home),
-                "CODEX_REMOTE_SANDBOX_HOME": str(state_home),
-                "CODEX_REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
-                "REMOTE_SANDBOX_HOME": str(production_home / ".remote-sandbox"),
-                "REMOTE_SANDBOX_RUNTIME_DIR": str(production_home / "runtime"),
-                "REMOTE_SANDBOX_CONTROL_DIR": str(production_home / "control"),
+                "REMOTE_SANDBOX_HOME": str(state_home),
+                "REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
+                "REMOTE_SANDBOX_CONTROL_DIR": str(runtime / "control"),
             },
             ssh_wrapper,
         )
-        executable = Path(sys.executable).with_name("codex-rsb")
+        executable = Path(sys.executable).with_name("rsb")
         if not executable.is_file():
-            raise RuntimeError(f"development CLI is unavailable at {executable}")
+            raise RuntimeError(f"rsb CLI is unavailable at {executable}")
         fixture = SshFixture(
             container_id=container_id,
             image=image,
-            host="codex-e2e-key",
-            password_host="codex-e2e-password",
+            host="rsb-e2e-key",
+            password_host="rsb-e2e-password",
             port=port,
             key_file=key_file,
             state_home=state_home,
@@ -949,7 +946,6 @@ def start_ssh_fixture(tmp_path: Path) -> SshFixture:
                 state_home,
                 runtime,
                 home,
-                production_home,
             ),
         )
         if cleanup_failures:
@@ -1002,10 +998,10 @@ def _ssh_config(*, port: int, key_file: Path) -> str:
         "  IdentitiesOnly yes\n"
     )
     return (
-        "Host codex-e2e-key\n"
+        "Host rsb-e2e-key\n"
         + common
         + f"  IdentityFile {key_file}\n"
-        + "Host codex-e2e-password\n"
+        + "Host rsb-e2e-password\n"
         + common
         + "  IdentityFile none\n"
         + "  PubkeyAuthentication no\n"

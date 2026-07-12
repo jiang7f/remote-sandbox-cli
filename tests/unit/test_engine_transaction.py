@@ -11,6 +11,7 @@ from remote_sandbox.manifest import EntryFingerprint, EntryKind, MissingEntry, f
 from remote_sandbox.placeholder import PlaceholderMetadata, encode_placeholder
 from remote_sandbox.policy import StaticPolicyEngine
 from remote_sandbox.state import WorkspaceStore
+from remote_sandbox.status import WorkspacePhase, WorkspaceStatus
 from remote_sandbox.transport import (
     TransferBatch,
     TransferDirection,
@@ -54,6 +55,52 @@ def test_expected_destination_event_is_acknowledged_as_echo(
     second = engine_fixture.engine.run_once("remote-watch")
     assert second.transferred == ()
     assert second.echoes == ("a.py",)
+
+
+def test_echo_only_cycle_does_not_publish_transient_syncing(
+    engine_fixture: EngineHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine_fixture.append_local_modify("a.py", b"new")
+    engine_fixture.engine.run_once("watcher")
+    engine_fixture.append_remote_event_for_current_fingerprint("a.py")
+    observed: list[WorkspaceStatus] = []
+    original = WorkspaceStore.set_status
+
+    def record_status(store: WorkspaceStore, status: WorkspaceStatus) -> None:
+        if store is engine_fixture.store:
+            observed.append(status)
+        original(store, status)
+
+    monkeypatch.setattr(WorkspaceStore, "set_status", record_status)
+
+    result = engine_fixture.engine.run_once("remote-watch")
+
+    assert result.echoes == ("a.py",)
+    assert observed
+    assert all(status.phase is not WorkspacePhase.SYNCING for status in observed)
+
+
+def test_initial_replay_never_publishes_ready_before_coordinator_finishes(
+    engine_fixture: EngineHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine_fixture.append_local_modify("a.py", b"new")
+    observed: list[WorkspaceStatus] = []
+    original = WorkspaceStore.set_status
+
+    def record_status(store: WorkspaceStore, status: WorkspaceStatus) -> None:
+        if store is engine_fixture.store:
+            observed.append(status)
+        original(store, status)
+
+    monkeypatch.setattr(WorkspaceStore, "set_status", record_status)
+
+    engine_fixture.engine.run_once("initial-replay")
+
+    assert observed
+    assert {status.phase for status in observed} == {WorkspacePhase.INITIAL_SYNCING}
+    assert {status.progress.stage for status in observed} == {"replaying"}
 
 
 def test_differing_remote_event_is_not_suppressed_as_an_echo(

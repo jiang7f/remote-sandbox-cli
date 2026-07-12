@@ -1503,7 +1503,7 @@ def make_daemon_pair(tmp_path: Path) -> DaemonPairHarness:
     runtime = SupervisorRuntime(
         "00000000-0000-4000-8000-000000000113",
         metadata_root,
-        Path("/tmp") / f"codex-rsb-process-{runtime_key}",
+        Path("/tmp") / f"rsb-process-{runtime_key}",
     )
     runtime.pidfile.unlink(missing_ok=True)
     runtime.socket.unlink(missing_ok=True)

@@ -13,7 +13,7 @@ from remote_sandbox.workspace import (
 
 
 def test_workspace_paths_live_outside_working_tree(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(tmp_path / "home"))
     local_root = tmp_path / "project"
     local_root.mkdir()
     spec = new_workspace_spec(
@@ -30,14 +30,14 @@ def test_workspace_paths_live_outside_working_tree(monkeypatch, tmp_path: Path) 
     assert paths.state_db == paths.root / "state.sqlite3"
     assert paths.daemon_log == paths.root / "daemon.log"
     assert not (local_root / ".remote-sandbox").exists()
-    assert not (local_root / ".codex-remote-sandbox").exists()
+    assert not (local_root / ".remote-sandbox").exists()
 
 
 def test_workspace_metadata_is_created_with_user_only_permissions(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(tmp_path / "home"))
     local_root = tmp_path / "project"
     local_root.mkdir()
     spec = new_workspace_spec(
@@ -73,7 +73,7 @@ def test_workspace_spec_round_trips_through_atomic_toml(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(tmp_path / "home"))
     spec = WorkspaceSpec(
         schema_version=1,
         workspace_id="00000000-0000-4000-8000-000000000001",

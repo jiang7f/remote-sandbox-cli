@@ -33,7 +33,7 @@ def test_structured_python_call_sends_payload_only_on_stdin(
 
     result = SubprocessSshRunner().run_python_file_bytes(
         "example-host",
-        "~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        "~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
         payload,
     )
 
@@ -120,7 +120,7 @@ def test_streaming_python_call_writes_request_and_leaves_stdout_open(
 
     returned = SubprocessSshRunner().stream_python_file(
         "example-host",
-        "~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        "~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
         payload,
     )
 
@@ -148,7 +148,7 @@ def test_streaming_python_call_cleans_up_partial_pipes_and_reaps_process(
     with pytest.raises(ssh_module.SshError, match="did not create pipes"):
         SubprocessSshRunner().stream_python_file(
             "example-host",
-            "~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+            "~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
             b"{}\n",
         )
 
@@ -173,7 +173,7 @@ def test_streaming_python_call_cleans_up_and_reaps_after_stdin_write_failure(
     with pytest.raises(OSError, match="stdin write failed"):
         SubprocessSshRunner().stream_python_file(
             "example-host",
-            "~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+            "~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
             b"{}\n",
         )
 
@@ -185,12 +185,12 @@ def test_streaming_python_call_cleans_up_and_reaps_after_stdin_write_failure(
     assert process.wait_calls == [1.0]
 
 
-def test_control_path_uses_isolated_codex_runtime_namespace(
+def test_control_path_uses_isolated_rsb_runtime_namespace(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    runtime = tmp_path / "codex-remote-sandbox-123"
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    runtime = tmp_path / "remote-sandbox-123"
+    monkeypatch.setenv("REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
     monkeypatch.setenv("REMOTE_SANDBOX_CONTROL_DIR", str(tmp_path / "installed-rsb"))
 
     options = ssh_control_opts()

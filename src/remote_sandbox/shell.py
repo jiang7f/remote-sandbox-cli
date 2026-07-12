@@ -303,6 +303,7 @@ def display_label(target: str) -> str:
 def build_managed_remote_shell_command(target: str, cwd: str, *, nonce: str) -> list[str]:
     validate_target(target)
     validate_remote_path(cwd)
+    prompt_slot = _prompt_slot_sentinel(nonce)
     script = (
         "p=$1\n"
         "label=$2\n"
@@ -325,7 +326,8 @@ def build_managed_remote_shell_command(target: str, cwd: str, *, nonce: str) -> 
         "  local s=$?\n"
         "  printf '\\033]777;remote-sandbox;cmd-done;%s;%s\\007' "
         "\"$__rsb_nonce\" \"$s\"\n"
-        "  PS1='\\[\\e[01;36m\\][${RSB_DISPLAY_LABEL}]\\[\\e[00m\\] "
+        "  PS1='\\[\\e]777;rsb;prompt;${__rsb_nonce};managed\\a\\]"
+        f"\\[\\e[01;36m\\]{prompt_slot}\\[\\e[00m\\] "
         "${CONDA_PROMPT_MODIFIER}\\[\\e[01;32m\\]${USER:-user}@\\h\\[\\e[00m\\]:"
         "\\[\\e[01;34m\\]\\W\\[\\e[00m\\] % '\n"
         "}\n"
@@ -365,62 +367,62 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         '  "~/"*) p=$HOME/${p#"~/"} ;;\n'
         "esac\n"
         'cd -- "$p" || exit\n'
-        "export CODEX_RSB_DISPLAY_LABEL=$label\n"
+        "export RSB_DISPLAY_LABEL=$label\n"
         "if command -v bash >/dev/null 2>&1; then\n"
         "  umask 077\n"
-        "  rc=$(mktemp \"${TMPDIR:-/tmp}/codex-rsb-enter-rc.XXXXXX\") || exit 2\n"
+        "  rc=$(mktemp \"${TMPDIR:-/tmp}/rsb-enter-rc.XXXXXX\") || exit 2\n"
         "  {\n"
-        "    printf '__codex_nonce=%s\\n' \"$nonce\"\n"
+        "    printf '__rsb_nonce=%s\\n' \"$nonce\"\n"
         "    cat <<'EOF'\n"
         "if [ -f /etc/bash.bashrc ]; then . /etc/bash.bashrc; fi\n"
         "if [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n"
-        "__codex_prompt_mode=enter\n"
-        "__codex_workspace_holding=\n"
-        "__codex_workspace_pending_root=\n"
-        "__codex_live_ps1='\\[\\e]777;codex-rsb;prompt;${__codex_nonce};managed\\a\\]"
+        "__rsb_prompt_mode=enter\n"
+        "__rsb_workspace_holding=\n"
+        "__rsb_workspace_pending_root=\n"
+        "__rsb_live_ps1='\\[\\e]777;rsb;prompt;${__rsb_nonce};managed\\a\\]"
         f"\\[\\e[01;36m\\]{prompt_slot}\\[\\e[00m\\] "
         "${CONDA_PROMPT_MODIFIER}\\[\\e[01;32m\\]${USER:-user}@\\h"
         "\\[\\e[00m\\]:\\[\\e[01;34m\\]\\W\\[\\e[00m\\] % '\n"
-        "codex-rsb() {\n"
+        "rsb() {\n"
         "  if [ \"${1:-}\" = connect ]; then\n"
         "    shift\n"
-        "    local __codex_remote=\"\"\n"
-        "    local __codex_local=\"\"\n"
-        "    local __codex_name=\"\"\n"
-        "    local __codex_payload=\"\"\n"
-        "    local __codex_response=\"\"\n"
-        "    local __codex_status=\"\"\n"
-        "    local __codex_workspace_id=\"\"\n"
-        "    local __codex_workspace_name=\"\"\n"
-        "    local __codex_workspace_root=\"\"\n"
-        "    local __codex_direction=\"\"\n"
+        "    local __rsb_remote=\"\"\n"
+        "    local __rsb_local=\"\"\n"
+        "    local __rsb_name=\"\"\n"
+        "    local __rsb_payload=\"\"\n"
+        "    local __rsb_response=\"\"\n"
+        "    local __rsb_status=\"\"\n"
+        "    local __rsb_workspace_id=\"\"\n"
+        "    local __rsb_workspace_name=\"\"\n"
+        "    local __rsb_workspace_root=\"\"\n"
+        "    local __rsb_direction=\"\"\n"
         "    while [ \"$#\" -gt 0 ]; do\n"
         "      case \"$1\" in\n"
         "        -r|--remote)\n"
         "          if [ \"$#\" -lt 2 ]; then\n"
-        "            printf 'usage: codex-rsb connect [--remote remote-path] "
+        "            printf 'usage: rsb connect [--remote remote-path] "
         "[--local local-path] [--name name]\\n' >&2\n"
         "            return 2\n"
         "          fi\n"
-        "          __codex_remote=$2\n"
+        "          __rsb_remote=$2\n"
         "          shift 2\n"
         "          ;;\n"
         "        --name)\n"
         "          if [ \"$#\" -lt 2 ]; then\n"
-        "            printf 'usage: codex-rsb connect [--remote remote-path] "
+        "            printf 'usage: rsb connect [--remote remote-path] "
         "[--local local-path] [--name name]\\n' >&2\n"
         "            return 2\n"
         "          fi\n"
-        "          __codex_name=$2\n"
+        "          __rsb_name=$2\n"
         "          shift 2\n"
         "          ;;\n"
         "        -l|--local)\n"
         "          if [ \"$#\" -lt 2 ]; then\n"
-        "            printf 'usage: codex-rsb connect [--remote remote-path] "
+        "            printf 'usage: rsb connect [--remote remote-path] "
         "[--local local-path] [--name name]\\n' >&2\n"
         "            return 2\n"
         "          fi\n"
-        "          __codex_local=$2\n"
+        "          __rsb_local=$2\n"
         "          shift 2\n"
         "          ;;\n"
         "        --)\n"
@@ -428,120 +430,120 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "          break\n"
         "          ;;\n"
         "        -*)\n"
-        "          printf 'usage: codex-rsb connect [--remote remote-path] "
+        "          printf 'usage: rsb connect [--remote remote-path] "
         "[--local local-path] [--name name]\\n' >&2\n"
         "          return 2\n"
         "          ;;\n"
         "        *)\n"
-        "          if [ -n \"$__codex_remote\" ]; then\n"
-        "            printf 'usage: codex-rsb connect [--remote remote-path] "
+        "          if [ -n \"$__rsb_remote\" ]; then\n"
+        "            printf 'usage: rsb connect [--remote remote-path] "
         "[--local local-path] [--name name]\\n' >&2\n"
         "            return 2\n"
         "          fi\n"
-        "          __codex_remote=$1\n"
+        "          __rsb_remote=$1\n"
         "          shift\n"
         "          ;;\n"
         "      esac\n"
         "    done\n"
         "    if [ \"$#\" -gt 0 ]; then\n"
-        "      printf 'usage: codex-rsb connect [--remote remote-path] "
+        "      printf 'usage: rsb connect [--remote remote-path] "
         "[--local local-path] [--name name]\\n' >&2\n"
         "      return 2\n"
         "    fi\n"
-        "    if [ -z \"$__codex_remote\" ]; then\n"
-        "      __codex_remote=$PWD\n"
+        "    if [ -z \"$__rsb_remote\" ]; then\n"
+        "      __rsb_remote=$PWD\n"
         "    fi\n"
-        "    case \"$__codex_remote\" in\n"
-        "      '~') __codex_remote=$HOME ;;\n"
-        "      '~/'*) __codex_remote=$HOME/${__codex_remote#'~/'} ;;\n"
+        "    case \"$__rsb_remote\" in\n"
+        "      '~') __rsb_remote=$HOME ;;\n"
+        "      '~/'*) __rsb_remote=$HOME/${__rsb_remote#'~/'} ;;\n"
         "      /*) ;;\n"
-        "      *) __codex_remote=$PWD/$__codex_remote ;;\n"
+        "      *) __rsb_remote=$PWD/$__rsb_remote ;;\n"
         "    esac\n"
-        "    if [ -d \"$__codex_remote\" ]; then\n"
-        "      __codex_remote=$(cd -- \"$__codex_remote\" && pwd -P) || return\n"
+        "    if [ -d \"$__rsb_remote\" ]; then\n"
+        "      __rsb_remote=$(cd -- \"$__rsb_remote\" && pwd -P) || return\n"
         "    fi\n"
-        "    __codex_payload=$(python3 -c 'import base64,json,sys; "
+        "    __rsb_payload=$(python3 -c 'import base64,json,sys; "
         "data={\"remote\":sys.argv[1],\"local\":sys.argv[2] or None,"
         "\"name\":sys.argv[3] or None}; "
         "print(base64.b64encode(json.dumps(data,separators=(\",\",\":\")).encode()).decode())' "
-        "\"$__codex_remote\" \"$__codex_local\" \"$__codex_name\") || return\n"
-        "    __codex_response=$(\n"
-        "      __codex_stty=$(stty -g) || exit 1\n"
-        "      trap 'stty \"$__codex_stty\" >/dev/null 2>&1' EXIT\n"
+        "\"$__rsb_remote\" \"$__rsb_local\" \"$__rsb_name\") || return\n"
+        "    __rsb_response=$(\n"
+        "      __rsb_stty=$(stty -g) || exit 1\n"
+        "      trap 'stty \"$__rsb_stty\" >/dev/null 2>&1' EXIT\n"
         "      trap 'exit 130' HUP INT TERM\n"
         "      stty -echo || exit 1\n"
-        "      printf '\\033]777;codex-rsb;connect-request;%s;b64:%s\\007' "
-        "\"$__codex_nonce\" \"$__codex_payload\" > /dev/tty\n"
-        "      IFS= read -r __codex_response\n"
-        "      __codex_read_status=$?\n"
-        "      printf '%s' \"$__codex_response\"\n"
-        "      exit \"$__codex_read_status\"\n"
+        "      printf '\\033]777;rsb;connect-request;%s;b64:%s\\007' "
+        "\"$__rsb_nonce\" \"$__rsb_payload\" > /dev/tty\n"
+        "      IFS= read -r __rsb_response\n"
+        "      __rsb_read_status=$?\n"
+        "      printf '%s' \"$__rsb_response\"\n"
+        "      exit \"$__rsb_read_status\"\n"
         "    )\n"
         "    if [ \"$?\" -ne 0 ]; then\n"
-        "      printf 'codex-rsb: binding response cancelled\\n' >&2\n"
+        "      printf 'rsb: binding response cancelled\\n' >&2\n"
         "      return 1\n"
         "    fi\n"
-        "    case \"$__codex_response\" in\n"
+        "    case \"$__rsb_response\" in\n"
         "      error$'\\t'*)\n"
-        "        printf 'codex-rsb: %s\\n' \"${__codex_response#*$'\\t'}\" >&2\n"
+        "        printf 'rsb: %s\\n' \"${__rsb_response#*$'\\t'}\" >&2\n"
         "        return 1\n"
         "        ;;\n"
         "      ok$'\\t'*)\n"
-        "        IFS=$'\\t' read -r __codex_status __codex_workspace_id "
-        "__codex_workspace_name __codex_workspace_root __codex_direction "
-        "<<< \"$__codex_response\"\n"
+        "        IFS=$'\\t' read -r __rsb_status __rsb_workspace_id "
+        "__rsb_workspace_name __rsb_workspace_root __rsb_direction "
+        "<<< \"$__rsb_response\"\n"
         "        ;;\n"
         "      *)\n"
-        "        printf 'codex-rsb: invalid binding response\\n' >&2\n"
+        "        printf 'rsb: invalid binding response\\n' >&2\n"
         "        return 1\n"
         "        ;;\n"
         "    esac\n"
-        "    if [ \"$__codex_status\" != ok ] || "
-        "[ -z \"$__codex_workspace_id\" ] || [ -z \"$__codex_workspace_name\" ] || "
-        "[ -z \"$__codex_workspace_root\" ]; then\n"
-        "      printf 'codex-rsb: invalid binding response\\n' >&2\n"
+        "    if [ \"$__rsb_status\" != ok ] || "
+        "[ -z \"$__rsb_workspace_id\" ] || [ -z \"$__rsb_workspace_name\" ] || "
+        "[ -z \"$__rsb_workspace_root\" ]; then\n"
+        "      printf 'rsb: invalid binding response\\n' >&2\n"
         "      return 1\n"
         "    fi\n"
-        "    case \"$__codex_direction\" in\n"
+        "    case \"$__rsb_direction\" in\n"
         "      local-to-remote|remote-to-local|empty) ;;\n"
         "      *)\n"
-        "        printf 'codex-rsb: invalid binding response\\n' >&2\n"
+        "        printf 'rsb: invalid binding response\\n' >&2\n"
         "        return 1\n"
         "        ;;\n"
         "    esac\n"
-        "    export CODEX_RSB_WORKSPACE_ID=$__codex_workspace_id\n"
-        "    export CODEX_RSB_WORKSPACE_NAME=$__codex_workspace_name\n"
-        "    export CODEX_RSB_WORKSPACE_ROOT=$__codex_workspace_root\n"
-        "    __codex_prompt_mode=managed\n"
-        "    if [ \"$__codex_direction\" = local-to-remote ]; then\n"
+        "    export RSB_WORKSPACE_ID=$__rsb_workspace_id\n"
+        "    export RSB_WORKSPACE_NAME=$__rsb_workspace_name\n"
+        "    export RSB_WORKSPACE_ROOT=$__rsb_workspace_root\n"
+        "    __rsb_prompt_mode=managed\n"
+        "    if [ \"$__rsb_direction\" = local-to-remote ]; then\n"
         "      cd -- \"$HOME\" || return 1\n"
-        "      __codex_workspace_holding=$PWD\n"
-        "      __codex_workspace_pending_root=$__codex_workspace_root\n"
+        "      __rsb_workspace_holding=$PWD\n"
+        "      __rsb_workspace_pending_root=$__rsb_workspace_root\n"
         "    else\n"
-        "      cd -- \"$__codex_workspace_root\" || return 1\n"
-        "      __codex_workspace_holding=\n"
-        "      __codex_workspace_pending_root=\n"
+        "      cd -- \"$__rsb_workspace_root\" || return 1\n"
+        "      __rsb_workspace_holding=\n"
+        "      __rsb_workspace_pending_root=\n"
         "    fi\n"
         "    return 0\n"
         "  fi\n"
-        "  command codex-rsb \"$@\"\n"
+        "  command rsb \"$@\"\n"
         "}\n"
-        "__codex_rsb_publish_ready() {\n"
-        "  if [ -n \"$__codex_workspace_pending_root\" ] && "
-        "[ \"$PWD\" = \"$__codex_workspace_holding\" ]; then\n"
-        "    cd -- \"$__codex_workspace_pending_root\" || return 1\n"
+        "__rsb_publish_ready() {\n"
+        "  if [ -n \"$__rsb_workspace_pending_root\" ] && "
+        "[ \"$PWD\" = \"$__rsb_workspace_holding\" ]; then\n"
+        "    cd -- \"$__rsb_workspace_pending_root\" || return 1\n"
         "  fi\n"
-        "  __codex_workspace_holding=\n"
-        "  __codex_workspace_pending_root=\n"
+        "  __rsb_workspace_holding=\n"
+        "  __rsb_workspace_pending_root=\n"
         "}\n"
-        "__codex_rsb_ready_key() {\n"
-        "  local __codex_saved_line=$READLINE_LINE\n"
-        "  local __codex_saved_point=$READLINE_POINT\n"
-        "  __codex_rsb_publish_ready\n"
-        "  READLINE_LINE=$__codex_saved_line\n"
-        "  READLINE_POINT=$__codex_saved_point\n"
+        "__rsb_ready_key() {\n"
+        "  local __rsb_saved_line=$READLINE_LINE\n"
+        "  local __rsb_saved_point=$READLINE_POINT\n"
+        "  __rsb_publish_ready\n"
+        "  READLINE_LINE=$__rsb_saved_line\n"
+        "  READLINE_POINT=$__rsb_saved_point\n"
         "}\n"
-        "bind -x '\"\\C-x\\C-]\": __codex_rsb_ready_key'\n"
+        "bind -x '\"\\C-x\\C-]\": __rsb_ready_key'\n"
         "bind '\"\\e[777~\": redraw-current-line'\n"
         "bind -m emacs-standard '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
         "bind -m emacs-meta '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
@@ -549,23 +551,23 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "bind -m vi-command '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
         "bind -m vi-move '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
         "bind -m vi '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
-        "__codex_enter_prompt() {\n"
-        "  if [ \"$__codex_prompt_mode\" = managed ]; then\n"
-        "    PS1=$__codex_live_ps1\n"
+        "__rsb_enter_prompt() {\n"
+        "  if [ \"$__rsb_prompt_mode\" = managed ]; then\n"
+        "    PS1=$__rsb_live_ps1\n"
         "  else\n"
-        "    PS1='\\[\\e]777;codex-rsb;prompt;${__codex_nonce};enter\\a\\]"
-        "\\[\\e[01;33m\\][${CODEX_RSB_DISPLAY_LABEL}:enter]\\[\\e[00m\\] "
+        "    PS1='\\[\\e]777;rsb;prompt;${__rsb_nonce};enter\\a\\]"
+        "\\[\\e[01;33m\\][${RSB_DISPLAY_LABEL}:enter]\\[\\e[00m\\] "
         "${CONDA_PROMPT_MODIFIER}\\[\\e[01;32m\\]${USER:-user}@\\h\\[\\e[00m\\]:"
         "\\[\\e[01;34m\\]\\W\\[\\e[00m\\] % '\n"
         "  fi\n"
         "}\n"
-        "PROMPT_COMMAND=__codex_enter_prompt\n"
+        "PROMPT_COMMAND=__rsb_enter_prompt\n"
         "trap 'rm -f \"${BASH_SOURCE[0]}\"' EXIT\n"
         "EOF\n"
         "  } > \"$rc\"\n"
         "  exec bash --noprofile --rcfile \"$rc\" -i\n"
         "fi\n"
-        'printf "codex-rsb enter requires bash on the remote host\\n" >&2\n'
+        'printf "rsb enter requires bash on the remote host\\n" >&2\n'
         "exit 127\n"
     )
     remote_command = " ".join(
@@ -586,9 +588,9 @@ class ShellOutputParser:
     def __init__(self, nonce: str) -> None:
         self._cmd_done_prefix = f"\x1b]777;remote-sandbox;cmd-done;{nonce};".encode()
         self._connect_request_prefix = (
-            f"\x1b]777;codex-rsb;connect-request;{nonce};".encode()
+            f"\x1b]777;rsb;connect-request;{nonce};".encode()
         )
-        self._prompt_prefix = f"\x1b]777;codex-rsb;prompt;{nonce}".encode()
+        self._prompt_prefix = f"\x1b]777;rsb;prompt;{nonce}".encode()
         self._slot_prefix = _prompt_slot_sentinel(nonce).encode("ascii")
         self._prefixes = (
             self._cmd_done_prefix,
@@ -717,11 +719,22 @@ def managed_shell_loop(
     *,
     nonce: str,
     on_barrier: Callable[[int], None],
+    name: str | None = None,
+    workspace_id: str | None = None,
     backend: ShellBackend | None = None,
 ) -> int:
     argv = build_managed_remote_shell_command(target, cwd, nonce=nonce)
-    shell_backend = backend or _pty_shell_backend
-    return shell_backend(argv, nonce, on_barrier)
+    if backend is not None:
+        return backend(argv, nonce, on_barrier)
+    return _pty_enter_shell_backend(
+        argv,
+        nonce,
+        lambda _event: ConnectResponse(ok=False, error="workspace is already connected"),
+        target=display_label(target),
+        initial_name=name,
+        initial_status_probe=_status_probe_for_workspace(workspace_id),
+        on_barrier=on_barrier,
+    )
 
 
 def enter_shell_loop(
@@ -809,13 +822,16 @@ def _pty_enter_shell_backend(
     on_connect_request: ConnectRequestHandler,
     *,
     target: str = "host",
+    initial_name: str | None = None,
+    initial_status_probe: StatusProbe | None = None,
+    on_barrier: Callable[[int], None] | None = None,
 ) -> int:
     pid, master_fd = pty.fork()
     if pid == 0:
         os.execvp(argv[0], argv)
     parser = ShellOutputParser(nonce)
     ready_probe: ReadyProbe | None = None
-    status_probe: StatusProbe | None = None
+    status_probe = initial_status_probe
     ready_probe_generation = 0
     ready_probe_worker = _ReadyProbeWorker()
     ready_latched = False
@@ -824,7 +840,7 @@ def _pty_enter_shell_backend(
     next_ready_probe_at = 0.0
     renderer = PromptRenderer()
     redraw = PromptRedrawController()
-    active_name: str | None = None
+    active_name = initial_name
     current_status = WorkspaceStatus(
         WorkspacePhase.INITIAL_SYNCING,
         SyncProgress("scanning"),
@@ -859,6 +875,9 @@ def _pty_enter_shell_backend(
                     for event in parser.feed(data):
                         if isinstance(event, BytesEvent):
                             os.write(sys.stdout.fileno(), event.data)
+                        elif isinstance(event, BarrierEvent):
+                            if on_barrier is not None:
+                                on_barrier(event.status)
                         elif isinstance(event, PromptEvent):
                             at_prompt = True
                             command_running = False
@@ -935,7 +954,7 @@ def _pty_enter_shell_backend(
                         previous_prompt = renderer.render(target, active_name, previous)
                         updated_prompt = renderer.render(target, active_name, updated)
                         current_status = updated
-                        if updated.phase is WorkspacePhase.READY:
+                        if updated.phase is WorkspacePhase.READY and ready_probe is not None:
                             ready_probe = None
                             ready_latched = True
                         if previous_prompt != updated_prompt:
@@ -1111,7 +1130,7 @@ def _prompt_slot_sentinel(nonce: str, width: int = 34) -> str:
     if width < 2:
         raise ValueError("prompt slot width must be at least 2")
     digest = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
-    body = f"codex-slot:{digest}"
+    body = f"rsb-slot:{digest}"
     return "[" + body[: width - 2].ljust(width - 2) + "]"
 
 

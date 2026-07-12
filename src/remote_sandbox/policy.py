@@ -68,8 +68,6 @@ _HARD_IGNORE_PATTERNS = (
     "*/.git/",
     ".remote-sandbox/",
     "*/.remote-sandbox/",
-    ".codex-remote-sandbox/",
-    "*/.codex-remote-sandbox/",
 )
 
 
@@ -148,7 +146,7 @@ class StaticPolicyEngine:
             if _is_placeholder_size_directive(stripped):
                 raise ValueError(
                     "placeholder-size moved to user settings; "
-                    "run `codex-rsb set placeholder-limit 10MB` instead"
+                    "run `rsb set placeholder-limit 10MB` instead"
                 )
             decision, pattern = _parse_rule(stripped, section, line_no)
             rules.append(PolicyRule(decision, pattern))

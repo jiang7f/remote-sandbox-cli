@@ -20,14 +20,14 @@ def test_git_and_control_metadata_cannot_be_reenabled() -> None:
             ".git/**",
             "nested/.git/**",
             ".remote-sandbox/**",
-            ".codex-remote-sandbox/**",
+            ".remote-sandbox/**",
         ]
     )
 
     assert policy.is_ignored(".git/index")
     assert policy.is_ignored("nested/.git/config")
     assert policy.is_ignored(".remote-sandbox/state.sqlite3")
-    assert policy.is_ignored(".codex-remote-sandbox/state.sqlite3")
+    assert policy.is_ignored(".remote-sandbox/state.sqlite3")
 
 
 def test_environment_cache_can_be_explicitly_reenabled() -> None:

@@ -123,7 +123,7 @@ def test_watchdog_events_use_relative_paths(
         ".git/index",
         "nested/.git/config",
         ".remote-sandbox/state.sqlite3",
-        ".codex-remote-sandbox/daemon.log",
+        ".remote-sandbox/daemon.log",
     ],
 )
 def test_hard_ignored_paths_do_not_emit_events(ignored_path: str) -> None:

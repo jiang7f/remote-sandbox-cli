@@ -11,7 +11,7 @@ from types import ModuleType
 
 import pytest
 
-_E2E_FIXTURE_MODULE = "_codex_remote_sandbox_e2e_fixture"
+_E2E_FIXTURE_MODULE = "_rsb_remote_sandbox_e2e_fixture"
 
 
 def _load_e2e_fixture_module() -> ModuleType:
@@ -39,7 +39,7 @@ def test_fixture_contract_loads_sibling_conftest_under_stable_name() -> None:
     expected = Path(__file__).with_name("conftest.py").resolve()
 
     assert Path(e2e.__file__).resolve() == expected
-    assert e2e.__name__ == "_codex_remote_sandbox_e2e_fixture"
+    assert e2e.__name__ == "_rsb_remote_sandbox_e2e_fixture"
 
 
 def test_isolated_ssh_wrapper_forces_fixture_config_and_environment(tmp_path: Path) -> None:
@@ -105,7 +105,7 @@ def test_fixture_cleanup_aggregates_failures_and_removes_all_local_residue(
         runtime_dir=runtime,
         home=home,
         env={},
-        cli_executable=tmp_path / "codex-rsb",
+        cli_executable=tmp_path / "rsb",
         _tmp_path=tmp_path,
         _shells=[BrokenShell()],
     )
@@ -154,8 +154,8 @@ def test_start_fixture_cleans_generated_artifacts_when_docker_build_fails(
 ) -> None:
     key = tmp_path / "client-key"
     home = tmp_path / "home"
-    state = tmp_path / "codex-state"
-    runtime = tmp_path / "codex-runtime"
+    state = tmp_path / "rsb-state"
+    runtime = tmp_path / "rsb-runtime"
     for path in (home, state, runtime):
         path.mkdir()
     docker_calls: list[tuple[str, ...]] = []
@@ -240,7 +240,7 @@ def test_prompt_wait_ignores_matching_text_from_prior_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     shell = object.__new__(e2e.PtyShell)
-    shell._output = bytearray(b"[codex:fixture sync 99%]")
+    shell._output = bytearray(b"[fixture sync 99%]")
     monkeypatch.setattr(e2e.PtyShell, "_read_available", lambda _self, _deadline: None)
 
     with pytest.raises(AssertionError, match="PTY did not emit"):

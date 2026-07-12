@@ -30,9 +30,9 @@ def test_connect_request_does_not_emit_exit_or_close_session() -> None:
 
     assert "connect-request" in script
     assert "exit 0" not in script
-    assert "read -r __codex_response" in script
+    assert "read -r __rsb_response" in script
     assert "stty -echo" in script
-    assert "codex-rsb()" in script
+    assert "rsb()" in script
 
 
 def test_connect_request_disables_echo_before_requesting_a_response() -> None:
@@ -40,48 +40,48 @@ def test_connect_request_disables_echo_before_requesting_a_response() -> None:
 
     assert script.index("stty -echo") < script.index("connect-request")
     marker_line = next(line for line in script.splitlines() if "connect-request" in line)
-    assert marker_line.endswith('"$__codex_payload" > /dev/tty')
+    assert marker_line.endswith('"$__rsb_payload" > /dev/tty')
 
 
 def test_response_read_restores_echo_for_success_eof_and_signals() -> None:
     script = _enter_rcfile()
-    save = script.index("__codex_stty=$(stty -g)")
+    save = script.index("__rsb_stty=$(stty -g)")
     restore = script.index("trap 'stty")
     signals = script.index("trap 'exit 130' HUP INT TERM")
     disable = script.index("stty -echo")
     marker = script.index("connect-request")
-    read = script.index("read -r __codex_response")
-    leave_subshell = script.index('exit "$__codex_read_status"')
+    read = script.index("read -r __rsb_response")
+    leave_subshell = script.index('exit "$__rsb_read_status"')
 
     assert save < restore < signals < disable < marker < read < leave_subshell
 
 
 def test_local_to_remote_uses_home_as_the_holding_directory() -> None:
     script = _enter_rcfile()
-    branch = script.split('if [ "$__codex_direction" = local-to-remote ]; then', 1)[1]
+    branch = script.split('if [ "$__rsb_direction" = local-to-remote ]; then', 1)[1]
 
-    assert branch.index('cd -- "$HOME"') < branch.index("__codex_workspace_holding=$PWD")
+    assert branch.index('cd -- "$HOME"') < branch.index("__rsb_workspace_holding=$PWD")
 
 
 def test_ready_transition_has_authenticated_prompt_and_private_readline_trigger() -> None:
     script = _enter_rcfile()
 
-    assert "\\e]777;codex-rsb;prompt;${__codex_nonce};managed\\a" in script
-    assert "\\e]777;codex-rsb;prompt;${__codex_nonce};enter\\a" in script
-    prompt_function = script.split("__codex_enter_prompt() {", 1)[1].split("}\n", 1)[0]
+    assert "\\e]777;rsb;prompt;${__rsb_nonce};managed\\a" in script
+    assert "\\e]777;rsb;prompt;${__rsb_nonce};enter\\a" in script
+    prompt_function = script.split("__rsb_enter_prompt() {", 1)[1].split("}\n", 1)[0]
     assert "printf" not in prompt_function
     assert "bind -x" in script
-    assert "__codex_rsb_publish_ready" in script
+    assert "__rsb_publish_ready" in script
     assert "READLINE_LINE" in script
     assert "READLINE_POINT" in script
-    assert 'bind -x \'"\\C-x\\C-]": __codex_rsb_ready_key\'' in script
+    assert 'bind -x \'"\\C-x\\C-]": __rsb_ready_key\'' in script
     assert "\\e[778~" not in script
     assert 'bind -m emacs-standard \'"\\e[777~": redraw-current-line\'' in script
     assert 'bind -m vi-move \'"\\e[777~": redraw-current-line\'' in script
     assert "bind -m vi-insertion" not in script
     assert shell_module._ready_key_sequence() == b"\x18\x1d"
     assert shell_module._redraw_key_sequence() == b"\x1b[777~"
-    assert "__codex_rsb_live_key" not in script
+    assert "__rsb_live_key" not in script
     assert shell_module._READY_PROBE_INTERVAL_S >= 0.25
 
 
@@ -101,7 +101,7 @@ def test_ready_slot_keeps_readline_width_but_visually_returns_to_compact_width()
     )
 
     replacement = shell_module._render_prompt_slot("ZJU_2", "dq", status)
-    compact = "[codex:ZJU_2:dq]"
+    compact = "[ZJU_2:dq]"
     padding = 34 - shell_module.display_width(compact)
 
     assert replacement == compact + " " * padding + f"\x1b[{padding}D"
@@ -131,7 +131,7 @@ def test_connect_request_parser_requires_the_session_nonce_across_chunks() -> No
             separators=(",", ":"),
         ).encode()
     )
-    marker = b"\x1b]777;codex-rsb;connect-request;good;b64:" + payload + b"\x07"
+    marker = b"\x1b]777;rsb;connect-request;good;b64:" + payload + b"\x07"
     parser = ShellOutputParser("good")
 
     events = []
@@ -151,8 +151,8 @@ def test_connect_request_parser_requires_the_session_nonce_across_chunks() -> No
 
 
 def test_prompt_marker_requires_the_session_nonce() -> None:
-    enter = b"\x1b]777;codex-rsb;prompt;good;enter\x07"
-    managed = b"\x1b]777;codex-rsb;prompt;good;managed\x07"
+    enter = b"\x1b]777;rsb;prompt;good;enter\x07"
+    managed = b"\x1b]777;rsb;prompt;good;managed\x07"
 
     assert ShellOutputParser("good").feed(enter) == [
         shell_module.PromptEvent(slot_authorized=False)
@@ -165,7 +165,7 @@ def test_prompt_marker_requires_the_session_nonce() -> None:
 
 
 def test_real_enter_prompt_does_not_authorize_bare_slot_bytes() -> None:
-    marker = b"\x1b]777;codex-rsb;prompt;good;enter\x07"
+    marker = b"\x1b]777;rsb;prompt;good;enter\x07"
     visible_prompt = b"\x1b[01;33m[host:enter]\x1b[00m user@host:repo % "
     slot = shell_module._prompt_slot_sentinel("good").encode()
     parser = ShellOutputParser("good")
@@ -180,7 +180,7 @@ def test_real_enter_prompt_does_not_authorize_bare_slot_bytes() -> None:
 
 
 def test_real_enter_prompt_preserves_fragmented_bare_slot_bytes() -> None:
-    marker = b"\x1b]777;codex-rsb;prompt;good;enter\x07"
+    marker = b"\x1b]777;rsb;prompt;good;enter\x07"
     visible_prompt = b"\x1b[01;33m[host:enter]\x1b[00m % "
     slot = shell_module._prompt_slot_sentinel("good").encode()
     parser = ShellOutputParser("good")
@@ -196,7 +196,7 @@ def test_real_enter_prompt_preserves_fragmented_bare_slot_bytes() -> None:
 
 
 def test_real_enter_prompt_preserves_wrong_nonce_slot_bytes() -> None:
-    marker = b"\x1b]777;codex-rsb;prompt;good;enter\x07"
+    marker = b"\x1b]777;rsb;prompt;good;enter\x07"
     visible_prompt = b"[host:enter] % "
     wrong_slot = shell_module._prompt_slot_sentinel("wrong").encode()
     parser = ShellOutputParser("good")
@@ -227,7 +227,7 @@ def test_fragmented_prompt_slot_is_ordinary_output_without_authorization() -> No
 
 
 def test_authenticated_prompt_allows_exactly_one_fragmented_slot() -> None:
-    marker = b"\x1b]777;codex-rsb;prompt;good;managed\x07"
+    marker = b"\x1b]777;rsb;prompt;good;managed\x07"
     color = b"\x1b[01;36m"
     slot = shell_module._prompt_slot_sentinel("good").encode()
     parser = ShellOutputParser("good")
@@ -250,7 +250,7 @@ def test_authenticated_prompt_allows_exactly_one_fragmented_slot() -> None:
 
 
 def test_wrong_nonce_prompt_does_not_authorize_identical_slot_bytes() -> None:
-    forged = b"\x1b]777;codex-rsb;prompt;wrong\x07"
+    forged = b"\x1b]777;rsb;prompt;wrong\x07"
     slot = shell_module._prompt_slot_sentinel("good").encode()
     parser = ShellOutputParser("good")
 
@@ -263,8 +263,8 @@ def test_wrong_nonce_prompt_does_not_authorize_identical_slot_bytes() -> None:
 
 
 def test_wrong_nonce_prompt_does_not_clear_valid_managed_authorization() -> None:
-    managed = b"\x1b]777;codex-rsb;prompt;good;managed\x07"
-    forged = b"\x1b]777;codex-rsb;prompt;wrong;enter\x07"
+    managed = b"\x1b]777;rsb;prompt;good;managed\x07"
+    forged = b"\x1b]777;rsb;prompt;wrong;enter\x07"
     slot = shell_module._prompt_slot_sentinel("good").encode()
     parser = ShellOutputParser("good")
 
@@ -278,9 +278,9 @@ def test_wrong_nonce_prompt_does_not_clear_valid_managed_authorization() -> None
 
 
 def test_connect_request_clears_unused_prompt_slot_authorization() -> None:
-    marker = b"\x1b]777;codex-rsb;prompt;good;managed\x07"
+    marker = b"\x1b]777;rsb;prompt;good;managed\x07"
     payload = base64.b64encode(b'{"remote":"/work/dq","local":null,"name":"dq"}')
-    connect = b"\x1b]777;codex-rsb;connect-request;good;b64:" + payload + b"\x07"
+    connect = b"\x1b]777;rsb;connect-request;good;b64:" + payload + b"\x07"
     slot = shell_module._prompt_slot_sentinel("good").encode()
     parser = ShellOutputParser("good")
 
@@ -294,10 +294,10 @@ def test_connect_request_clears_unused_prompt_slot_authorization() -> None:
 
 
 def test_enter_connect_then_managed_prompt_authorizes_one_slot() -> None:
-    enter = b"\x1b]777;codex-rsb;prompt;good;enter\x07"
+    enter = b"\x1b]777;rsb;prompt;good;enter\x07"
     payload = base64.b64encode(b'{"remote":"/work/dq","local":null,"name":"dq"}')
-    connect = b"\x1b]777;codex-rsb;connect-request;good;b64:" + payload + b"\x07"
-    managed = b"\x1b]777;codex-rsb;prompt;good;managed\x07"
+    connect = b"\x1b]777;rsb;connect-request;good;b64:" + payload + b"\x07"
+    managed = b"\x1b]777;rsb;prompt;good;managed\x07"
     color = b"\x1b[01;36m"
     slot = shell_module._prompt_slot_sentinel("good").encode()
     parser = ShellOutputParser("good")

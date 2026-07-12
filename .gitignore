@@ -36,7 +36,7 @@ id_ecdsa
 
 # Logs
 *.log
-.codex_logs/
+.rsb_logs/
 
 .claude/
 .venv/

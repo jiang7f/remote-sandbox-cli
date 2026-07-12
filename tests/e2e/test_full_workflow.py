@@ -7,8 +7,8 @@ import pytest
 
 @pytest.mark.e2e
 def test_connect_sync_run_and_forget_without_workspace_metadata(ssh_fixture) -> None:
-    production_sentinel = ssh_fixture.create_production_state_sentinel(b"do-not-touch")
-    remote_production_sentinel = ssh_fixture.create_remote_production_state_sentinel(b"remote")
+    local_state_sentinel = ssh_fixture.create_local_state_sentinel(b"do-not-touch")
+    remote_state_sentinel = ssh_fixture.create_remote_state_sentinel(b"remote")
     local = ssh_fixture.local_workspace()
     remote = ssh_fixture.remote_workspace(empty=True)
     (local / "train.py").write_text("print('ok')\n", encoding="utf-8")
@@ -32,8 +32,8 @@ def test_connect_sync_run_and_forget_without_workspace_metadata(ssh_fixture) -> 
     assert ssh_fixture.cli("forget", "dq").returncode == 0
     assert not ssh_fixture.local_binding_exists("dq")
     assert not ssh_fixture.remote_exists(remote_metadata)
-    assert production_sentinel.read_bytes() == b"do-not-touch"
-    assert ssh_fixture.read_remote(remote_production_sentinel) == b"remote"
+    assert local_state_sentinel.read_bytes() == b"do-not-touch"
+    assert ssh_fixture.read_remote(remote_state_sentinel) == b"remote"
 
 
 @pytest.mark.e2e

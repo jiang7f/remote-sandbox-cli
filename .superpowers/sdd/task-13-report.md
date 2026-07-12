@@ -4,7 +4,7 @@
 
 - Replaced the production `Daemon` and its startup `SyncSession` pass with `WorkspaceSupervisor`.
 - Added `SupervisorClient` and JSON control requests for `status`, `sync`, `resume`, and `stop`. The existing `poke_daemon` API maps to `sync` so protected CLI callers continue to work.
-- Moved pid, lock, log, state, and control socket identity outside synchronized trees. Durable files use the workspace metadata directory keyed by `workspace_id`. The socket uses the codex runtime namespace keyed by the same id.
+- Moved pid, lock, log, state, and control socket identity outside synchronized trees. Durable files use the workspace metadata directory keyed by `workspace_id`. The socket uses the rsb runtime namespace keyed by the same id.
 - Published durable `STARTING`, pid, and the control socket before component construction, agent installation, local scanning, hashing, or transfer.
 - Made `RemoteWorkspaceClient` agent installation lazy so constructing production components cannot make an early remote call.
 - Made `WorkspaceSupervisor` the sole owner of initial sync, restart audit, journal replay, incremental engine cycles, local watcher lifecycle, remote subscription lifecycle, retry state, and shutdown cleanup.

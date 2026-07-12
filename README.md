@@ -1,15 +1,19 @@
-# codex-remote-sandbox
+# remote-sandbox
 
-`codex-remote-sandbox` 是当前仓库中的开发验证版本。它让 Codex 和编辑器只操作本地工作区，同时通过 SSH 在远程工作区执行命令，并由本地 supervisor 维护双向同步。
+`remote-sandbox` 让编辑器只操作本地工作区，同时通过 SSH 在远程工作区执行命令，并由本地 supervisor 维护双向同步。
 
-这个版本使用独立的命令、状态目录和运行时目录，不会复用已安装的 `rsb` 或旧版 `remote-sandbox` 状态。
+正式命令只有 `rsb`。工具状态位于 `~/.remote-sandbox`，运行时文件位于 `/tmp/remote-sandbox-<uid>`，项目目录内不会写入控制元数据。
 
-## 开发状态
+## 安装与开发
 
-- 开发命令是 `codex-rsb`。
-- 本仓库不提供 `rsb` 命令别名。
-- 当前验证入口是 `uv run codex-rsb`。
-- 不要把本 README 中的命令当作已发布包的安装说明。
+从源码安装正式命令。
+
+```bash
+uv tool install --editable .
+rsb --help
+```
+
+在仓库中开发时也可以直接使用 `uv run rsb`。
 
 ## 环境要求
 
@@ -31,18 +35,18 @@
 
 SSH 主机、端口、用户、密钥和跳板机应配置在 `~/.ssh/config` 中。程序调用系统 OpenSSH，不读取或复制私钥内容。
 
-## 本地开发
+## 快速开始
 
 ```bash
 uv sync --locked
-uv run codex-rsb --help
-uv run codex-rsb list
+uv run rsb --help
+uv run rsb list
 ```
 
 直接绑定已知远程目录。
 
 ```bash
-uv run codex-rsb connect ZJU_2 \
+uv run rsb connect ZJU_2 \
   --remote ~/work/project \
   --local ./project \
   --name project \
@@ -52,30 +56,30 @@ uv run codex-rsb connect ZJU_2 \
 先浏览远程服务器，再从同一个 shell 发起绑定。
 
 ```bash
-uv run codex-rsb enter ZJU_2
+uv run rsb enter ZJU_2
 ```
 
-进入浏览 shell 后，切换到目标目录并执行终端内提供的 `codex-rsb connect` 请求。
+进入浏览 shell 后，切换到目标目录并执行终端内提供的 `rsb connect` 请求。
 
 ## 常用命令
 
 ```bash
-uv run codex-rsb list
-uv run codex-rsb status [name] [--watch]
-uv run codex-rsb start [name]
-uv run codex-rsb stop [name]
-uv run codex-rsb shell [name]
-uv run codex-rsb run [name] -- python3 train.py
-uv run codex-rsb reconnect <name> [--local <path>] [--no-shell]
-uv run codex-rsb conflicts [name]
-uv run codex-rsb resolve <path> --use-local
-uv run codex-rsb resolve <path> --use-remote
-uv run codex-rsb fetch <path>
-uv run codex-rsb fetch --all
-uv run codex-rsb peek <path> --lines 40
-uv run codex-rsb peek <path> --tail 40
-uv run codex-rsb forget <name>
-uv run codex-rsb forget <name> --local-only
+uv run rsb list
+uv run rsb status [name] [--watch]
+uv run rsb start [name]
+uv run rsb stop [name]
+uv run rsb shell [name]
+uv run rsb run [name] -- python3 train.py
+uv run rsb reconnect <name> [--local <path>] [--no-shell]
+uv run rsb conflicts [name]
+uv run rsb resolve <path> --use-local
+uv run rsb resolve <path> --use-remote
+uv run rsb fetch <path>
+uv run rsb fetch --all
+uv run rsb peek <path> --lines 40
+uv run rsb peek <path> --tail 40
+uv run rsb forget <name>
+uv run rsb forget <name> --local-only
 ```
 
 `forget <name>` 会停止本地 supervisor，停止远程 watcher，删除远程工具元数据，删除本地工具元数据，并删除连接记录。它不会删除本地或远程项目文件。
@@ -84,32 +88,32 @@ uv run codex-rsb forget <name> --local-only
 
 ## 元数据隔离
 
-同步项目树中不会写入 `.remote-sandbox` 或 `.codex-remote-sandbox` 目录。
+同步项目树中不会写入 `.remote-sandbox` 目录。
 
 本机工具状态默认位于以下位置。
 
 ```text
-~/.codex-remote-sandbox/config.toml
-~/.codex-remote-sandbox/connections.toml
-~/.codex-remote-sandbox/workspaces/<workspace-id>/workspace.toml
-~/.codex-remote-sandbox/workspaces/<workspace-id>/state.sqlite3
-~/.codex-remote-sandbox/workspaces/<workspace-id>/daemon.log
+~/.remote-sandbox/config.toml
+~/.remote-sandbox/connections.toml
+~/.remote-sandbox/workspaces/<workspace-id>/workspace.toml
+~/.remote-sandbox/workspaces/<workspace-id>/state.sqlite3
+~/.remote-sandbox/workspaces/<workspace-id>/daemon.log
 ```
 
 本机 socket 和 SSH control master 默认位于以下运行时目录。
 
 ```text
-/tmp/codex-remote-sandbox-<uid>/
+/tmp/remote-sandbox-<uid>/
 ```
 
 远程工具元数据默认位于以下位置。
 
 ```text
-~/.codex-remote-sandbox/agents/<agent-version>/agent.pyz
-~/.codex-remote-sandbox/workspaces/<workspace-id>/
+~/.remote-sandbox/agents/<agent-version>/agent.pyz
+~/.remote-sandbox/workspaces/<workspace-id>/
 ```
 
-测试可以通过 `CODEX_REMOTE_SANDBOX_HOME`、`CODEX_REMOTE_SANDBOX_RUNTIME_DIR` 和 `CODEX_REMOTE_SANDBOX_CONNECTIONS` 指向一次性目录。正式开发流程不应设置旧版 `REMOTE_SANDBOX_HOME`、`REMOTE_SANDBOX_RUNTIME_DIR`、`REMOTE_SANDBOX_CONTROL_DIR` 或 `REMOTE_SANDBOX_CONNECTIONS` 来替代开发命名空间。
+测试可以通过 `REMOTE_SANDBOX_HOME`、`REMOTE_SANDBOX_RUNTIME_DIR` 和 `REMOTE_SANDBOX_CONNECTIONS` 指向一次性目录。
 
 ## `.git` 规则
 
@@ -138,38 +142,24 @@ uv run codex-rsb forget <name> --local-only
 查看冲突。
 
 ```bash
-uv run codex-rsb conflicts project
+uv run rsb conflicts project
 ```
 
 选择保留的一侧。
 
 ```bash
-uv run codex-rsb resolve path/to/file --use-local
-uv run codex-rsb resolve path/to/file --use-remote
+uv run rsb resolve path/to/file --use-local
+uv run rsb resolve path/to/file --use-remote
 ```
 
 冲突解决通过 supervisor mutation 队列执行，不会与增量同步引擎并发修改同一路径。
-
-## 回迁正式命名
-
-只有在开发版本完成 Linux 和 macOS 自动化测试、Docker OpenSSH E2E、真实服务器验收、升级与回滚演练后，才能开始正式命名回迁。回迁前应冻结新的连接创建，并备份开发和已安装版本各自的外部元数据。
-
-受控步骤如下。
-
-1. 先发布停止写入的新版本，退役 `codex-rsb` 的日常使用，并确认没有运行中的开发 supervisor、watcher 或 SSH control master。
-2. 恢复发行包名和命令名，将开发发行名 `codex-remote-sandbox` 和命令 `codex-rsb` 切换到最终批准的正式名称与 `rsb` 入口。
-3. 逐个检查 `CODEX_REMOTE_SANDBOX_HOME`、`CODEX_REMOTE_SANDBOX_RUNTIME_DIR` 和 `CODEX_REMOTE_SANDBOX_CONNECTIONS` 指向的开发状态。根据发布计划迁移或明确丢弃开发元数据，不能让它自动覆盖 `REMOTE_SANDBOX_HOME` 或其他已安装版本状态。
-4. 在隔离副本上验证 registry、workspace ID、远程 agent、冲突、forget 和回滚行为，再执行真实用户状态迁移。
-5. 保留一个发布周期的只读检测和回滚路径。只有升级、回滚和清理验收通过后，才能移除旧命令与配置的兼容别名。
-
-任何一步失败都应停止迁移，恢复备份，并继续使用相互隔离的开发和已安装命名空间。
 
 ## 忽略和占位文件
 
 在项目根目录运行以下命令可以创建默认 `.rsbignore`。
 
 ```bash
-uv run codex-rsb init
+uv run rsb init
 ```
 
 普通规则表示忽略。`[placeholder]` 后的规则表示在本地保留占位文件。
@@ -186,7 +176,7 @@ checkpoints/
 设置全局占位阈值。
 
 ```bash
-uv run codex-rsb set placeholder-limit 100MB
+uv run rsb set placeholder-limit 100MB
 ```
 
 `peek` 只读取远程文件的前部或尾部，不替换本地占位文件，也不更新同步 base。`fetch` 会通过 supervisor 拉取并验证占位文件。
@@ -211,10 +201,10 @@ uv run pytest -q -s tests/performance -m performance
 Docker SSH E2E 使用一次性 Ubuntu 22.04 容器、随机回环端口、临时 HOME、临时工具状态和临时 Ed25519 密钥。
 
 ```bash
-CODEX_E2E_REQUIRED=1 uv run pytest -q -s tests/e2e -m e2e
+RSB_E2E_REQUIRED=1 uv run pytest -q -s tests/e2e -m e2e
 ```
 
-未设置 `CODEX_E2E_REQUIRED=1` 且本机没有 Docker 时，E2E 会明确跳过。设置后缺少 Docker 会直接失败，适合 Linux CI。
+未设置 `RSB_E2E_REQUIRED=1` 且本机没有 Docker 时，E2E 会明确跳过。设置后缺少 Docker 会直接失败，适合 Linux CI。
 
 ## 质量检查
 

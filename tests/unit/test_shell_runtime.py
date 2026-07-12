@@ -32,6 +32,8 @@ def test_managed_shell_command_and_backend_adapter() -> None:
     assert argv[0] == "ssh"
     assert argv[-2] == "user@host"
     assert "cmd-done" in argv[-1]
+    assert "rsb;prompt;${__rsb_nonce};managed" in argv[-1]
+    assert shell._prompt_slot_sentinel("n1") in argv[-1]
     assert result == 19
     assert calls[0][1] == "n1"
     assert barriers == [7]
@@ -95,7 +97,7 @@ def test_process_shell_output_dispatches_bytes_barrier_and_connect() -> None:
     payload = base64.b64encode(
         json.dumps({"remote": "/work", "local": None, "name": "dq"}).encode()
     )
-    connect = b"\x1b]777;codex-rsb;connect-request;expected;b64:" + payload + b"\x07"
+    connect = b"\x1b]777;rsb;connect-request;expected;b64:" + payload + b"\x07"
     barrier = b"\x1b]777;remote-sandbox;cmd-done;expected;9\x07"
     output: list[bytes] = []
     barriers: list[int] = []

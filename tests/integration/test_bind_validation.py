@@ -38,8 +38,8 @@ def test_two_unrelated_non_empty_trees_are_rejected_before_metadata_commit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    state_home = tmp_path / "codex-home"
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(state_home))
+    state_home = tmp_path / "rsb-home"
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(state_home))
     local = tmp_path / "local"
     local.mkdir()
     (local / "local.txt").write_text("local", encoding="utf-8")
@@ -66,8 +66,8 @@ def test_bind_writes_only_external_metadata(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    state_home = tmp_path / "codex-home"
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(state_home))
+    state_home = tmp_path / "rsb-home"
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(state_home))
     local = tmp_path / "local"
     runner = FakeSshRunner()
     monkeypatch.setattr(
@@ -87,7 +87,7 @@ def test_bind_writes_only_external_metadata(
     paths = workspace_paths(result.workspace.workspace_id)
     assert paths.workspace_file.is_file()
     assert not (local / ".remote-sandbox").exists()
-    assert not (local / ".codex-remote-sandbox").exists()
+    assert not (local / ".remote-sandbox").exists()
     assert not any("/work/remote/.remote-sandbox" in path for _target, path in runner.files)
     assert result.connection.workspace_id == result.workspace.workspace_id
 
@@ -98,8 +98,8 @@ def test_bind_rolls_back_external_metadata_and_remote_registration(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    state_home = tmp_path / "codex-home"
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(state_home))
+    state_home = tmp_path / "rsb-home"
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(state_home))
     runner = FakeSshRunner()
     registration = RecordingRemoteRegistration()
     monkeypatch.setattr(
@@ -136,8 +136,8 @@ def test_failed_reconnect_keeps_existing_remote_registration(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    state_home = tmp_path / "codex-home"
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(state_home))
+    state_home = tmp_path / "rsb-home"
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(state_home))
     runner = FakeSshRunner()
     remote_state = {"active": False}
     first_registration = RecordingRemoteRegistration(

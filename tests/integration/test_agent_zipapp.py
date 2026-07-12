@@ -33,7 +33,7 @@ class RecordingRunner:
             return self.self_check
         content = self.uploads[-1][2]
         digest = hashlib.sha256(content).hexdigest()
-        return f"codex-remote-sandbox-agent {AGENT_VERSION} {digest}\n"
+        return f"remote-sandbox-agent {AGENT_VERSION} {digest}\n"
 
 
 def test_agent_zipapp_self_check(tmp_path: Path) -> None:
@@ -47,13 +47,13 @@ def test_agent_zipapp_self_check(tmp_path: Path) -> None:
         text=True,
     )
 
-    assert result.stdout == f"codex-remote-sandbox-agent {AGENT_VERSION} {digest}\n"
+    assert result.stdout == f"remote-sandbox-agent {AGENT_VERSION} {digest}\n"
 
 
 def test_agent_zipapp_runs_on_python_310(tmp_path: Path) -> None:
-    python_310 = os.environ.get("CODEX_PYTHON_310")
+    python_310 = os.environ.get("RSB_PYTHON_310")
     if not python_310:
-        pytest.skip("the explicit quality gate supplies CODEX_PYTHON_310")
+        pytest.skip("the explicit quality gate supplies RSB_PYTHON_310")
     archive = build_agent_zipapp(tmp_path / "agent.pyz")
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
 
@@ -65,7 +65,7 @@ def test_agent_zipapp_runs_on_python_310(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout == f"codex-remote-sandbox-agent {AGENT_VERSION} {digest}\n"
+    assert result.stdout == f"remote-sandbox-agent {AGENT_VERSION} {digest}\n"
 
 
 def test_agent_zipapp_returns_structured_error_for_unsupported_request(tmp_path: Path) -> None:
@@ -161,7 +161,7 @@ def test_remote_agent_manager_uploads_atomically_outside_workspace(tmp_path: Pat
 
     install = RemoteAgentManager(runner).ensure("ZJU_2")
 
-    expected_path = f"~/.codex-remote-sandbox/agents/{AGENT_VERSION}/agent.pyz"
+    expected_path = f"~/.remote-sandbox/agents/{AGENT_VERSION}/agent.pyz"
     assert runner.uploads == [("ZJU_2", expected_path, runner.uploads[0][2])]
     assert runner.python_calls == [("ZJU_2", expected_path, ("self-check",))]
     assert install.version == AGENT_VERSION
@@ -173,8 +173,8 @@ def test_remote_agent_manager_uploads_atomically_outside_workspace(tmp_path: Pat
 @pytest.mark.parametrize(
     "self_check",
     [
-        "codex-remote-sandbox-agent wrong-version ignored\n",
-        f"codex-remote-sandbox-agent {AGENT_VERSION} wrong-checksum\n",
+        "remote-sandbox-agent wrong-version ignored\n",
+        f"remote-sandbox-agent {AGENT_VERSION} wrong-checksum\n",
     ],
 )
 def test_remote_agent_manager_rejects_failed_self_check(self_check: str) -> None:

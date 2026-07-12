@@ -31,7 +31,7 @@ jobs:
         run: uv python install 3.10
       - name: Check Python 3.10 packaged agent
         run: >-
-          CODEX_PYTHON_310="$(uv python find 3.10)"
+          RSB_PYTHON_310="$(uv python find 3.10)"
           uv run pytest -q tests/integration/test_agent_zipapp.py
           -k test_agent_zipapp_runs_on_python_310
       - name: Check legacy imports
@@ -88,7 +88,7 @@ jobs:
   docker-e2e:
     runs-on: ubuntu-latest
     env:
-      CODEX_E2E_REQUIRED: "1"
+      RSB_E2E_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6

@@ -34,38 +34,37 @@ def test_local_only_forget_removes_local_state_and_reports_remote_residue(
 
     assert result.exit_code == 0
     assert not cli_fixture.registry_has("dq")
-    assert "~/.codex-remote-sandbox/workspaces/" in result.stdout
+    assert "~/.remote-sandbox/workspaces/" in result.stdout
     assert cli_fixture.record.workspace_id in result.stdout
 
 
-def test_local_only_forget_does_not_read_or_delete_installed_registry(
+def test_local_only_forget_uses_formal_registry(
     monkeypatch: MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    development_home = tmp_path / "codex-home"
-    installed_registry = tmp_path / "installed" / "connections.toml"
-    installed = BindingRecord(
-        name="installed",
+    state_home = tmp_path / "state"
+    registry = state_home / "connections.toml"
+    record = BindingRecord(
+        name="workspace",
         workspace_id="00000000-0000-4000-8000-000000000183",
         target="host",
-        remote_path="/work/installed",
-        local_path=str(tmp_path / "installed-project"),
+        remote_path="/work/project",
+        local_path=str(tmp_path / "project"),
         updated_at="2026-07-12T00:00:00Z",
     )
-    upsert_binding_record(installed_registry, installed)
-    installed_before = installed_registry.read_bytes()
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(development_home))
-    monkeypatch.setenv("REMOTE_SANDBOX_CONNECTIONS", str(installed_registry))
+    upsert_binding_record(registry, record)
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(state_home))
+    monkeypatch.setenv("REMOTE_SANDBOX_CONNECTIONS", str(registry))
     services = default_cli_services()
 
     result = invoke_cli(
-        ["forget", "installed", "--local-only"],
+        ["forget", "workspace", "--local-only"],
         services=services,
     )
 
     assert result.exit_code == 0
-    assert "already forgotten" in result.stdout
-    assert installed_registry.read_bytes() == installed_before
+    assert "Forgot workspace locally" in result.stdout
+    assert find_binding_record("workspace", registry) is None
 
 
 def test_normal_forget_uses_double_ended_cleanup_order(cli_fixture: CliHarness) -> None:
@@ -138,8 +137,8 @@ def test_local_forget_keeps_registry_until_metadata_deletion_is_verified(
     monkeypatch: MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    state_home = tmp_path / "codex-home"
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(state_home))
+    state_home = tmp_path / "rsb-home"
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(state_home))
     record = BindingRecord(
         name="dq",
         workspace_id="00000000-0000-4000-8000-000000000098",

@@ -7,7 +7,7 @@ from wcwidth import wcswidth, wcwidth
 from remote_sandbox.status import WorkspacePhase, WorkspaceStatus
 
 DEFAULT_PROMPT_WIDTH = 34
-_MIN_PROMPT_WIDTH = len("[codex:]")
+_MIN_PROMPT_WIDTH = 8
 
 
 class PromptRenderer:
@@ -23,7 +23,7 @@ class PromptRenderer:
         _reject_control_characters(target, field="target")
         _reject_control_characters(name, field="name")
         suffix = _status_suffix(status)
-        value = f"[codex:{target}:{name}{suffix}]"
+        value = f"[{target}:{name}{suffix}]"
         fitted = _truncate_closed_bracket(value, self.width)
         if status.phase is WorkspacePhase.READY:
             return fitted

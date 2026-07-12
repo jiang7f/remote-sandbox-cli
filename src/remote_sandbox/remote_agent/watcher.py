@@ -10,7 +10,7 @@ from typing import Protocol
 
 from .store import RemoteStore
 
-_HARD_IGNORED_NAMES = {".git", ".remote-sandbox", ".codex-remote-sandbox"}
+_HARD_IGNORED_NAMES = {".git", ".remote-sandbox"}
 
 
 @dataclass(frozen=True, slots=True)

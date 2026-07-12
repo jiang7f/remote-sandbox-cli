@@ -191,7 +191,7 @@ class _SupervisorControlServer:
         self._sock = sock
         self._thread = threading.Thread(
             target=self._serve,
-            name="codex-rsb-supervisor-control",
+            name="rsb-supervisor-control",
             daemon=True,
         )
         self._thread.start()
@@ -212,7 +212,7 @@ class _SupervisorControlServer:
             thread = threading.Thread(
                 target=self._handle_connection,
                 args=(connection,),
-                name="codex-rsb-supervisor-request",
+                name="rsb-supervisor-request",
                 daemon=True,
             )
             with self._connection_lock:
@@ -352,7 +352,7 @@ class WorkspaceSupervisor:
             SupervisorRuntime(
                 workspace_id,
                 metadata_root,
-                Path("/tmp") / f"codex-rsb-test-{runtime_key}",
+                Path("/tmp") / f"rsb-test-{runtime_key}",
             ),
             store=store,
             initial_sync=initial_sync,
@@ -616,7 +616,7 @@ class WorkspaceSupervisor:
         self._subscription_thread = threading.Thread(
             target=self._consume_subscription,
             args=(subscription,),
-            name="codex-rsb-remote-events",
+            name="rsb-remote-events",
             daemon=True,
         )
         self._subscription_thread.start()

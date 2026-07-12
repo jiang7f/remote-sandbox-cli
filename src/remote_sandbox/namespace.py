@@ -10,34 +10,32 @@ from pathlib import Path
 class ToolNamespace:
     distribution: str
     command: str
-    long_command: str
     home_dirname: str
     runtime_prefix: str
 
 
-DEV_NAMESPACE = ToolNamespace(
-    distribution="codex-remote-sandbox",
-    command="codex-rsb",
-    long_command="codex-remote-sandbox",
-    home_dirname=".codex-remote-sandbox",
-    runtime_prefix="codex-remote-sandbox",
+TOOL_NAMESPACE = ToolNamespace(
+    distribution="remote-sandbox",
+    command="rsb",
+    home_dirname=".remote-sandbox",
+    runtime_prefix="remote-sandbox",
 )
 
 
 def tool_home(env: Mapping[str, str] | None = None) -> Path:
     values = os.environ if env is None else env
-    override = values.get("CODEX_REMOTE_SANDBOX_HOME")
+    override = values.get("REMOTE_SANDBOX_HOME")
     if override:
         return Path(override).expanduser()
-    return Path(values.get("HOME", str(Path.home()))) / DEV_NAMESPACE.home_dirname
+    return Path(values.get("HOME", str(Path.home()))) / TOOL_NAMESPACE.home_dirname
 
 
 def runtime_dir(env: Mapping[str, str] | None = None) -> Path:
     values = os.environ if env is None else env
-    override = values.get("CODEX_REMOTE_SANDBOX_RUNTIME_DIR")
+    override = values.get("REMOTE_SANDBOX_RUNTIME_DIR")
     if override:
         return Path(override).expanduser()
-    return Path("/tmp") / f"{DEV_NAMESPACE.runtime_prefix}-{os.getuid()}"
+    return Path("/tmp") / f"{TOOL_NAMESPACE.runtime_prefix}-{os.getuid()}"
 
 
 def ssh_control_dir(env: Mapping[str, str] | None = None) -> Path:
@@ -45,4 +43,4 @@ def ssh_control_dir(env: Mapping[str, str] | None = None) -> Path:
 
 
 def program_name() -> str:
-    return DEV_NAMESPACE.command
+    return TOOL_NAMESPACE.command

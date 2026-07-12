@@ -12,7 +12,7 @@ from remote_sandbox.shell import (
 )
 from remote_sandbox.ssh import build_remote_shell_command
 
-_CONTROL_METADATA_NAMES = {".remote-sandbox", ".codex-remote-sandbox"}
+_CONTROL_METADATA_NAMES = {".remote-sandbox"}
 
 
 def _find_in_tree_control_metadata(
@@ -138,7 +138,7 @@ def test_no_tracked_generated_artifacts() -> None:
 def test_in_tree_metadata_scan_detects_directories_and_tracked_paths(tmp_path: Path) -> None:
     directory = tmp_path / "nested" / ".remote-sandbox"
     directory.mkdir(parents=True)
-    tracked = "docs/.codex-remote-sandbox/config.toml"
+    tracked = "docs/.remote-sandbox/config.toml"
 
     found = _find_in_tree_control_metadata(tmp_path, (tracked,))
 
@@ -156,30 +156,24 @@ def test_no_in_tree_control_metadata() -> None:
     assert _find_in_tree_control_metadata(Path.cwd(), tracked) == []
 
 
-def test_readme_advertises_only_codex_rsb_command() -> None:
+def test_readme_advertises_only_rsb_command() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
-    assert readme.startswith("# codex-remote-sandbox\n")
-    assert "长命令是 `codex-remote-sandbox`" not in readme
+    assert readme.startswith("# remote-sandbox\n")
     command_lines = [
         line.strip()
         for line in readme.splitlines()
         if line.strip().startswith("uv run")
     ]
     assert command_lines
-    assert all(
-        "uv run codex-rsb" in line or not line.startswith("uv run codex-")
-        for line in command_lines
-    )
+    assert any(line.startswith("uv run rsb") for line in command_lines)
 
 
-def test_readme_documents_controlled_rename_back_procedure() -> None:
+def test_readme_documents_formal_namespace() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
 
-    assert "## 回迁正式命名" in readme
-    assert "退役 `codex-rsb`" in readme
-    assert "恢复发行包名和命令名" in readme
-    assert "迁移或明确丢弃开发元数据" in readme
-    assert "验收通过后" in readme
-    assert "兼容别名" in readme
-    assert "CODEX_REMOTE_SANDBOX_HOME" in readme
+    assert "正式命令只有 `rsb`" in readme
+    assert "~/.remote-sandbox" in readme
+    assert "/tmp/remote-sandbox-<uid>" in readme
     assert "REMOTE_SANDBOX_HOME" in readme
+    assert "REMOTE_SANDBOX_RUNTIME_DIR" in readme
+    assert "REMOTE_SANDBOX_CONNECTIONS" in readme

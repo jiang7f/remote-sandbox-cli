@@ -222,7 +222,7 @@ def test_remote_client_lifecycle_calls_use_structured_workspace_requests() -> No
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
 
     assert client.register("/home/u/算法")["root"] == "/home/u/算法"
@@ -256,7 +256,7 @@ def test_remote_client_ensures_versioned_agent_when_path_is_not_supplied() -> No
     manager = RecordingAgentManager(
         AgentInstall(
             version="0.2.0-dev",
-            remote_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+            remote_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
             sha256="digest",
         )
     )
@@ -319,7 +319,7 @@ def test_remote_snapshot_parses_metadata_fingerprints_and_sequence() -> None:
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
 
     snapshot = client.snapshot()
@@ -359,7 +359,7 @@ def test_remote_snapshot_parses_audit_identity_fields() -> None:
         runner,
         target="host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/test/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/test/agent.pyz",
     )
 
     snapshot = client.snapshot()
@@ -408,7 +408,7 @@ def test_remote_hash_paths_requests_and_returns_only_selected_paths() -> None:
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
 
     entries = client.hash_paths(["requested.txt", "link", "missing.txt"])
@@ -518,7 +518,7 @@ def test_subscription_restarts_after_last_acknowledged_sequence() -> None:
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
     subscription = client.subscribe(after_sequence=0)
     events = iter(subscription)
@@ -549,7 +549,7 @@ def test_subscription_raises_nonzero_stream_error_without_reopening() -> None:
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
 
     with pytest.raises(RemoteProtocolError, match="watcher stopped"):
@@ -572,7 +572,7 @@ def test_repeated_failed_subscriptions_do_not_accumulate() -> None:
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
 
     for _ in range(3):
@@ -597,7 +597,7 @@ def test_subscription_backs_off_between_repeated_clean_eof_reopens(
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
     subscription = client.subscribe(after_sequence=0)
     delays: list[float] = []
@@ -626,7 +626,7 @@ def test_close_interrupts_reopen_backoff_without_spawning_again(
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
     subscription = client.subscribe(after_sequence=0)
     entered_backoff = threading.Event()
@@ -666,7 +666,7 @@ def test_close_during_stream_launch_terminates_late_process_without_reopening() 
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
     subscription = client.subscribe(after_sequence=0)
     iterator = iter(subscription)
@@ -708,7 +708,7 @@ def test_subscription_drains_large_stderr_without_pipe_deadlock() -> None:
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
     subscription = client.subscribe(after_sequence=0)
     iterator = iter(subscription)
@@ -751,7 +751,7 @@ def test_malformed_foreground_response_raises_protocol_error() -> None:
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
 
     with pytest.raises(RemoteProtocolError, match="malformed"):
@@ -772,7 +772,7 @@ def test_acknowledge_rejects_non_integer_or_negative_sequence(sequence: object) 
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
 
     with pytest.raises(ValueError, match="non-negative integer"):
@@ -796,7 +796,7 @@ def test_acknowledge_wraps_malformed_remote_sequence(payload: dict[str, object])
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
 
     with pytest.raises(RemoteProtocolError, match="acknowledgement payload is malformed"):
@@ -825,7 +825,7 @@ def test_invalid_missing_fingerprint_path_is_a_protocol_error() -> None:
         runner,
         target="example-host",
         workspace_id="w1",
-        agent_path="~/.codex-remote-sandbox/agents/0.2.0-dev/agent.pyz",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
     )
 
     with pytest.raises(RemoteProtocolError, match="invalid remote fingerprint"):

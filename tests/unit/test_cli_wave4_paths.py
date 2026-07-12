@@ -153,7 +153,7 @@ def test_no_shell_connect_and_reconnect_failure_paths(
         services=cli_fixture.services,
     )
     assert reconnect.exit_code == 2
-    assert "run codex-rsb status" in reconnect.stderr
+    assert "run rsb status" in reconnect.stderr
 
 
 def test_fetch_peek_resolve_and_service_record_output_paths(
@@ -203,7 +203,7 @@ def test_default_adapters_starting_fetch_cancel_and_malformed_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(tmp_path / "state"))
     local = tmp_path / "local"
     local.mkdir()
     record = _record(local)
@@ -238,7 +238,7 @@ def test_default_cleanup_adapters_detect_shared_agent_and_changed_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(tmp_path / "state"))
     local = tmp_path / "local"
     local.mkdir()
     record = _record(local)
@@ -363,11 +363,21 @@ def test_shell_poke_parse_record_and_runner_helpers(
     class Runner:
         def __init__(self) -> None:
             self.master_targets: list[str] = []
+            self.shell_identity: tuple[str | None, str | None] | None = None
 
         def ensure_master(self, target: str) -> None:
             self.master_targets.append(target)
 
-        def interactive_shell(self, _target: str, _remote: str, *, on_barrier: Any) -> int:
+        def interactive_shell(
+            self,
+            _target: str,
+            _remote: str,
+            *,
+            on_barrier: Any,
+            name: str | None = None,
+            workspace_id: str | None = None,
+        ) -> int:
+            self.shell_identity = (name, workspace_id)
             on_barrier(0)
             return 9
 
@@ -390,6 +400,7 @@ def test_shell_poke_parse_record_and_runner_helpers(
         lambda _root, source: poke_calls.append(source),
     )
     assert cli.open_wrapped_shell("dq") == 9
+    assert runner.shell_identity == (record.name, record.workspace_id)
     assert poke_calls == ["shell"]
 
     monkeypatch.setattr(cli, "_poke_or_restart_daemon", poke_or_restart)

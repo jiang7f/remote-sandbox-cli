@@ -29,7 +29,7 @@ def test_status_explains_foreground_reconnect_for_password_auth(
 
     assert result.exit_code == 0
     assert "disconnected" in result.stdout
-    assert "codex-rsb reconnect dq" in result.stdout
+    assert "rsb reconnect dq" in result.stdout
 
 
 def test_init_writes_only_user_ignore_configuration(cli_fixture: CliHarness) -> None:
@@ -117,7 +117,7 @@ def test_no_shell_connect_returns_after_initial_syncing_publication(
     assert result.exit_code == 0
     assert "Connected dq" in result.stdout
     assert "initial sync continues in background" in result.stdout
-    assert "codex-rsb status dq --watch" in result.stdout
+    assert "rsb status dq --watch" in result.stdout
     assert cli_fixture.store.get_status().phase.value == "initial-syncing"
     assert cli_fixture.store.initial_sync_started_generation() == 1
 

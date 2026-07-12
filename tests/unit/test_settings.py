@@ -59,10 +59,10 @@ def test_load_rejects_invalid_configuration(tmp_path: Path, content: str) -> Non
         settings.load_settings(path)
 
 
-def test_remote_sandbox_home_uses_development_namespace(
+def test_remote_sandbox_home_uses_formal_namespace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("CODEX_REMOTE_SANDBOX_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("REMOTE_SANDBOX_HOME", str(tmp_path / "state"))
     assert settings.remote_sandbox_home() == tmp_path / "state"
     assert settings.settings_path() == tmp_path / "state" / "config.toml"

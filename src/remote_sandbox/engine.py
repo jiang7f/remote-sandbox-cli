@@ -137,20 +137,25 @@ class SyncEngine:
             policy=policy,
         )
         self._cycle_lock = threading.RLock()
+        self._status_override: tuple[WorkspacePhase, str] | None = None
 
     def run_once(self, reason: str) -> EngineResult:
         if type(reason) is not str or not reason:
             raise ValueError("sync reason must not be empty")
         with self._cycle_lock:
+            previous_override = self._status_override
+            if reason == "initial-replay":
+                self._status_override = (WorkspacePhase.INITIAL_SYNCING, "replaying")
             try:
                 return self._run_once(reason)
             except BaseException as exc:
                 self._record_error(exc)
                 raise
+            finally:
+                self._status_override = previous_override
 
     def _run_once(self, reason: str) -> EngineResult:
         del reason
-        self._set_status(WorkspacePhase.SYNCING, "collecting")
         remote_after = self.store.acknowledged_sequence("remote")
         imported = self.remote.events_after(remote_after)
         self.store.record_events(imported)
@@ -188,6 +193,7 @@ class SyncEngine:
         dirty = tuple(sorted(sources))
         if not dirty:
             return self._commit_echoes(local_events, remote_events, echoes)
+        self._set_status(WorkspacePhase.SYNCING, "collecting")
 
         local = {path: local[path] for path in dirty}
         remote = {path: remote[path] for path in dirty}
@@ -765,6 +771,8 @@ class SyncEngine:
         self.audit_coordinator.record_drift()
 
     def _set_status(self, phase: WorkspacePhase, stage: str) -> None:
+        if self._status_override is not None:
+            phase, stage = self._status_override
         pending = len(self.store.pending_events("local", 0))
         pending += len(self.store.pending_events("remote", 0))
         pending += len(self.store.list_requeued_paths())
