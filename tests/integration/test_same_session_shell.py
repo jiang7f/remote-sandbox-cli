@@ -204,7 +204,10 @@ def test_real_pty_ready_preserves_partial_readline_buffer_and_shell_process(
             start=command_start,
         )
 
-        text = output.decode("utf-8", errors="replace").replace("\r", "")
+        text = _normalize_terminal_output(bytes(output)).decode(
+            "utf-8",
+            errors="replace",
+        )
         pid_line = next(line for line in text.splitlines() if line.startswith("PID:"))
         buffer_line = next(line for line in text.splitlines() if line.startswith("BUFFER:"))
         original_pid = pid_line.removeprefix("PID:")

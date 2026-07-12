@@ -186,9 +186,12 @@ def test_change_during_scan_is_excluded_from_bulk_and_replayed(
     initial_pair: InitialPairHarness,
 ) -> None:
     (initial_pair.remote / "stable.txt").write_text("stable", encoding="utf-8")
-    initial_pair.remote_client.on_before_snapshot = lambda: (
-        initial_pair.remote / "late.txt"
-    ).write_text("late", encoding="utf-8")
+
+    def create_during_scan() -> None:
+        (initial_pair.remote / "late.txt").write_text("late", encoding="utf-8")
+        initial_pair.remote_client.append_event(EventKind.CREATE, "late.txt")
+
+    initial_pair.remote_client.on_before_snapshot = create_during_scan
 
     initial_pair.coordinator.run()
 

@@ -24,7 +24,7 @@ from remote_sandbox.engine import SyncEngine
 from remote_sandbox.fetch import fetch_placeholders
 from remote_sandbox.initial_sync import InitialSyncCoordinator
 from remote_sandbox.journal import EventKind, JournalEvent
-from remote_sandbox.namespace import runtime_dir
+from remote_sandbox.namespace import runtime_dir, supervisor_runtime_dir
 from remote_sandbox.policy import POLICY_FILE_NAME, StaticPolicyEngine
 from remote_sandbox.registry import BindingRecord, list_binding_records
 from remote_sandbox.remote_client import RemoteEventSubscription, RemoteWorkspaceClient
@@ -895,7 +895,7 @@ def daemon_workspace_status(workspace_id: str) -> WorkspaceStatus:
     runtime = SupervisorRuntime(
         workspace_id,
         paths.root,
-        runtime_dir() / "supervisors",
+        supervisor_runtime_dir(runtime_dir()),
     )
     client = SupervisorClient(runtime)
     used_fallback = False
@@ -1123,7 +1123,7 @@ def _runtime_for_local(local_root: Path) -> SupervisorRuntime:
     return SupervisorRuntime(
         record.workspace_id,
         paths.root,
-        runtime_dir() / "supervisors",
+        supervisor_runtime_dir(runtime_dir()),
     )
 
 

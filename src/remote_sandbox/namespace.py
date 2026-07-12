@@ -41,11 +41,20 @@ def runtime_dir(env: Mapping[str, str] | None = None) -> Path:
 
 def ssh_control_dir(env: Mapping[str, str] | None = None) -> Path:
     desired = runtime_dir(env) / "cm"
-    socket_path = desired / ("0" * 40)
+    return _bounded_socket_dir(desired, label="cm", socket_name_bytes=40)
+
+
+def supervisor_runtime_dir(runtime_root: Path) -> Path:
+    desired = runtime_root / "supervisors"
+    return _bounded_socket_dir(desired, label="supervisors", socket_name_bytes=41)
+
+
+def _bounded_socket_dir(desired: Path, *, label: str, socket_name_bytes: int) -> Path:
+    socket_path = desired / ("0" * socket_name_bytes)
     if len(os.fsencode(socket_path)) < 100:
         return desired
     digest = hashlib.sha256(os.fsencode(desired)).hexdigest()[:16]
-    return Path("/tmp") / f"remote-sandbox-cm-{os.getuid()}" / digest
+    return Path("/tmp") / f"remote-sandbox-{label}-{os.getuid()}" / digest
 
 
 def program_name() -> str:

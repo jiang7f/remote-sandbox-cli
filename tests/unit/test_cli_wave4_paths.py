@@ -293,6 +293,11 @@ def test_remote_component_and_supervisor_client_factories(
         lambda _workspace_id: SimpleNamespace(root=tmp_path / "metadata"),
     )
     monkeypatch.setattr(cli, "runtime_dir", lambda: tmp_path / "runtime")
+    monkeypatch.setattr(
+        cli,
+        "supervisor_runtime_dir",
+        lambda root: root / "supervisors",
+    )
     client = cli._supervisor_client(record)
     assert client.runtime.workspace_id == record.workspace_id
     assert client.runtime.runtime_root == tmp_path / "runtime" / "supervisors"

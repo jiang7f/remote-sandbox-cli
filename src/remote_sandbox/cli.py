@@ -30,7 +30,7 @@ from remote_sandbox.daemon import (
     wait_for_daemon_control,
 )
 from remote_sandbox.fetch import fetch_all_prompt
-from remote_sandbox.namespace import runtime_dir
+from remote_sandbox.namespace import runtime_dir, supervisor_runtime_dir
 from remote_sandbox.peek import peek_placeholder
 from remote_sandbox.registry import (
     BindingRecord,
@@ -568,7 +568,7 @@ def _supervisor_client(record: BindingRecord) -> SupervisorClient:
         SupervisorRuntime(
             record.workspace_id,
             paths.root,
-            runtime_dir() / "supervisors",
+            supervisor_runtime_dir(runtime_dir()),
         )
     )
 

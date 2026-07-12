@@ -1,7 +1,13 @@
 import os
 from pathlib import Path
 
-from remote_sandbox.namespace import TOOL_NAMESPACE, runtime_dir, ssh_control_dir, tool_home
+from remote_sandbox.namespace import (
+    TOOL_NAMESPACE,
+    runtime_dir,
+    ssh_control_dir,
+    supervisor_runtime_dir,
+    tool_home,
+)
 
 
 def test_remote_sandbox_namespace_honors_formal_overrides(tmp_path: Path) -> None:
@@ -53,3 +59,14 @@ def test_long_runtime_override_uses_an_isolated_short_control_path(tmp_path: Pat
     assert len(os.fsencode(control / ("0" * 40))) < 100
     assert control == ssh_control_dir(env)
     assert control != runtime / "cm"
+
+
+def test_long_runtime_uses_an_isolated_short_supervisor_path(tmp_path: Path) -> None:
+    runtime = tmp_path / ("deep-runtime-" * 8)
+
+    supervisors = supervisor_runtime_dir(runtime)
+
+    assert supervisors.parent == Path("/tmp") / f"remote-sandbox-supervisors-{os.getuid()}"
+    assert len(os.fsencode(supervisors / (("0" * 36) + ".sock"))) < 100
+    assert supervisors == supervisor_runtime_dir(runtime)
+    assert supervisors != runtime / "supervisors"
