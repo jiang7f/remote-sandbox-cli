@@ -373,6 +373,13 @@ class SshFixture:
             text=True,
             timeout=20.0,
         )
+        subprocess.run(
+            ["docker", "restart", self.container_id],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
         _wait_for_ssh_python(self)
 
     def wait_for_remote_file(self, path: Path, timeout: float = 5.0) -> None:
@@ -532,12 +539,13 @@ class SshFixture:
                     if result.returncode != 0:
                         raise AssertionError(result.stdout + result.stderr)
                 except Exception as exc:
-                    failures.append(f"forget {name}: {exc}")
-                    _record_cleanup_failure(
-                        failures,
-                        f"local-only forget {name}",
-                        lambda value=name: self.cli("forget", value, "--local-only"),
-                    )
+                    try:
+                        local_result = self.cli("forget", name, "--local-only")
+                        if local_result.returncode != 0:
+                            raise AssertionError(local_result.stdout + local_result.stderr)
+                    except Exception as local_exc:
+                        failures.append(f"forget {name}: {exc}")
+                        failures.append(f"local-only forget {name}: {local_exc}")
             if isinstance(target, str):
                 _record_cleanup_failure(
                     failures,
