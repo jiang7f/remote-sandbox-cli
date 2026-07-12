@@ -70,7 +70,7 @@ def test_agent_zipapp_runs_on_python_310(tmp_path: Path) -> None:
 
 def test_agent_zipapp_returns_structured_error_for_unsupported_request(tmp_path: Path) -> None:
     archive = build_agent_zipapp(tmp_path / "agent.pyz")
-    request = AgentRequest("not-a-command", {"root": "/home/u/算法测试"})
+    request = AgentRequest("not-a-command", {"root": "/home/user/示例项目"})
 
     result = subprocess.run(
         ["python3", str(archive)],
@@ -161,11 +161,11 @@ print(hashlib.sha256(archive.read_bytes()).hexdigest())
 def test_remote_agent_manager_uploads_atomically_outside_workspace(tmp_path: Path) -> None:
     runner = RecordingRunner()
 
-    install = RemoteAgentManager(runner).ensure("ZJU_2")
+    install = RemoteAgentManager(runner).ensure("dev-server")
 
     expected_path = f"~/.remote-sandbox/agents/{AGENT_VERSION}/agent.pyz"
-    assert runner.uploads == [("ZJU_2", expected_path, runner.uploads[0][2])]
-    assert runner.python_calls == [("ZJU_2", expected_path, ("self-check",))]
+    assert runner.uploads == [("dev-server", expected_path, runner.uploads[0][2])]
+    assert runner.python_calls == [("dev-server", expected_path, ("self-check",))]
     assert install.version == AGENT_VERSION
     assert install.remote_path == expected_path
     assert install.sha256 == hashlib.sha256(runner.uploads[0][2]).hexdigest()
@@ -183,4 +183,4 @@ def test_remote_agent_manager_rejects_failed_self_check(self_check: str) -> None
     runner = RecordingRunner(self_check)
 
     with pytest.raises(RuntimeError, match="self-check failed"):
-        RemoteAgentManager(runner).ensure("ZJU_2")
+        RemoteAgentManager(runner).ensure("dev-server")

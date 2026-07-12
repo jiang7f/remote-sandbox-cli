@@ -306,7 +306,7 @@ Both initial directions enter a shell immediately.
 Example development prompt:
 
 ```text
-[ZJU_2:dq sync 40%] user@2ndserver:~ % python tra
+[dev-server:dq sync 40%] user@server:~ % python tra
 ```
 
 The bracketed status is one live prompt field. It does not print historical progress lines.
@@ -314,12 +314,12 @@ The bracketed status is one live prompt field. It does not print historical prog
 Prompt states include:
 
 ```text
-[ZJU_2:dq scanning]
-[ZJU_2:dq planning]
-[ZJU_2:dq sync 40%]
-[ZJU_2:dq conflict 1]
-[ZJU_2:dq offline]
-[ZJU_2:dq]
+[dev-server:dq scanning]
+[dev-server:dq planning]
+[dev-server:dq sync 40%]
+[dev-server:dq conflict 1]
+[dev-server:dq offline]
+[dev-server:dq]
 ```
 
 The remote prompt contains a fixed-width sentinel. The local PTY output parser replaces that
@@ -623,7 +623,7 @@ Scenarios include:
 ### 19.3 E2E tests
 
 E2E uses an isolated Linux SSH container with Python 3.10, rsync, tar, and both password and key
-authentication fixtures. Automated tests never depend on ZJU_2.
+authentication fixtures. Automated tests never depend on dev-server.
 
 Critical flows include:
 
@@ -637,7 +637,7 @@ Critical flows include:
 - Verification that neither workspace contains `.remote-sandbox` or control metadata.
 - Verification that the development command does not read or modify the production namespace.
 
-After all automated gates pass, a separate manual acceptance run is performed against ZJU_2.
+After all automated gates pass, a separate manual acceptance run is performed against dev-server.
 
 ### 19.4 Performance tests
 

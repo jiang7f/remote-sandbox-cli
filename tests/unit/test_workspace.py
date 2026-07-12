@@ -18,7 +18,7 @@ def test_workspace_paths_live_outside_working_tree(monkeypatch, tmp_path: Path) 
     local_root.mkdir()
     spec = new_workspace_spec(
         name="dq",
-        target="ZJU_2",
+        target="dev-server",
         local_root=local_root,
         remote_root="/home/user/dq",
     )
@@ -78,7 +78,7 @@ def test_workspace_spec_round_trips_through_atomic_toml(
         schema_version=1,
         workspace_id="00000000-0000-4000-8000-000000000001",
         name='dq "quoted"',
-        target="ZJU_2",
+        target="dev-server",
         local_root=str(tmp_path / "project with spaces"),
         remote_root="/work/back\\slash\nand-newline",
         created_at="2026-07-10T00:00:00+00:00",

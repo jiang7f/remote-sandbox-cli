@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remote Sandbox"
+  short_description: "Use rsb for local editing and remote execution"
+  default_prompt: "Use $remote-sandbox to discover this workspace binding and run the requested command remotely."

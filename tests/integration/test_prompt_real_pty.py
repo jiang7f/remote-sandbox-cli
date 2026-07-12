@@ -32,7 +32,7 @@ def test_managed_shell_renders_initial_prompt_in_nested_real_pty(tmp_path: Path)
     workspace.mkdir()
     rcfile = tmp_path / "managed-bashrc"
     rcfile.write_text(
-        "RSB_DISPLAY_LABEL=ZJU_2\n"
+        "RSB_DISPLAY_LABEL=dev-server\n"
         f"__rsb_nonce={shlex.quote(nonce)}\n{_managed_rcfile(nonce)}\n",
         encoding="utf-8",
     )
@@ -53,7 +53,7 @@ def test_managed_shell_renders_initial_prompt_in_nested_real_pty(tmp_path: Path)
                 ["bash", "--noprofile", "--rcfile", str(rcfile), "-i"],
                 nonce,
                 lambda _event: ConnectResponse(ok=False, error="already connected"),
-                target="ZJU_2",
+                target="dev-server",
                 initial_name="dq",
                 initial_status_probe=lambda: WorkspaceStatus(
                     WorkspacePhase.READY,
@@ -68,7 +68,7 @@ def test_managed_shell_renders_initial_prompt_in_nested_real_pty(tmp_path: Path)
     os.close(frontend_slave)
     output = bytearray()
     try:
-        _read_until(frontend_master, output, b"[ZJU_2:dq scanning]", timeout=3.0)
+        _read_until(frontend_master, output, b"[dev-server:dq scanning]", timeout=3.0)
         start = len(output)
         os.write(frontend_master, b"pwd\n")
         _read_until(
@@ -99,7 +99,7 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
     probe_log = tmp_path / "probe.log"
     rcfile = tmp_path / "bashrc"
     rcfile.write_text(
-        "RSB_DISPLAY_LABEL=ZJU_2\n"
+        "RSB_DISPLAY_LABEL=dev-server\n"
         f"__rsb_nonce={shlex.quote(nonce)}\n{_enter_rcfile(nonce)}\n",
         encoding="utf-8",
     )
@@ -173,7 +173,7 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
                 ["bash", "--noprofile", "--rcfile", str(rcfile), "-i"],
                 nonce,
                 connect,
-                target="ZJU_2",
+                target="dev-server",
             )
         except BaseException:
             traceback.print_exc()
@@ -188,7 +188,7 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
             frontend_master,
             f"rsb connect --remote {shlex.quote(str(workspace))}\n".encode(),
         )
-        _read_until(frontend_master, output, b"[ZJU_2:dq scanning]", timeout=3.0)
+        _read_until(frontend_master, output, b"[dev-server:dq scanning]", timeout=3.0)
 
         slot = shell_module._prompt_slot_sentinel(nonce).encode()
         ps1_start = len(output)
@@ -240,7 +240,7 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
         _read_until(
             frontend_master,
             output,
-            b"[ZJU_2:dq]",
+            b"[dev-server:dq]",
             timeout=2.0,
             start=compact_start,
         )
@@ -255,7 +255,7 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
         _read_until(
             frontend_master,
             output,
-            b"[ZJU_2:dq]",
+            b"[dev-server:dq]",
             timeout=2.0,
             start=ready_typing_start,
         )
@@ -279,7 +279,7 @@ def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) 
         _read_until(
             frontend_master,
             output,
-            b"[ZJU_2:dq offline]",
+            b"[dev-server:dq offline]",
             timeout=2.0,
             start=offline_start,
         )
@@ -387,13 +387,13 @@ def test_lifecycle_phase_has_a_distinct_real_pty_prompt_token(
 
 
 def _enter_rcfile(nonce: str) -> str:
-    command = shell_module.build_enter_remote_shell_command("ZJU_2", "~", nonce=nonce)[-1]
+    command = shell_module.build_enter_remote_shell_command("dev-server", "~", nonce=nonce)[-1]
     outer_script = shlex.split(command)[2]
     return outer_script.split("cat <<'EOF'\n", 1)[1].split("\nEOF\n", 1)[0]
 
 
 def _managed_rcfile(nonce: str) -> str:
-    command = shell_module.build_managed_remote_shell_command("ZJU_2", "~", nonce=nonce)[-1]
+    command = shell_module.build_managed_remote_shell_command("dev-server", "~", nonce=nonce)[-1]
     outer_script = shlex.split(command)[2]
     return outer_script.split("cat <<'EOF'\n", 1)[1].split("\nEOF\n", 1)[0]
 

@@ -56,6 +56,7 @@ from remote_sandbox.shell import (
     InitialShellDirection,
     enter_shell_loop,
 )
+from remote_sandbox.skill_install import install_codex_skill, uninstall_codex_skill
 from remote_sandbox.ssh import SubprocessSshRunner
 from remote_sandbox.ssh_config import SshHost, load_configured_hosts
 from remote_sandbox.state import ConflictRecord, WorkspaceStore
@@ -595,6 +596,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("init", help="Write the default .rsbignore file")
 
+    skill = subparsers.add_parser("skill", help="Manage the bundled AI assistant skill")
+    skill_subparsers = skill.add_subparsers(dest="skill_command", required=True)
+    skill_install = skill_subparsers.add_parser(
+        "install",
+        help="Install the remote-sandbox skill for Codex",
+    )
+    skill_install.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace a different installed copy",
+    )
+    skill_uninstall = skill_subparsers.add_parser(
+        "uninstall",
+        help="Uninstall the remote-sandbox skill from Codex",
+    )
+    skill_uninstall.add_argument(
+        "--force",
+        action="store_true",
+        help="Remove managed files even if they were modified",
+    )
+
     subparsers.add_parser("list", help="List SSH-configured servers")
 
     status = subparsers.add_parser("status", help="List local workspace bindings")
@@ -952,6 +974,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     services = default_cli_services()
     try:
+        if args.command == "skill" and args.skill_command == "install":
+            install_result = install_codex_skill(force=args.force)
+            action = "Installed" if install_result.changed else "Already installed"
+            print(f"{action} remote-sandbox skill at {install_result.path}")
+            return 0
+        if args.command == "skill" and args.skill_command == "uninstall":
+            uninstall_result = uninstall_codex_skill(force=args.force)
+            action = "Uninstalled" if uninstall_result.changed else "Already uninstalled"
+            print(f"{action} remote-sandbox skill at {uninstall_result.path}")
+            if uninstall_result.retained_extra_files:
+                print(f"Retained unrecognized files in {uninstall_result.path}")
+            return 0
         service_commands = {
             "init",
             "status",

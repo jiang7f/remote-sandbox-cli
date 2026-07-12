@@ -183,7 +183,7 @@ def make_prompt_shell_harness() -> PromptShellHarness:
     session = ManagedShellSession(
         backend=backend,
         nonce="prompt-test-nonce",
-        target="ZJU_2",
+        target="dev-server",
     )
     session.activate_workspace(
         ConnectResponse(

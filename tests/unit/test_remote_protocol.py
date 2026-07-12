@@ -8,13 +8,13 @@ from remote_sandbox.remote_protocol import (
 
 
 def test_agent_protocol_round_trips_unicode_paths_without_shell_quoting() -> None:
-    request = AgentRequest("register", {"workspace_id": "w1", "root": "/home/u/算法测试"})
+    request = AgentRequest("register", {"workspace_id": "w1", "root": "/home/user/示例项目"})
 
     encoded = encode_request(request)
 
     assert encoded.endswith(b"\n")
     assert encoded.count(b"\n") == 1
-    assert "算法测试".encode() in encoded
+    assert "示例项目".encode() in encoded
     assert decode_request(encoded) == request
 
 

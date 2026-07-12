@@ -101,7 +101,7 @@ def test_live_prompt_sentinel_has_the_same_fixed_display_width() -> None:
         (
             shell_module.WorkspacePhase.INITIAL_SYNCING,
             shell_module.SyncProgress("scanning"),
-            "[ZJU_2:dq scanning]",
+            "[dev-server:dq scanning]",
         ),
         (
             shell_module.WorkspacePhase.INITIAL_SYNCING,
@@ -110,12 +110,12 @@ def test_live_prompt_sentinel_has_the_same_fixed_display_width() -> None:
                 files_done=40,
                 files_total=100,
             ),
-            "[ZJU_2:dq sync 40%]",
+            "[dev-server:dq sync 40%]",
         ),
         (
             shell_module.WorkspacePhase.READY,
             shell_module.SyncProgress("idle"),
-            "[ZJU_2:dq]",
+            "[dev-server:dq]",
         ),
     ],
 )
@@ -129,7 +129,7 @@ def test_slot_keeps_readline_width_but_visually_returns_to_compact_width(
         progress,
     )
 
-    replacement = shell_module._render_prompt_slot("ZJU_2", "dq", status)
+    replacement = shell_module._render_prompt_slot("dev-server", "dq", status)
     padding = 34 - shell_module.display_width(compact)
 
     assert replacement == compact + " " * padding + f"\x1b[{padding}D"

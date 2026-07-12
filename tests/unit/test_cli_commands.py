@@ -17,6 +17,12 @@ def test_parser_exposes_confirmed_commands_and_debug_flag() -> None:
     assert status.watch is True
     assert status.paths is True
     assert parser.parse_args(["conflicts", "dq"]).command == "conflicts"
+    skill = parser.parse_args(["skill", "install", "--force"])
+    assert skill.skill_command == "install"
+    assert skill.force is True
+    uninstall = parser.parse_args(["skill", "uninstall"])
+    assert uninstall.skill_command == "uninstall"
+    assert uninstall.force is False
     resolved = parser.parse_args(["resolve", "model.py", "--use-local"])
     assert resolved.use_local is True
     forgotten = parser.parse_args(["forget", "dq", "--local-only"])

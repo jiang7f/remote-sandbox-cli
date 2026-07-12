@@ -1,230 +1,231 @@
 # remote-sandbox
 
-`remote-sandbox` 让编辑器只操作本地工作区，同时通过 SSH 在远程工作区执行命令，并由本地 supervisor 维护双向同步。
+`remote-sandbox` 将本地目录和 SSH 服务器上的目录绑定为一个双向同步工作区。编辑器和 AI 编码助手只操作本地文件，需要远程环境或算力时通过 `rsb` 执行命令。
 
-正式命令只有 `rsb`。工具状态位于 `~/.remote-sandbox`，运行时文件位于 `/tmp/remote-sandbox-<uid>`，项目目录内不会写入控制元数据。
+正式命令只有 `rsb`。
+
+- 本地和远程同时运行文件 watcher，修改会持续同步。
+- 首次同步显示扫描、规划、传输和重放状态。
+- 远程 shell 的提示符会动态显示同步状态，例如 `[dev-server:project sync 40%]`。
+- 工具元数据保存在工作区之外，不会向项目目录写入 `.remote-sandbox`。
+- `.git` 始终留在各自所在的一侧，不参与同步。
 
 ## 安装
 
-使用 `uv` 安装公开发布版。
+推荐使用 `uv` 安装独立命令。
 
 ```bash
 uv tool install remote-sandbox
 rsb --help
 ```
 
-## 源码开发
-
-从当前源码安装可编辑版命令。
+也可以安装到当前 Python 虚拟环境。
 
 ```bash
-uv tool install --editable .
+python -m pip install remote-sandbox
 rsb --help
 ```
 
-在仓库中开发时也可以直接使用 `uv run rsb`。
+升级已安装版本。
+
+```bash
+uv tool upgrade remote-sandbox
+```
 
 ## 环境要求
 
-本机需要以下工具。
+本机需要 Python 3.11、3.12 或 3.13，以及 OpenSSH、`rsync` 和 `tar`。远程服务器需要 Python 3.10 或更高版本，以及 OpenSSH、`bash`、`rsync` 和 `tar`。
 
-- Python 3.11、3.12 或 3.13
-- `uv`
-- OpenSSH 客户端
-- `rsync`
-- `tar`
+先确保普通 SSH 连接可用。建议在 `~/.ssh/config` 中配置主机别名、用户、密钥、端口和跳板机。
 
-远程服务器需要以下环境。
+```sshconfig
+Host dev-server
+    HostName server.example.com
+    User devuser
+    IdentityFile ~/.ssh/id_ed25519
+```
 
-- OpenSSH 服务
-- Python 3.10 或更高版本
-- `bash`
-- `rsync`
-- `tar`
-
-SSH 主机、端口、用户、密钥和跳板机应配置在 `~/.ssh/config` 中。程序调用系统 OpenSSH，不读取或复制私钥内容。
+`remote-sandbox` 调用系统 OpenSSH，不读取或复制私钥内容。
 
 ## 快速开始
 
+### 直接绑定目录
+
+在本地项目目录中执行。
+
 ```bash
-uv sync --locked
-uv run rsb --help
-uv run rsb list
+cd ~/projects/project
+rsb connect dev-server \
+  --remote ~/work/project \
+  --name project
 ```
 
-直接绑定已知远程目录。
+确认本地和远程路径后，`rsb` 会立即建立绑定、启动两侧 watcher，并进入远程 shell。首次同步期间，方括号中的状态会原位更新。同步完成后提示符变为 `[dev-server:project]`，shell 不会因为同步结束而自动退出。
+
+如果只想建立绑定而不进入 shell，可以使用 `--no-shell`。
 
 ```bash
-uv run rsb connect ZJU_2 \
+rsb connect dev-server \
   --remote ~/work/project \
-  --local ./project \
+  --local ~/projects/project \
   --name project \
   --no-shell
 ```
 
-在 CI 或其他已明确核对过两侧目录的非交互自动化中，可以显式接受新绑定确认。
+### 先浏览远程目录
+
+不知道远程目录的准确路径时，可以先进入服务器。
 
 ```bash
-rsb connect ZJU_2 --remote ~/work/project --name project --no-shell --yes
+cd ~/projects/project
+rsb enter dev-server
 ```
 
-先浏览远程服务器，再从同一个 shell 发起绑定。
+在打开的远程 shell 中切换目录，然后发起绑定。
 
 ```bash
-uv run rsb enter ZJU_2
+cd ~/work/project
+rsb connect --name project
 ```
 
-进入浏览 shell 后，切换到目标目录并执行终端内提供的 `rsb connect` 请求。
+### 首次同步规则
+
+新绑定只接受明确、可判断来源的目录状态。
+
+- 本地非空、远程为空时，本地内容上传到远程。
+- 本地为空、远程非空时，远程内容下载到本地。
+- 两端都为空时，建立空工作区。
+- 两端都非空且没有已验证的历史状态时，拒绝自动合并。
+
+首次传输开始前 watcher 已经启动。扫描期间发生的新修改会进入事件 journal，并在初始快照传输后重放，避免初始化时间较长时漏掉修改。
+
+## 查看状态和路径
+
+```bash
+rsb status
+rsb status project
+rsb status project --paths
+rsb status project --watch
+```
+
+`--paths` 显示绑定的本地目录和 `<SSH target>:<remote path>`。`--watch` 持续刷新同步阶段、进度、待处理事件、冲突和错误。
+
+常见阶段包括 `initial-syncing`、`syncing`、`ready`、`degraded` 和 `failed`。扫描尚未得到总文件数时显示 `scanning` 或 `collecting`，得到传输计划后才显示百分比。
+
+## 执行远程命令
+
+运行一条远程命令并返回它的退出状态。
+
+```bash
+rsb run project -- pytest -q
+rsb run project -- python3 train.py
+```
+
+打开持续交互的远程 shell。
+
+```bash
+rsb shell project
+```
+
+如果工作区正在同步，从 `rsb shell` 打开的其他 shell 也会显示同一个动态状态前缀。
 
 ## 常用命令
 
 ```bash
-uv run rsb list
-uv run rsb status [name] [--watch] [--paths]
-uv run rsb start [name]
-uv run rsb stop [name]
-uv run rsb shell [name]
-uv run rsb run [name] -- python3 train.py
-uv run rsb reconnect <name> [--local <path>] [--no-shell]
-uv run rsb conflicts [name]
-uv run rsb resolve <path> --use-local
-uv run rsb resolve <path> --use-remote
-uv run rsb fetch <path>
-uv run rsb fetch --all
-uv run rsb peek <path> --lines 40
-uv run rsb peek <path> --tail 40
-uv run rsb forget <name>
-uv run rsb forget <name> --local-only
+rsb list
+rsb status [name] [--watch] [--paths]
+rsb start [name]
+rsb stop [name]
+rsb shell [name]
+rsb run [name] -- <command>
+rsb reconnect <name> [--local <path>] [--no-shell]
+rsb conflicts [name]
+rsb resolve <path> --use-local
+rsb resolve <path> --use-remote
+rsb fetch <path>
+rsb fetch --all
+rsb peek <path> --lines 40
+rsb peek <path> --tail 40
+rsb forget <name>
+rsb forget <name> --local-only
 ```
-
-查看绑定的本地和远程目录。
-
-```bash
-rsb status --paths
-rsb status project --paths
-```
-
-`REMOTE` 列使用 `<SSH target>:<remote path>` 格式。
-
-`forget <name>` 会停止本地 supervisor，停止远程 watcher，删除远程工具元数据，删除本地工具元数据，并删除连接记录。它不会删除本地或远程项目文件。
-
-`forget <name> --local-only` 用于远程服务器不可达的情况。它只删除本地元数据和连接记录，并明确报告仍然存在的远程工具元数据路径。
 
 ## 给 AI 编码助手使用
 
-不需要专门的 skill。AI 只编辑本地工作区，需要运行测试、训练或其他项目命令时，通过 `rsb run` 在远程工作区执行。
+### Codex 推荐方式
 
-临时使用时，可以直接把下面这段发给 AI。
+安装 `remote-sandbox` 后执行一次。
 
-```text
-这个项目通过 remote-sandbox 绑定，绑定名是 dq。
-只读写当前本地项目目录。
-先用 rsb status dq --paths 确认绑定。
-运行项目命令时使用 rsb run dq -- <command>。
-不要直接通过 SSH 修改远程项目文件。
+```bash
+rsb skill install
 ```
 
-经常使用时，把同样的规则放进项目根目录的 `AGENTS.md`。
+该命令把随软件发布的 skill 安装到 `${CODEX_HOME:-~/.codex}/skills/remote-sandbox`。重新打开 Codex 任务后，只需要告诉 AI binding 名称。
+
+```text
+使用 rsb 的 project binding 运行测试。
+```
+
+如果 Codex 当前就在绑定的本地目录中，也可以只说。
+
+```text
+这个项目使用 rsb。修改代码并在远程运行测试。
+```
+
+skill 会先运行 `rsb status --paths` 自动确认 binding。本地文件仍由 AI 直接读取和编辑，需要项目环境或远程算力的命令通过 `rsb run <name> -- <command>` 执行。只有明确需要人工交互终端时才使用 `rsb shell`。
+
+升级 `remote-sandbox` 后，可以更新已安装的 skill。
+
+```bash
+rsb skill install --force
+```
+
+不再需要时可以卸载。
+
+```bash
+rsb skill uninstall
+```
+
+如果 skill 文件被手动修改，卸载会先保护这些修改并提示使用 `--force`。卸载只处理 `rsb` 管理的文件，不会递归删除同一目录中的其他文件。
+
+### 其他 AI 编码助手
+
+不支持 Codex skill 的工具可以读取项目根目录的 `AGENTS.md`。加入以下规则后，不需要在每次任务中重复完整提示。
 
 ```markdown
 ## Remote execution
 
-This project is bound through remote-sandbox as `dq`.
+This project is bound through remote-sandbox as `project`.
+
 - Read and edit only the local working tree.
-- Check the binding with `rsb status dq --paths`.
-- Run project commands with `rsb run dq -- <command>`.
+- Check the binding with `rsb status project --paths`.
+- Run commands that need the project environment or remote compute with `rsb run project -- <command>`.
 - Do not edit the remote workspace directly over SSH.
+- Report remote command failures separately from synchronization warnings.
 ```
 
-例如，AI 要在远程运行测试时执行。
+AI 编辑代码时仍然直接操作当前本地目录。需要远程依赖、GPU、编译器或测试环境时执行如下命令。
 
 ```bash
-rsb run dq -- pytest -q
+rsb run project -- pytest -q
 ```
 
-`rsb shell dq` 适合人工交互操作。对 AI 来说，可返回退出状态的 `rsb run` 更简单也更稳定。
+`rsb run` 会返回远程命令的标准输出、标准错误和退出状态，比让 AI 驱动交互式 `rsb shell` 更稳定。
 
-## 元数据隔离
+## 忽略规则和占位文件
 
-同步项目树中不会写入 `.remote-sandbox` 目录。
-
-本机工具状态默认位于以下位置。
-
-```text
-~/.remote-sandbox/config.toml
-~/.remote-sandbox/connections.toml
-~/.remote-sandbox/workspaces/<workspace-id>/workspace.toml
-~/.remote-sandbox/workspaces/<workspace-id>/state.sqlite3
-~/.remote-sandbox/workspaces/<workspace-id>/daemon.log
-```
-
-本机 socket 和 SSH control master 默认位于以下运行时目录。
-
-```text
-/tmp/remote-sandbox-<uid>/
-```
-
-远程工具元数据默认位于以下位置。
-
-```text
-~/.remote-sandbox/agents/<agent-version>/agent.pyz
-~/.remote-sandbox/workspaces/<workspace-id>/
-```
-
-测试可以通过 `REMOTE_SANDBOX_HOME`、`REMOTE_SANDBOX_RUNTIME_DIR` 和 `REMOTE_SANDBOX_CONNECTIONS` 指向一次性目录。
-
-## `.git` 规则
-
-`.git` 始终是本地专用内容。
-
-- `.git` 不会上传到远程工作区。
-- 远程 `.git` 不会拉回本地工作区。
-- `.rsbignore` 不能重新启用 `.git` 同步。
-- 工具元数据也不会进入 Git 项目树。
-
-## 首次同步
-
-首次同步只接受以下明确状态。
-
-- 本地非空、远程为空时执行本地到远程同步。
-- 本地为空、远程非空时执行远程到本地同步。
-- 两端都为空时建立空工作区。
-- 两端都非空且没有可恢复的已验证状态时拒绝继续。
-
-首次同步启动 watcher 后再扫描，并在扫描、规划、传输和重放阶段发布状态。传输完成的文件经过源端和目标端验证后才写入 base 和 expected echo 状态。中断后会从已持久化的验证结果继续。
-
-## 增量同步与冲突
-
-本地和远程事件进入 SQLite journal。同步引擎根据 base、local 和 remote 三方状态决定上传、下载、删除、expected echo 或冲突。
-
-查看冲突。
+在项目根目录创建默认 `.rsbignore`。
 
 ```bash
-uv run rsb conflicts project
+rsb init
 ```
 
-选择保留的一侧。
-
-```bash
-uv run rsb resolve path/to/file --use-local
-uv run rsb resolve path/to/file --use-remote
-```
-
-冲突解决通过 supervisor mutation 队列执行，不会与增量同步引擎并发修改同一路径。
-
-## 忽略和占位文件
-
-在项目根目录运行以下命令可以创建默认 `.rsbignore`。
-
-```bash
-uv run rsb init
-```
-
-普通规则表示忽略。`[placeholder]` 后的规则表示在本地保留占位文件。
+普通规则表示忽略。`[placeholder]` 后的规则表示大文件只在本地保留占位信息，需要时再获取。
 
 ```gitignore
 .venv/
 __pycache__/
+.pytest_cache/
 node_modules/
 
 [placeholder]
@@ -234,44 +235,72 @@ checkpoints/
 设置全局占位阈值。
 
 ```bash
-uv run rsb set placeholder-limit 100MB
+rsb set placeholder-limit 100MB
 ```
 
-`peek` 只读取远程文件的前部或尾部，不替换本地占位文件，也不更新同步 base。`fetch` 会通过 supervisor 拉取并验证占位文件。
+`peek` 只读取远程文件的开头或结尾。`fetch` 会拉取并验证占位文件。
 
-## 测试
+## 冲突处理
 
-单元和集成测试要求覆盖率不低于 85%。
+当本地和远程在同一基线之后修改了同一路径时，`rsb` 保留两侧内容并记录冲突，不会静默覆盖。
 
 ```bash
-uv run pytest tests/unit tests/integration \
-  --cov=remote_sandbox \
-  --cov-report=term-missing \
-  --cov-fail-under=85
+rsb conflicts project
+rsb resolve path/to/file --use-local
+rsb resolve path/to/file --use-remote
 ```
 
-性能测试使用 5,000 个确定性的 128 字节文件。传输门使用一次预热和五组交替顺序样本，并对中位数应用未放宽的比较公式。
+## 元数据和清理
 
-```bash
-uv run pytest -q -s tests/performance -m performance
+项目目录中不会创建 `.remote-sandbox`。本机状态默认保存在以下位置。
+
+```text
+~/.remote-sandbox/config.toml
+~/.remote-sandbox/connections.toml
+~/.remote-sandbox/workspaces/<workspace-id>/workspace.toml
+~/.remote-sandbox/workspaces/<workspace-id>/state.sqlite3
+~/.remote-sandbox/workspaces/<workspace-id>/daemon.log
 ```
 
-Docker SSH E2E 使用一次性 Ubuntu 22.04 容器、随机回环端口、临时 HOME、临时工具状态和临时 Ed25519 密钥。
+socket 和 SSH control master 位于 `/tmp/remote-sandbox-<uid>/`。远程 agent 和 workspace 状态位于 `~/.remote-sandbox/`，同样不在远程项目目录内。
+
+测试或隔离环境可以使用 `REMOTE_SANDBOX_HOME`、`REMOTE_SANDBOX_RUNTIME_DIR` 和 `REMOTE_SANDBOX_CONNECTIONS` 覆盖默认位置。
+
+正常删除绑定。
 
 ```bash
-RSB_E2E_REQUIRED=1 uv run pytest -q -s tests/e2e -m e2e
+rsb forget project
 ```
 
-未设置 `RSB_E2E_REQUIRED=1` 且本机没有 Docker 时，E2E 会明确跳过。设置后缺少 Docker 会直接失败，适合 Linux CI。
+该命令停止本地 supervisor 和远程 watcher，删除两侧工具元数据及连接记录，但不会删除本地或远程项目文件。
 
-## 质量检查
+远程服务器不可达时，可以只清理本机记录。
 
 ```bash
-uv lock --check
+rsb forget project --local-only
+```
+
+命令会报告仍留在远程的工具元数据位置，方便服务器恢复后手动处理。
+
+## 源码开发
+
+```bash
+git clone https://github.com/jiang7f/remote-sandbox-cli.git
+cd remote-sandbox-cli
+uv sync --locked
+uv run rsb --help
+```
+
+运行代码质量检查和测试。
+
+```bash
 uv run ruff check .
 uv run mypy src
-uv run python -m compileall -q src tests
-git diff --check
+uv run pytest
 ```
 
-CI 在 macOS 和 Linux 上运行 Python 3.11、3.12 和 3.13 的单元与集成测试。Docker E2E 和性能测试只在 Linux job 中运行。
+从当前源码安装可编辑命令。
+
+```bash
+uv tool install --editable .
+```

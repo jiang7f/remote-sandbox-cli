@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Work only in `/Users/7f/仓库/remote-sandbox-cli`.
+- Work only in the repository root.
 - Preserve the existing unstaged changes in `src/remote_sandbox/cli.py`, `src/remote_sandbox/daemon.py`, and `src/remote_sandbox/ssh.py`. Do not reset or discard them.
 - Fold the existing reconnect and authentication-classification behavior into Tasks 8, 13, and 16 with regression tests before staging those files.
 - Stage explicit task files only. Do not use `git add .`.
@@ -322,7 +322,7 @@ def test_workspace_paths_live_outside_working_tree(monkeypatch, tmp_path: Path) 
     local_root.mkdir()
     spec = new_workspace_spec(
         name="dq",
-        target="ZJU_2",
+        target="dev-server",
         local_root=local_root,
         remote_root="/home/user/dq",
     )
@@ -1170,7 +1170,7 @@ from remote_sandbox.remote_protocol import AgentRequest, decode_request, encode_
 
 
 def test_agent_protocol_round_trips_unicode_paths_without_shell_quoting() -> None:
-    request = AgentRequest("register", {"workspace_id": "w1", "root": "/home/u/算法测试"})
+    request = AgentRequest("register", {"workspace_id": "w1", "root": "/home/user/示例项目"})
     assert decode_request(encode_request(request)) == request
 ```
 
@@ -3159,7 +3159,7 @@ def test_all_live_status_slots_have_equal_display_width() -> None:
         ),
         WorkspaceStatus(WorkspacePhase.DISCONNECTED, SyncProgress("offline")),
     ]
-    rendered = [renderer.render("ZJU_2", "dq", status) for status in states]
+    rendered = [renderer.render("dev-server", "dq", status) for status in states]
     assert {len(value) for value in rendered} == {34}
     assert "planning" in rendered[1]
     assert "sync 40%" in rendered[2]
@@ -3227,7 +3227,7 @@ class PromptShellHarness:
 ```
 
 `make_prompt_shell_harness()` creates a managed test session already positioned at a Bash prompt
-with target `ZJU_2`, name `dq`, and a fake Readline endpoint that applies the private redraw binding.
+with target `dev-server`, name `dq`, and a fake Readline endpoint that applies the private redraw binding.
 Append the fixture to `tests/integration/conftest.py`:
 
 ```python
@@ -4009,12 +4009,12 @@ git diff --check
 
 Expected: all verification commands PASS and no workspace contains control metadata.
 
-- [ ] **Step 8: Perform manual ZJU_2 acceptance after automated gates pass**
+- [ ] **Step 8: Perform manual dev-server acceptance after automated gates pass**
 
 Use only the development command and disposable directories:
 
 ```bash
-uv run rsb enter ZJU_2
+uv run rsb enter dev-server
 uv run rsb status dq --watch
 uv run rsb reconnect dq
 uv run rsb forget dq
