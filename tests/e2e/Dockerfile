@@ -1,7 +1,7 @@
 FROM ubuntu:22.04
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    openssh-server python3 rsync tar ca-certificates && \
+    openssh-server python3 rsync tar ca-certificates iptables && \
     rm -rf /var/lib/apt/lists/* && \
     mkdir -p /run/sshd && \
     useradd --create-home --shell /bin/bash test && \

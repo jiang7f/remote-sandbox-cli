@@ -12,12 +12,13 @@ def test_remote_watcher_crash_becomes_degraded_and_requests_audit(
     supervisor_fixture: SupervisorHarness,
 ) -> None:
     supervisor_fixture.remote.raise_watcher_crash()
-    supervisor_fixture.supervisor.handle_subscription_failure(
+    delay = supervisor_fixture.supervisor.handle_subscription_failure(
         supervisor_fixture.remote.failure
     )
     status = supervisor_fixture.store.get_status()
     assert status.phase is WorkspacePhase.DEGRADED
     assert supervisor_fixture.supervisor.audit_requested is True
+    assert delay == 0.25
 
 
 def test_live_pid_without_control_socket_is_never_reported_stopped(

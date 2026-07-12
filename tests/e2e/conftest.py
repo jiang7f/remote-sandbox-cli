@@ -357,28 +357,30 @@ class SshFixture:
         )
 
     def disconnect_network(self) -> None:
-        subprocess.run(
-            ["docker", "network", "disconnect", "bridge", self.container_id],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=20.0,
+        self._docker_exec(
+            "iptables",
+            "-I",
+            "INPUT",
+            "1",
+            "-p",
+            "tcp",
+            "--dport",
+            "2222",
+            "-j",
+            "REJECT",
         )
 
     def reconnect_network(self) -> None:
-        subprocess.run(
-            ["docker", "network", "connect", "bridge", self.container_id],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=20.0,
-        )
-        subprocess.run(
-            ["docker", "restart", self.container_id],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30.0,
+        self._docker_exec(
+            "iptables",
+            "-D",
+            "INPUT",
+            "-p",
+            "tcp",
+            "--dport",
+            "2222",
+            "-j",
+            "REJECT",
         )
         _wait_for_ssh_python(self)
 
@@ -895,6 +897,8 @@ def start_ssh_fixture(tmp_path: Path) -> SshFixture:
                 "run",
                 "-d",
                 "--rm",
+                "--cap-add",
+                "NET_ADMIN",
                 "-p",
                 "127.0.0.1::2222",
                 "-v",

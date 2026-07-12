@@ -48,6 +48,7 @@ _CONTROL_MAX_LINE_BYTES = 64 * 1024
 _CONTROL_HANDLER_LIMIT = 16
 _MUTATION_WAITER_LIMIT = 12
 _MAX_BACKOFF_S = 30.0
+_DEGRADED_INITIAL_BACKOFF_S = 0.25
 _MUTATION_TIMEOUT_S = 3600.0
 
 
@@ -478,7 +479,7 @@ class WorkspaceSupervisor:
             self._request_audit()
             phase = WorkspacePhase.DEGRADED
             stage = "audit-requested"
-            delay = self._backoff_delay()
+            delay = self._degraded_backoff_delay()
         else:
             self._requires_foreground_auth = False
             self._connection_state = "reconnecting"
@@ -685,6 +686,14 @@ class WorkspaceSupervisor:
 
     def _backoff_delay(self) -> float:
         return float(min(2.0 * 2 ** (self._consecutive_failures - 1), _MAX_BACKOFF_S))
+
+    def _degraded_backoff_delay(self) -> float:
+        return float(
+            min(
+                _DEGRADED_INITIAL_BACKOFF_S * 2 ** (self._consecutive_failures - 1),
+                _MAX_BACKOFF_S,
+            )
+        )
 
     def _status(self) -> DaemonStatus:
         status = self.store.get_status()
