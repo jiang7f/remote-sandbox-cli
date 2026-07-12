@@ -187,7 +187,7 @@ class _SupervisorControlServer:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(path)
         self._runtime.socket.chmod(0o600)
-        sock.listen(8)
+        sock.listen(_CONTROL_HANDLER_LIMIT)
         sock.settimeout(0.5)
         self._sock = sock
         self._thread = threading.Thread(
