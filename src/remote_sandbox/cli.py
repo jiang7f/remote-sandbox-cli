@@ -90,7 +90,7 @@ class CliServices:
     ensure_supervisor: Callable[[BindingRecord], object]
     request_sync: Callable[[BindingRecord], bool]
     run_remote: Callable[[BindingRecord, tuple[str, ...]], RemoteCommandResult]
-    connect_workspace: Callable[[str, str, Path, str | None], ConnectedWorkspace]
+    connect_workspace: Callable[[str, str, Path, str | None, bool], ConnectedWorkspace]
     wait_initial_sync: Callable[[BindingRecord, int], WorkspaceStatus]
     fetch_placeholders: Callable[
         [BindingRecord, str | None, bool, Callable[[str], bool]],
@@ -210,6 +210,7 @@ def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
             args.remote,
             Path(args.local),
             args.name,
+            args.yes,
         )
         record = connection.record
         services.ensure_supervisor(record)
@@ -242,6 +243,7 @@ def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
             existing.remote_path,
             local,
             existing.name,
+            False,
         )
         rebound = connection.record
         services.ensure_supervisor(rebound)
@@ -399,13 +401,14 @@ def default_cli_services() -> CliServices:
         remote: str,
         local: Path,
         name: str | None,
+        assume_yes: bool,
     ) -> ConnectedWorkspace:
         result = bind_workspace(
             target=target,
             remote=remote,
             local=local,
             runner=_connected_runner(target),
-            confirm=confirm_prompt,
+            confirm=(lambda _prompt: True) if assume_yes else confirm_prompt,
             connection_name=name,
         )
         with WorkspaceStore.open(workspace_paths(result.connection.workspace_id).state_db) as store:
@@ -643,6 +646,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     connect.add_argument("-l", "--local", default=".", help="Local workspace path; defaults to cwd")
     connect.add_argument("--name", default=None, help="Connection name for rsb reconnect")
+    connect.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Accept the new binding confirmation",
+    )
     connect.add_argument(
         "--no-shell",
         action="store_true",
@@ -994,6 +1003,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.remote,
                 Path(args.local),
                 args.name,
+                args.yes,
             )
             record = connection.record
             _print_connection(record)
@@ -1014,6 +1024,7 @@ def main(argv: list[str] | None = None) -> int:
                 existing.remote_path,
                 local,
                 existing.name,
+                False,
             )
             rebound = connection.record
             if args.no_shell:

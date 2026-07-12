@@ -176,7 +176,7 @@ def test_default_services_adapters_use_isolated_runtime_boundaries(
             created=True,
         ),
     )
-    connected = services.connect_workspace("host", "/work/dq", local, "dq")
+    connected = services.connect_workspace("host", "/work/dq", local, "dq", False)
     assert connected.record == record and connected.created is True
 
     class Client:

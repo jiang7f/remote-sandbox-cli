@@ -19,6 +19,21 @@ def _wait_until(predicate: Callable[[], bool], *, timeout: float = 3.0) -> None:
     raise AssertionError("timed out waiting for filesystem event")
 
 
+def _wait_for_event_quiet(events: list[JournalEvent], *, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    quiet_since = time.monotonic()
+    observed = len(events)
+    while time.monotonic() < deadline:
+        current = len(events)
+        if current != observed:
+            observed = current
+            quiet_since = time.monotonic()
+        elif time.monotonic() - quiet_since >= 0.15:
+            return
+        time.sleep(0.02)
+    raise AssertionError("timed out waiting for filesystem events to settle")
+
+
 def test_real_watchdog_creation_appends_one_relative_path_to_journal(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
@@ -50,7 +65,6 @@ def test_real_watchdog_preserves_a_move_as_one_journal_event(tmp_path: Path) -> 
     root = tmp_path / "workspace"
     root.mkdir()
     source = root / "before.py"
-    source.touch()
     recorded: list[JournalEvent] = []
     sequence = 0
 
@@ -64,9 +78,13 @@ def test_real_watchdog_preserves_a_move_as_one_journal_event(tmp_path: Path) -> 
     try:
         (root / "event-barrier").touch()
         _wait_until(lambda: any(event.path == "event-barrier" for event in recorded))
+        source.touch()
+        _wait_until(lambda: any(event.path == "before.py" for event in recorded))
+        _wait_for_event_quiet(recorded)
         recorded.clear()
         source.rename(root / "after.py")
         _wait_until(lambda: any(event.kind is EventKind.MOVE for event in recorded))
+        _wait_for_event_quiet(recorded)
     finally:
         watcher.stop()
 

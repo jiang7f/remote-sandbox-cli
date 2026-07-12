@@ -62,6 +62,12 @@ uv run rsb connect ZJU_2 \
   --no-shell
 ```
 
+在 CI 或其他已明确核对过两侧目录的非交互自动化中，可以显式接受新绑定确认。
+
+```bash
+rsb connect ZJU_2 --remote ~/work/project --name project --no-shell --yes
+```
+
 先浏览远程服务器，再从同一个 shell 发起绑定。
 
 ```bash

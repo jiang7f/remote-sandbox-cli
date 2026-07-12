@@ -526,16 +526,24 @@ def _connect_remote(
     name: str = "dq",
 ) -> None:
     output_start = len(output)
+    command_marker = b"rsb connect --remote "
     os.write(
         fd,
         f"rsb connect --remote {shlex.quote(str(workspace))}\n".encode(),
     )
+    command_at = _read_pty_until(
+        fd,
+        output,
+        command_marker,
+        timeout=3.0,
+        start=output_start,
+    )
     _read_pty_until(
         fd,
         output,
-        f"\r\n\x1b[01;36m[host:{name}".encode(),
+        f"\x1b[01;36m[host:{name}".encode(),
         timeout=3.0,
-        start=output_start,
+        start=command_at,
     )
 
 

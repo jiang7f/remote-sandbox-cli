@@ -22,9 +22,19 @@ def test_parser_exposes_confirmed_commands_and_debug_flag() -> None:
     forgotten = parser.parse_args(["forget", "dq", "--local-only"])
     assert forgotten.local_only is True
     no_shell = parser.parse_args(
-        ["connect", "host", "--remote", "/work/dq", "--name", "dq", "--no-shell"]
+        [
+            "connect",
+            "host",
+            "--remote",
+            "/work/dq",
+            "--name",
+            "dq",
+            "--no-shell",
+            "--yes",
+        ]
     )
     assert no_shell.no_shell is True
+    assert no_shell.yes is True
 
 
 def test_resolve_requires_exactly_one_selected_source() -> None:

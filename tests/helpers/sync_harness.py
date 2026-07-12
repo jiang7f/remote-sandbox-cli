@@ -937,6 +937,7 @@ def make_cli_harness(tmp_path: Path) -> CliHarness:
         remote: str,
         local: Path,
         name: str | None,
+        _assume_yes: bool,
     ) -> ConnectedWorkspace:
         assert target == "host"
         assert remote == "/work/dq"

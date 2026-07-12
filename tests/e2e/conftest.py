@@ -86,7 +86,10 @@ class PtyShell:
         started = time.monotonic()
         output_start = len(self._output)
         self._send(command.encode() + b"\n")
-        self._wait_for(b"[", timeout=20.0, start=output_start)
+        self._wait_for(b"[y/N]", timeout=20.0, start=output_start)
+        output_start = len(self._output)
+        self._send(b"y\n")
+        self._wait_for(f"[{self._fixture.host}:{name}".encode(), timeout=20.0, start=output_start)
         if self.first_sync_status_at == float("inf"):
             self.first_sync_status_at = time.monotonic()
         if self.first_sync_status_at < started:
@@ -429,6 +432,7 @@ class SshFixture:
             "--name",
             name,
             "--no-shell",
+            "--yes",
         )
         result = (
             self.cli_with_password(*command, password=_PASSWORD)
