@@ -9,6 +9,7 @@ def test_key_connection_replays_remote_delete_after_network_recovery(ssh_fixture
     path = remote / "delete-me.txt"
     ssh_fixture.write_remote(path, b"x")
     ssh_fixture.wait_for_local_file(local / "delete-me.txt")
+    ssh_fixture.wait_for_state("key-recovery", "ready")
 
     ssh_fixture.disconnect_network()
     ssh_fixture.delete_remote(path)
