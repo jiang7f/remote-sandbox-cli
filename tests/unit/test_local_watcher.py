@@ -124,6 +124,10 @@ def test_watchdog_events_use_relative_paths(
         "nested/.git/config",
         ".remote-sandbox/state.sqlite3",
         ".remote-sandbox/daemon.log",
+        ".remote-sandbox-new-abc/value.txt",
+        "nested/.remote-sandbox-old-def/value.txt",
+        ".remote-sandbox-delete-ghi",
+        "nested/.remote-sandbox-recovered-jkl/value.txt",
     ],
 )
 def test_hard_ignored_paths_do_not_emit_events(ignored_path: str) -> None:

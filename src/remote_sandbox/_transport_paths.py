@@ -438,6 +438,7 @@ def _copy_from_descriptor(
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if stat.S_ISDIR(entry.st_mode):
         destination.mkdir(mode=stat.S_IMODE(entry.st_mode), exist_ok=True)
+        destination.chmod(stat.S_IMODE(entry.st_mode), follow_symlinks=False)
         _record_staged_signature(
             parent_fd,
             leaf,
@@ -648,10 +649,22 @@ def _copy_path_to_directory(source: Path, parent_fd: int, name: str) -> None:
                 shutil.copyfileobj(input_file, output, length=1024 * 1024)
         finally:
             os.close(descriptor)
+        os.chmod(
+            name,
+            stat.S_IMODE(entry.st_mode),
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
         return
     if not stat.S_ISDIR(entry.st_mode):
         raise OSError(errno.EINVAL, "unsupported staged entry")
     os.mkdir(name, stat.S_IMODE(entry.st_mode), dir_fd=parent_fd)
+    os.chmod(
+        name,
+        stat.S_IMODE(entry.st_mode),
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
     descriptor = _open_directory(name, dir_fd=parent_fd)
     try:
         for child in source.iterdir():

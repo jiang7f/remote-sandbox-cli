@@ -147,7 +147,7 @@ def test_enter_and_bind_rejects_invalid_control_startup_state(
     assert captured == []
 
 
-def test_enter_and_bind_ready_probe_handles_live_control_states(
+def test_enter_and_bind_uses_symmetric_immediate_shell_entry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -170,23 +170,5 @@ def test_enter_and_bind_ready_probe_handles_live_control_states(
     )
 
     assert cli.enter_and_bind(target="host", remote="~", local=local, open_shell=True) == 7
-    probe = captured[0].ready_probe
-    assert probe is not None
-
-    states = (
-        ("ready", "ok", "ready"),
-        ("failed", "ok", "stop"),
-        ("initial-syncing", "disconnected", "stop"),
-        ("initial-syncing", "ok", "pending"),
-    )
-    for phase, connection_state, expected in states:
-        current = SimpleNamespace(
-            phase=SimpleNamespace(value=phase),
-            conn_state=connection_state,
-        )
-        monkeypatch.setattr(
-            cli,
-            "daemon_control_status",
-            lambda _root, value=current: value,
-        )
-        assert probe() == expected
+    assert captured[0].ready_probe is None
+    assert captured[0].enter_immediately is True

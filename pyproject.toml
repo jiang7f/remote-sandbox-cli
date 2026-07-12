@@ -1,6 +1,6 @@
 [project]
 name = "remote-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 description = "Editor-agnostic remote workspace sandbox with SSH-backed execution and sync"
 readme = "README.md"
 license = "MIT"
@@ -30,9 +30,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jiang7f/remote-sandbox"
-Repository = "https://github.com/jiang7f/remote-sandbox"
-Issues = "https://github.com/jiang7f/remote-sandbox/issues"
+Homepage = "https://github.com/jiang7f/remote-sandbox-cli"
+Repository = "https://github.com/jiang7f/remote-sandbox-cli"
+Issues = "https://github.com/jiang7f/remote-sandbox-cli/issues"
 
 [project.scripts]
 rsb = "remote_sandbox.cli:main"

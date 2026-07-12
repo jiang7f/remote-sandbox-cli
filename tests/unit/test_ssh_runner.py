@@ -1,11 +1,33 @@
 from __future__ import annotations
 
 import subprocess
+import sys
+import threading
+import time
 
 import pytest
 
 import remote_sandbox.ssh as ssh_module
 from remote_sandbox.ssh import SshError, SubprocessSshRunner
+
+
+def test_cancellable_subprocess_stops_promptly() -> None:
+    cancelled = threading.Event()
+    timer = threading.Timer(0.1, cancelled.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(SshError, match="cancelled"):
+            ssh_module._run_cancellable_bytes(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                input_data=b"",
+                timeout=30.0,
+                cancel_event=cancelled,
+            )
+    finally:
+        timer.cancel()
+
+    assert time.monotonic() - started < 2.0
 
 
 def test_control_master_reuses_establishes_and_reports_failure(

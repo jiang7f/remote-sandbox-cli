@@ -4,9 +4,18 @@
 
 正式命令只有 `rsb`。工具状态位于 `~/.remote-sandbox`，运行时文件位于 `/tmp/remote-sandbox-<uid>`，项目目录内不会写入控制元数据。
 
-## 安装与开发
+## 安装
 
-从源码安装正式命令。
+使用 `uv` 安装公开发布版。
+
+```bash
+uv tool install remote-sandbox
+rsb --help
+```
+
+## 源码开发
+
+从当前源码安装可编辑版命令。
 
 ```bash
 uv tool install --editable .

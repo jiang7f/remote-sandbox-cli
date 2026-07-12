@@ -1,4 +1,6 @@
 import io
+import os
+import stat
 import subprocess
 import sys
 import tarfile
@@ -9,6 +11,7 @@ import pytest
 
 import remote_sandbox._transport_paths as transport_paths
 import remote_sandbox.transport as transport_module
+from remote_sandbox._transport_fingerprint import ProtectedLocalRoot
 from remote_sandbox._transport_remote import REMOTE_CREATE_CODE, REMOTE_EXTRACT_CODE
 from remote_sandbox.ssh import _DELETE_WORKSPACE_PATH_CODE
 from remote_sandbox.transport import (
@@ -168,6 +171,67 @@ def test_tar_creation_disables_macos_copyfile_metadata(
         lambda _progress: None,
     )
     assert observed[0]["COPYFILE_DISABLE"] == "1"
+
+
+def test_tar_staging_preserves_modes_under_strict_umask(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "tree").mkdir(mode=0o755)
+    (source / "tree" / "value.txt").write_text("value", encoding="utf-8")
+    (source / "tree" / "value.txt").chmod(0o644)
+    archive = tmp_path / "batch.tar"
+
+    previous = os.umask(0o077)
+    try:
+        with ProtectedLocalRoot(source) as protected:
+            transport_module._create_tar_archive(
+                protected,
+                ("tree", "tree/value.txt"),
+                archive,
+            )
+    finally:
+        os.umask(previous)
+
+    with tarfile.open(archive, "r:") as handle:
+        modes = {member.name.rstrip("/"): member.mode for member in handle.getmembers()}
+    assert modes == {"tree": 0o755, "tree/value.txt": 0o644}
+
+
+def test_remote_tar_extract_restores_modes_under_strict_umask(tmp_path: Path) -> None:
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w") as handle:
+        directory = tarfile.TarInfo("tree")
+        directory.type = tarfile.DIRTYPE
+        directory.mode = 0o755
+        handle.addfile(directory)
+        file_info = tarfile.TarInfo("tree/value.txt")
+        file_info.mode = 0o644
+        file_info.size = 5
+        handle.addfile(file_info, io.BytesIO(b"value"))
+
+    extracted = subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            "umask 077; exec \"$@\"",
+            "sh",
+            sys.executable,
+            "-c",
+            REMOTE_EXTRACT_CODE,
+            str(destination),
+            "tree",
+            "tree/value.txt",
+        ],
+        check=False,
+        input=payload.getvalue(),
+        capture_output=True,
+    )
+
+    assert extracted.returncode == 0, extracted.stderr.decode(errors="replace")
+    assert stat.S_IMODE((destination / "tree").stat().st_mode) == 0o755
+    assert stat.S_IMODE((destination / "tree" / "value.txt").stat().st_mode) == 0o644
 
 
 @pytest.mark.parametrize("engine", ["rsync", "tar"])

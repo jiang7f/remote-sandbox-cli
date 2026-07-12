@@ -7,7 +7,12 @@ import pytest
 import remote_sandbox.remote_agent.inotify as inotify_module
 import remote_sandbox.remote_agent.watcher as watcher_module
 from remote_sandbox.remote_agent.store import RemoteStore
-from remote_sandbox.remote_agent.watcher import PollingWatcher, WatcherService
+from remote_sandbox.remote_agent.watcher import (
+    PollingWatcher,
+    WatcherService,
+    path_is_hard_ignored,
+    scan_snapshot,
+)
 
 
 def _store(tmp_path: Path, root: Path) -> RemoteStore:
@@ -82,6 +87,25 @@ def test_watcher_service_falls_back_when_inotify_is_unavailable(
 
     assert service.backend_name == "polling"
     assert isinstance(service._backend, PollingWatcher)
+
+
+def test_remote_snapshot_and_path_filter_hide_internal_transport_paths(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    visible = root / "visible.txt"
+    visible.write_text("visible", encoding="utf-8")
+    internal = root / ".remote-sandbox-new-abc"
+    internal.mkdir()
+    (internal / "value.txt").write_text("internal", encoding="utf-8")
+    nested = root / "nested" / ".remote-sandbox-old-def"
+    nested.mkdir(parents=True)
+    (nested / "value.txt").write_text("internal", encoding="utf-8")
+
+    assert set(scan_snapshot(root)) == {"nested", "visible.txt"}
+    assert path_is_hard_ignored(internal / "value.txt", root)
+    assert path_is_hard_ignored(nested / "value.txt", root)
 
 
 class _Backend:

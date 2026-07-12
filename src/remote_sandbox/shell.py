@@ -119,6 +119,7 @@ class ConnectResponse:
     name: str | None = None
     remote_root: str | None = None
     direction: InitialShellDirection | None = None
+    enter_immediately: bool = False
     error: str | None = None
     ready_probe: Callable[[], ReadyProbeResult | bool] | None = field(
         default=None,
@@ -138,7 +139,8 @@ class ConnectResponse:
             raise ValueError("connect response contains a protocol control character")
         if self.direction not in {"local-to-remote", "remote-to-local", "empty"}:
             raise ValueError("connect response has an invalid initial direction")
-        return "\t".join(("ok", *encoded))
+        response = "\t".join(("ok", *encoded))
+        return response + "\t1" if self.enter_immediately else response
 
 
 class _ManagedSessionBackend(Protocol):
@@ -216,7 +218,7 @@ class ManagedShellSession:
             raise ValueError("invalid initial shell direction")
         self.prompt_mode = "managed"
         self._workspace_name = response.name or "workspace"
-        if direction == "local-to-remote":
+        if direction == "local-to-remote" and not response.enter_immediately:
             self._holding_cwd = self.remote_cwd
             self._pending_workspace_cwd = response.remote_root
             return
@@ -323,15 +325,23 @@ def build_managed_remote_shell_command(target: str, cwd: str, *, nonce: str) -> 
         "if [ -f /etc/bash.bashrc ]; then . /etc/bash.bashrc; fi\n"
         "if [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n"
         "__rsb_prompt() {\n"
-        "  local s=$?\n"
-        "  printf '\\033]777;remote-sandbox;cmd-done;%s;%s\\007' "
-        "\"$__rsb_nonce\" \"$s\"\n"
-        "  PS1='\\[\\e]777;rsb;prompt;${__rsb_nonce};managed\\a\\]"
+        "  __rsb_last_status=$?\n"
+        "  PS1='\\[\\e]777;remote-sandbox;cmd-done;${__rsb_nonce};"
+        "${__rsb_last_status}\\a\\]"
+        "\\[\\e]777;rsb;prompt;${__rsb_nonce};managed\\a\\]"
         f"\\[\\e[01;36m\\]{prompt_slot}\\[\\e[00m\\] "
         "${CONDA_PROMPT_MODIFIER}\\[\\e[01;32m\\]${USER:-user}@\\h\\[\\e[00m\\]:"
         "\\[\\e[01;34m\\]\\W\\[\\e[00m\\] % '\n"
         "}\n"
         "PROMPT_COMMAND=__rsb_prompt\n"
+        "bind '\"\\e[777~\": redraw-current-line'\n"
+        "bind -m emacs-standard '\"\\e[777~\": redraw-current-line' "
+        "2>/dev/null || :\n"
+        "bind -m emacs-meta '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
+        "bind -m emacs-ctlx '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
+        "bind -m vi-command '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
+        "bind -m vi-move '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
+        "bind -m vi '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
         "trap 'rm -f \"${BASH_SOURCE[0]}\"' EXIT\n"
         "EOF\n"
         "  } > \"$rc\"\n"
@@ -396,6 +406,7 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "    local __rsb_workspace_name=\"\"\n"
         "    local __rsb_workspace_root=\"\"\n"
         "    local __rsb_direction=\"\"\n"
+        "    local __rsb_enter_immediately=\"\"\n"
         "    while [ \"$#\" -gt 0 ]; do\n"
         "      case \"$1\" in\n"
         "        -r|--remote)\n"
@@ -491,6 +502,7 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "      ok$'\\t'*)\n"
         "        IFS=$'\\t' read -r __rsb_status __rsb_workspace_id "
         "__rsb_workspace_name __rsb_workspace_root __rsb_direction "
+        "__rsb_enter_immediately "
         "<<< \"$__rsb_response\"\n"
         "        ;;\n"
         "      *)\n"
@@ -511,11 +523,19 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "        return 1\n"
         "        ;;\n"
         "    esac\n"
+        "    case \"$__rsb_enter_immediately\" in\n"
+        "      ''|0|1) ;;\n"
+        "      *)\n"
+        "        printf 'rsb: invalid binding response\\n' >&2\n"
+        "        return 1\n"
+        "        ;;\n"
+        "    esac\n"
         "    export RSB_WORKSPACE_ID=$__rsb_workspace_id\n"
         "    export RSB_WORKSPACE_NAME=$__rsb_workspace_name\n"
         "    export RSB_WORKSPACE_ROOT=$__rsb_workspace_root\n"
         "    __rsb_prompt_mode=managed\n"
-        "    if [ \"$__rsb_direction\" = local-to-remote ]; then\n"
+        "    if [ \"$__rsb_direction\" = local-to-remote ] && "
+        "[ \"$__rsb_enter_immediately\" != 1 ]; then\n"
         "      cd -- \"$HOME\" || return 1\n"
         "      __rsb_workspace_holding=$PWD\n"
         "      __rsb_workspace_pending_root=$__rsb_workspace_root\n"
@@ -544,12 +564,25 @@ def build_enter_remote_shell_command(target: str, cwd: str, *, nonce: str) -> li
         "  READLINE_POINT=$__rsb_saved_point\n"
         "}\n"
         "bind -x '\"\\C-x\\C-]\": __rsb_ready_key'\n"
+        "bind -m emacs-standard -x '\"\\C-x\\C-]\": __rsb_ready_key' "
+        "2>/dev/null || :\n"
+        "bind -m emacs-meta -x '\"\\C-x\\C-]\": __rsb_ready_key' "
+        "2>/dev/null || :\n"
+        "bind -m emacs-ctlx -x '\"\\C-x\\C-]\": __rsb_ready_key' "
+        "2>/dev/null || :\n"
+        "bind -m vi-command -x '\"\\C-x\\C-]\": __rsb_ready_key' "
+        "2>/dev/null || :\n"
+        "bind -m vi-move -x '\"\\C-x\\C-]\": __rsb_ready_key' "
+        "2>/dev/null || :\n"
+        "bind -m vi-insertion -x '\"\\C-x\\C-]\": __rsb_ready_key' "
+        "2>/dev/null || :\n"
         "bind '\"\\e[777~\": redraw-current-line'\n"
         "bind -m emacs-standard '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
         "bind -m emacs-meta '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
         "bind -m emacs-ctlx '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
         "bind -m vi-command '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
         "bind -m vi-move '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
+        "bind -m vi-insertion '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
         "bind -m vi '\"\\e[777~\": redraw-current-line' 2>/dev/null || :\n"
         "__rsb_enter_prompt() {\n"
         "  if [ \"$__rsb_prompt_mode\" = managed ]; then\n"
@@ -784,6 +817,7 @@ def enter_shell_loop(
 def _pty_shell_backend(argv: list[str], nonce: str, on_barrier: Callable[[int], None]) -> int:
     pid, master_fd = pty.fork()
     if pid == 0:
+        _prepare_child_terminal_environment()
         os.execvp(argv[0], argv)
     parser = ShellOutputParser(nonce)
     stdin_fd = sys.stdin.fileno()
@@ -828,6 +862,7 @@ def _pty_enter_shell_backend(
 ) -> int:
     pid, master_fd = pty.fork()
     if pid == 0:
+        _prepare_child_terminal_environment()
         os.execvp(argv[0], argv)
     parser = ShellOutputParser(nonce)
     ready_probe: ReadyProbe | None = None
@@ -985,7 +1020,10 @@ def _pty_enter_shell_backend(
                 ):
                     next_ready_probe_at = now + _READY_PROBE_INTERVAL_S
                 if ready_latched and at_prompt:
-                    os.write(master_fd, _ready_key_sequence())
+                    os.write(
+                        master_fd,
+                        _ready_key_sequence() + _redraw_key_sequence(),
+                    )
                     ready_latched = False
                     pending_redraw = False
                 if pending_redraw:
@@ -1025,6 +1063,11 @@ def _raw_terminal(fd: int):  # type: ignore[no-untyped-def]
         yield
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+
+def _prepare_child_terminal_environment() -> None:
+    if os.environ.get("TERM") in {None, "", "dumb"}:
+        os.environ["TERM"] = "xterm"
 
 
 @contextmanager
@@ -1118,10 +1161,10 @@ def _render_prompt_slot(
     renderer: PromptRenderer | None = None,
 ) -> str:
     active_renderer = renderer or PromptRenderer()
-    prompt = active_renderer.render(target, name, status)
+    prompt = active_renderer.render(target, name, status).rstrip()
     padding = active_renderer.width - display_width(prompt)
     replacement = prompt + " " * padding
-    if status.phase is WorkspacePhase.READY and padding:
+    if padding:
         replacement += f"\x1b[{padding}D"
     return replacement
 

@@ -102,14 +102,16 @@ def test_agent_zipapp_has_stable_bytes_and_self_contained_layout(tmp_path: Path)
             "remote_agent/__init__.py",
             "remote_agent/__main__.py",
             "remote_agent/inotify.py",
+            "remote_agent/paths.py",
             "remote_agent/store.py",
             "remote_agent/watcher.py",
         ]
-        assert [entry.date_time for entry in entries] == [(1980, 1, 1, 0, 0, 0)] * 7
-        assert [entry.compress_type for entry in entries] == [zipfile.ZIP_STORED] * 7
+        assert [entry.date_time for entry in entries] == [(1980, 1, 1, 0, 0, 0)] * 8
+        assert [entry.compress_type for entry in entries] == [zipfile.ZIP_STORED] * 8
         assert [stat.S_IMODE(entry.external_attr >> 16) for entry in entries] == [
             0o644,
             0o755,
+            0o644,
             0o644,
             0o644,
             0o644,

@@ -143,6 +143,11 @@ def test_agent_argument_validators_reject_wrong_types() -> None:
         agent_main._expect_relative_paths({"paths": "value"}, "paths")
     with pytest.raises(ValueError, match="relative"):
         agent_main._expect_relative_paths({"paths": ["../escape"]}, "paths")
+    with pytest.raises(ValueError, match="relative"):
+        agent_main._expect_relative_paths(
+            {"paths": ["nested/.remote-sandbox-new-abc/value.txt"]},
+            "paths",
+        )
 
 
 def test_agent_start_status_stop_and_forget_state_machine(

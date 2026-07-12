@@ -32,12 +32,32 @@ def test_managed_shell_command_and_backend_adapter() -> None:
     assert argv[0] == "ssh"
     assert argv[-2] == "user@host"
     assert "cmd-done" in argv[-1]
+    assert "printf '\\033]777;remote-sandbox;cmd-done" not in argv[-1]
+    assert "cmd-done;${__rsb_nonce};${__rsb_last_status}" in argv[-1]
     assert "rsb;prompt;${__rsb_nonce};managed" in argv[-1]
+    assert "bind -m emacs-standard" in argv[-1]
+    assert "redraw-current-line" in argv[-1]
     assert shell._prompt_slot_sentinel("n1") in argv[-1]
     assert result == 19
     assert calls[0][1] == "n1"
     assert barriers == [7]
     assert shell.display_label("user host/$") == "user_host__"
+
+
+def test_child_terminal_uses_xterm_only_for_missing_or_dumb_term(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for original in (None, "", "dumb"):
+        if original is None:
+            monkeypatch.delenv("TERM", raising=False)
+        else:
+            monkeypatch.setenv("TERM", original)
+        shell._prepare_child_terminal_environment()
+        assert shell.os.environ["TERM"] == "xterm"
+
+    monkeypatch.setenv("TERM", "xterm-256color")
+    shell._prepare_child_terminal_environment()
+    assert shell.os.environ["TERM"] == "xterm-256color"
 
 
 def test_enter_shell_loop_reports_selection_success_error_and_cancel() -> None:

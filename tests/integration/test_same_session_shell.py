@@ -45,6 +45,20 @@ def test_incomplete_remote_destination_starts_in_home_then_enters_when_ready(
     assert session.remote_cwd == "/work/dq"
 
 
+def test_symmetric_connect_enters_incomplete_remote_destination_immediately(
+    fake_pty_backend: FakePtyBackendHarness,
+) -> None:
+    session = fake_pty_backend.open_enter_shell()
+
+    session.connect(
+        direction="local-to-remote",
+        remote_root="/work/dq",
+        enter_immediately=True,
+    )
+
+    assert session.remote_cwd == "/work/dq"
+
+
 def test_complete_remote_source_starts_in_workspace_immediately(
     fake_pty_backend: FakePtyBackendHarness,
 ) -> None:

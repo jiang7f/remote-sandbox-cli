@@ -8,9 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .paths import name_is_hard_ignored, path_parts_are_hard_ignored
 from .store import RemoteStore
-
-_HARD_IGNORED_NAMES = {".git", ".remote-sandbox"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,7 +193,7 @@ def path_is_hard_ignored(path: Path, root: Path) -> bool:
         relative = path.relative_to(root)
     except ValueError:
         return True
-    return any(part in _HARD_IGNORED_NAMES for part in relative.parts)
+    return path_parts_are_hard_ignored(relative.parts)
 
 
 def watch_root_path(root: Path) -> Path:
@@ -213,7 +212,7 @@ def _scan_directory_descriptor(
     with os.scandir(descriptor) as entries:
         ordered = sorted(entries, key=lambda entry: entry.name)
     for entry in ordered:
-        if entry.name in _HARD_IGNORED_NAMES:
+        if name_is_hard_ignored(entry.name):
             continue
         try:
             metadata = entry.stat(follow_symlinks=False)

@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Work only in `/Users/7f/仓库/remote-sandbox-cli_副本`.
+- Work only in `/Users/7f/仓库/remote-sandbox-cli`.
 - Preserve the existing unstaged changes in `src/remote_sandbox/cli.py`, `src/remote_sandbox/daemon.py`, and `src/remote_sandbox/ssh.py`. Do not reset or discard them.
 - Fold the existing reconnect and authentication-classification behavior into Tasks 8, 13, and 16 with regression tests before staging those files.
 - Stage explicit task files only. Do not use `git add .`.

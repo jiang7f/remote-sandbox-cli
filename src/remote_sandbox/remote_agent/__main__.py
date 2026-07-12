@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import AGENT_VERSION
+from .paths import path_parts_are_hard_ignored
 from .store import (
     RemoteIndexEntry,
     RemoteStore,
@@ -1024,7 +1025,7 @@ def _expect_relative_paths(payload: dict[str, Any], key: str) -> list[str]:
             or item.startswith("/")
             or "\\" in item
             or any(part in {"", ".", ".."} for part in parts)
-            or any(part in {".git", ".remote-sandbox"} for part in parts)
+            or path_parts_are_hard_ignored(tuple(parts))
             or any(ord(character) < 32 or ord(character) == 127 for character in item)
         ):
             raise ValueError(f"invalid relative path: {item}")

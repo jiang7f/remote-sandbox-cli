@@ -359,8 +359,20 @@ REMOTE_FINALIZE_RSYNC_CODE = textwrap.dedent(
                         shutil.copyfileobj(input_file, output, length=1024 * 1024)
             finally:
                 os.close(descriptor)
+            os.chmod(
+                name,
+                stat.S_IMODE(entry.st_mode),
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
             return
         os.mkdir(name, stat.S_IMODE(entry.st_mode), dir_fd=parent_fd)
+        os.chmod(
+            name,
+            stat.S_IMODE(entry.st_mode),
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
         descriptor = open_dir(name, parent_fd)
         try:
             for child in os.listdir(source):
@@ -602,10 +614,22 @@ REMOTE_EXTRACT_CODE = textwrap.dedent(
                         shutil.copyfileobj(input_file, output, length=1024 * 1024)
             finally:
                 os.close(descriptor)
+            os.chmod(
+                name,
+                stat.S_IMODE(entry.st_mode),
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
             return
         if not stat.S_ISDIR(entry.st_mode):
             raise ValueError("unsupported staged entry")
         os.mkdir(name, stat.S_IMODE(entry.st_mode), dir_fd=parent_fd)
+        os.chmod(
+            name,
+            stat.S_IMODE(entry.st_mode),
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
         descriptor = os.open(
             name,
             os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
@@ -650,6 +674,7 @@ REMOTE_EXTRACT_CODE = textwrap.dedent(
                 os.makedirs(os.path.dirname(destination), mode=0o700, exist_ok=True)
                 if member.isdir():
                     os.mkdir(destination, member.mode & 0o777)
+                    os.chmod(destination, member.mode & 0o777, follow_symlinks=False)
                 elif member.issym():
                     os.symlink(member.linkname, destination)
                 else:
@@ -664,6 +689,7 @@ REMOTE_EXTRACT_CODE = textwrap.dedent(
                     finally:
                         payload.close()
                         os.close(descriptor)
+                    os.chmod(destination, member.mode & 0o777, follow_symlinks=False)
 
         top_level = []
         for path in requested:

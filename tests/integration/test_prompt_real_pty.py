@@ -25,6 +25,70 @@ from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
     "ignore:This process .* is multi-threaded, use of fork\\(\\) may lead to "
     "deadlocks in the child\\.:DeprecationWarning"
 )
+@pytest.mark.timeout(8)
+def test_managed_shell_renders_initial_prompt_in_nested_real_pty(tmp_path: Path) -> None:
+    nonce = "managed-realpty"
+    workspace = tmp_path / "remote"
+    workspace.mkdir()
+    rcfile = tmp_path / "managed-bashrc"
+    rcfile.write_text(
+        "RSB_DISPLAY_LABEL=ZJU_2\n"
+        f"__rsb_nonce={shlex.quote(nonce)}\n{_managed_rcfile(nonce)}\n",
+        encoding="utf-8",
+    )
+    frontend_master, frontend_slave = pty.openpty()
+    fcntl.ioctl(
+        frontend_slave,
+        termios.TIOCSWINSZ,
+        struct.pack("HHHH", 24, 100, 0, 0),
+    )
+    pid = os.fork()
+    if pid == 0:
+        os.close(frontend_master)
+        os.login_tty(frontend_slave)
+        sys.stdin = os.fdopen(os.dup(0), "r", encoding="utf-8")
+        sys.stdout = os.fdopen(os.dup(1), "w", encoding="utf-8")
+        try:
+            result = shell_module._pty_enter_shell_backend(
+                ["bash", "--noprofile", "--rcfile", str(rcfile), "-i"],
+                nonce,
+                lambda _event: ConnectResponse(ok=False, error="already connected"),
+                target="ZJU_2",
+                initial_name="dq",
+                initial_status_probe=lambda: WorkspaceStatus(
+                    WorkspacePhase.READY,
+                    SyncProgress("idle"),
+                ),
+            )
+        except BaseException:
+            traceback.print_exc()
+            result = 1
+        os._exit(result)
+
+    os.close(frontend_slave)
+    output = bytearray()
+    try:
+        _read_until(frontend_master, output, b"[ZJU_2:dq scanning]", timeout=3.0)
+        start = len(output)
+        os.write(frontend_master, b"pwd\n")
+        _read_until(
+            frontend_master,
+            output,
+            str(Path.cwd()).encode(),
+            timeout=2.0,
+            start=start,
+        )
+    finally:
+        with suppress(OSError):
+            os.write(frontend_master, b"\nexit\n")
+        _terminate_child(pid)
+        os.close(frontend_master)
+
+
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded, use of fork\\(\\) may lead to "
+    "deadlocks in the child\\.:DeprecationWarning"
+)
 @pytest.mark.timeout(12)
 def test_live_prompt_redraw_is_readline_safe_in_a_real_bash_pty(tmp_path: Path) -> None:
     nonce = "realpty15"
@@ -324,6 +388,12 @@ def test_lifecycle_phase_has_a_distinct_real_pty_prompt_token(
 
 def _enter_rcfile(nonce: str) -> str:
     command = shell_module.build_enter_remote_shell_command("ZJU_2", "~", nonce=nonce)[-1]
+    outer_script = shlex.split(command)[2]
+    return outer_script.split("cat <<'EOF'\n", 1)[1].split("\nEOF\n", 1)[0]
+
+
+def _managed_rcfile(nonce: str) -> str:
+    command = shell_module.build_managed_remote_shell_command("ZJU_2", "~", nonce=nonce)[-1]
     outer_script = shlex.split(command)[2]
     return outer_script.split("cat <<'EOF'\n", 1)[1].split("\nEOF\n", 1)[0]
 

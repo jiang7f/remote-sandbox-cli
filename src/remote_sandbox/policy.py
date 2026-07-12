@@ -12,6 +12,7 @@ from remote_sandbox.manifest import (
     FileEntry,
     normalize_relative_path,
 )
+from remote_sandbox.remote_agent.paths import path_parts_are_hard_ignored
 
 
 class ReplicaSide(StrEnum):
@@ -183,6 +184,8 @@ class StaticPolicyEngine:
         return decision
 
     def _decision_for_path(self, path: str) -> tuple[PolicyDecision, bool]:
+        if path_parts_are_hard_ignored(tuple(path.split("/"))):
+            return PolicyDecision.IGNORE, True
         if any(_matches(pattern, path) for pattern in self._hard_ignore_patterns):
             return PolicyDecision.IGNORE, True
         decision = PolicyDecision.SYNC

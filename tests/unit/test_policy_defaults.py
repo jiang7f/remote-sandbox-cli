@@ -13,6 +13,25 @@ def test_git_and_portability_caches_are_ignored_by_default() -> None:
     assert policy.is_ignored("editor.swp")
 
 
+def test_internal_transport_paths_and_descendants_are_always_ignored() -> None:
+    policy = StaticPolicyEngine.from_lines(
+        [
+            "[sync]",
+            ".remote-sandbox-new-*/**",
+            "nested/.remote-sandbox-old-*/**",
+        ]
+    )
+
+    for path in (
+        ".remote-sandbox-new-abc",
+        ".remote-sandbox-new-abc/value.txt",
+        "nested/.remote-sandbox-old-def/value.txt",
+        "nested/.remote-sandbox-delete-ghi",
+        "nested/.remote-sandbox-recovered-jkl/value.txt",
+    ):
+        assert policy.is_ignored(path)
+
+
 def test_git_and_control_metadata_cannot_be_reenabled() -> None:
     policy = StaticPolicyEngine.from_lines(
         [

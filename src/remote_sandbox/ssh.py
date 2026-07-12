@@ -6,6 +6,8 @@ import posixpath
 import secrets
 import shlex
 import subprocess
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
@@ -376,6 +378,9 @@ class FakeSshRunner:
 class SubprocessSshRunner:
     timeout_s = 30.0
 
+    def __init__(self, *, cancel_event: threading.Event | None = None) -> None:
+        self._cancel_event = cancel_event
+
     def ensure_master(self, target: str) -> None:
         """Ensure a shared SSH master connection exists, authenticating once if needed.
 
@@ -653,12 +658,20 @@ class SubprocessSshRunner:
                 *(shlex.quote(arg) for arg in args),
             ]
         )
-        return subprocess.run(
-            [*self._ssh_batch_args(), target, remote_command],
-            check=False,
-            input=input_data,
-            capture_output=True,
+        command = [*self._ssh_batch_args(), target, remote_command]
+        if self._cancel_event is None:
+            return subprocess.run(
+                command,
+                check=False,
+                input=input_data,
+                capture_output=True,
+                timeout=self.timeout_s,
+            )
+        return _run_cancellable_bytes(
+            command,
+            input_data=input_data,
             timeout=self.timeout_s,
+            cancel_event=self._cancel_event,
         )
 
     def delete_workspace_path(self, target: str, root: str, path: str) -> None:
@@ -906,6 +919,44 @@ def _classify_ssh_failure(stderr: str) -> Literal["auth", "network"]:
     if any(marker in lowered for marker in _AUTH_FAILURE_MARKERS):
         return "auth"
     return "network"
+
+
+def _run_cancellable_bytes(
+    command: list[str],
+    *,
+    input_data: bytes,
+    timeout: float,
+    cancel_event: threading.Event | None,
+) -> subprocess.CompletedProcess[bytes]:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + timeout
+    pending_input: bytes | None = input_data
+    try:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                _cleanup_stream_process(process)
+                raise SshError("SSH operation cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _cleanup_stream_process(process)
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                stdout, stderr = process.communicate(
+                    input=pending_input,
+                    timeout=min(0.1, remaining),
+                )
+            except subprocess.TimeoutExpired:
+                pending_input = None
+                continue
+            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    except BaseException:
+        _cleanup_stream_process(process)
+        raise
 
 
 def _cleanup_stream_process(process: subprocess.Popen[bytes]) -> None:

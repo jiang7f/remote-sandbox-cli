@@ -58,7 +58,7 @@ def test_response_read_restores_echo_for_success_eof_and_signals() -> None:
 
 def test_local_to_remote_uses_home_as_the_holding_directory() -> None:
     script = _enter_rcfile()
-    branch = script.split('if [ "$__rsb_direction" = local-to-remote ]; then', 1)[1]
+    branch = script.split('if [ "$__rsb_direction" = local-to-remote ] &&', 1)[1]
 
     assert branch.index('cd -- "$HOME"') < branch.index("__rsb_workspace_holding=$PWD")
 
@@ -78,7 +78,8 @@ def test_ready_transition_has_authenticated_prompt_and_private_readline_trigger(
     assert "\\e[778~" not in script
     assert 'bind -m emacs-standard \'"\\e[777~": redraw-current-line\'' in script
     assert 'bind -m vi-move \'"\\e[777~": redraw-current-line\'' in script
-    assert "bind -m vi-insertion" not in script
+    assert 'bind -m vi-insertion -x \'"\\C-x\\C-]": __rsb_ready_key\'' in script
+    assert 'bind -m vi-insertion \'"\\e[777~": redraw-current-line\'' in script
     assert shell_module._ready_key_sequence() == b"\x18\x1d"
     assert shell_module._redraw_key_sequence() == b"\x1b[777~"
     assert "__rsb_live_key" not in script
@@ -94,14 +95,41 @@ def test_live_prompt_sentinel_has_the_same_fixed_display_width() -> None:
     assert sentinel in _enter_rcfile()
 
 
-def test_ready_slot_keeps_readline_width_but_visually_returns_to_compact_width() -> None:
+@pytest.mark.parametrize(
+    ("phase", "progress", "compact"),
+    [
+        (
+            shell_module.WorkspacePhase.INITIAL_SYNCING,
+            shell_module.SyncProgress("scanning"),
+            "[ZJU_2:dq scanning]",
+        ),
+        (
+            shell_module.WorkspacePhase.INITIAL_SYNCING,
+            shell_module.SyncProgress(
+                "transferring",
+                files_done=40,
+                files_total=100,
+            ),
+            "[ZJU_2:dq sync 40%]",
+        ),
+        (
+            shell_module.WorkspacePhase.READY,
+            shell_module.SyncProgress("idle"),
+            "[ZJU_2:dq]",
+        ),
+    ],
+)
+def test_slot_keeps_readline_width_but_visually_returns_to_compact_width(
+    phase: shell_module.WorkspacePhase,
+    progress: shell_module.SyncProgress,
+    compact: str,
+) -> None:
     status = shell_module.WorkspaceStatus(
-        shell_module.WorkspacePhase.READY,
-        shell_module.SyncProgress("idle"),
+        phase,
+        progress,
     )
 
     replacement = shell_module._render_prompt_slot("ZJU_2", "dq", status)
-    compact = "[ZJU_2:dq]"
     padding = 34 - shell_module.display_width(compact)
 
     assert replacement == compact + " " * padding + f"\x1b[{padding}D"
@@ -119,9 +147,10 @@ def test_long_unicode_live_slot_cannot_overwrite_the_rest_of_the_prompt() -> Non
         status,
     )
 
-    assert shell_module.display_width(replacement) == 34
-    assert "\x1b[" not in replacement
-    assert replacement.rstrip().endswith("]")
+    prompt, cursor_back = replacement.rsplit("\x1b[", 1)
+    assert shell_module.display_width(prompt) == 34
+    assert prompt.rstrip().endswith("]")
+    assert cursor_back.endswith("D")
 
 
 def test_connect_request_parser_requires_the_session_nonce_across_chunks() -> None:
@@ -366,6 +395,19 @@ def test_success_response_preserves_unicode_and_spaces() -> None:
     )
 
     assert response.encode() == "ok\tw1\tdq\t/work/量子 project\tlocal-to-remote"
+
+
+def test_success_response_can_request_immediate_workspace_entry() -> None:
+    response = ConnectResponse(
+        ok=True,
+        workspace_id="w1",
+        name="dq",
+        remote_root="/work/dq",
+        direction="local-to-remote",
+        enter_immediately=True,
+    )
+
+    assert response.encode() == "ok\tw1\tdq\t/work/dq\tlocal-to-remote\t1"
 
 
 def test_success_response_can_retain_a_local_ready_probe() -> None:
@@ -614,6 +656,7 @@ def test_enter_and_bind_responds_after_initial_sync_state_is_published(
             name="dq",
             remote_root="/work/量子 project",
             direction="remote-to-local",
+            enter_immediately=True,
         )
     ]
 
@@ -696,7 +739,7 @@ def test_enter_and_bind_rejects_durable_status_without_control_response(
     ]
 
 
-def test_ready_probe_uses_durable_status_only_to_detect_terminal_lifecycle(
+def test_local_to_remote_production_connect_enters_immediately_without_ready_probe(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -736,11 +779,6 @@ def test_ready_probe_uses_durable_status_only_to_detect_terminal_lifecycle(
     monkeypatch.setattr(cli, "SubprocessSshRunner", FakeRunner)
     monkeypatch.setattr(cli, "ensure_daemon", lambda *_args, **_kwargs: running_status)
     monkeypatch.setattr(cli, "wait_for_daemon_control", lambda *_args: running_status)
-    monkeypatch.setattr(
-        cli,
-        "daemon_control_status",
-        lambda _root: (_ for _ in ()).throw(cli.DaemonError("unresponsive")),
-    )
     monkeypatch.setattr(cli, "_print_connection", lambda _record: None)
 
     def fake_enter_shell_loop(
@@ -761,47 +799,8 @@ def test_ready_probe_uses_durable_status_only_to_detect_terminal_lifecycle(
     monkeypatch.setattr(cli, "enter_shell_loop", fake_enter_shell_loop)
 
     assert cli.enter_and_bind(target="host", remote="~", local=tmp_path, open_shell=True) == 0
-    probe = captured[0].ready_probe
-    assert probe is not None
-
-    terminal_statuses = (
-        SimpleNamespace(
-            running=False,
-            pid=None,
-            phase=SimpleNamespace(value="stopped"),
-            conn_state="ok",
-        ),
-        SimpleNamespace(
-            running=True,
-            pid=None,
-            phase=SimpleNamespace(value="initial-syncing"),
-            conn_state="ok",
-        ),
-        SimpleNamespace(
-            running=True,
-            pid=1234,
-            phase=SimpleNamespace(value="failed"),
-            conn_state="failed",
-        ),
-        SimpleNamespace(
-            running=True,
-            pid=1234,
-            phase=SimpleNamespace(value="degraded"),
-            conn_state="disconnected",
-        ),
-    )
-    for status in terminal_statuses:
-        monkeypatch.setattr(cli, "daemon_status", lambda _root, value=status: value)
-        assert probe() == "stop"
-
-    live_status = SimpleNamespace(
-        running=True,
-        pid=1234,
-        phase=SimpleNamespace(value="degraded"),
-        conn_state="degraded",
-    )
-    monkeypatch.setattr(cli, "daemon_status", lambda _root: live_status)
-    assert probe() == "pending"
+    assert captured[0].ready_probe is None
+    assert captured[0].enter_immediately is True
 
 
 def _enter_rcfile() -> str:

@@ -298,7 +298,10 @@ class WorkspaceSupervisor:
         remote: _SupervisorRemote | None = None,
         engine: _IncrementalEngine | None = None,
         local_watcher: LocalEventWatcher | None = None,
-        component_factory: Callable[[threading.Event], _ProductionComponents] | None = None,
+        component_factory: Callable[
+            [threading.Event, threading.Event], _ProductionComponents
+        ]
+        | None = None,
         mutation_handler: Callable[[str, dict[str, object]], dict[str, object]] | None = None,
         close_store: bool = False,
     ) -> None:
@@ -498,7 +501,7 @@ class WorkspaceSupervisor:
     def _load_components(self) -> None:
         if self._component_factory is None:
             return
-        components = self._component_factory(self._sync_requested)
+        components = self._component_factory(self._sync_requested, self._stop_event)
         self.remote = components.remote
         self.engine = components.engine
         self.initial_sync = components.initial_sync
@@ -519,6 +522,8 @@ class WorkspaceSupervisor:
                     self.initial_sync.run()
                 return True
             except Exception as exc:
+                if self._stop_event.is_set():
+                    return False
                 delay = self.handle_subscription_failure(exc)
                 if delay is not None:
                     if self._stop_event.wait(delay):
@@ -567,6 +572,8 @@ class WorkspaceSupervisor:
                 if self._subscription_thread is None or not self._subscription_thread.is_alive():
                     self._start_subscription()
             except Exception as exc:
+                if self._stop_event.is_set():
+                    return
                 delay = self.handle_subscription_failure(exc)
                 retry_at = None if delay is None else time.monotonic() + delay
 
@@ -1004,9 +1011,11 @@ def _build_supervisor(
     record = _record_for_local(local_root)
     spec = read_workspace_spec(workspace_paths(record.workspace_id).workspace_file)
     store = WorkspaceStore.open(runtime.state_db)
-    ssh_runner = runner or SubprocessSshRunner()
-
-    def build(sync_requested: threading.Event) -> _ProductionComponents:
+    def build(
+        sync_requested: threading.Event,
+        stop_event: threading.Event,
+    ) -> _ProductionComponents:
+        ssh_runner = runner or SubprocessSshRunner(cancel_event=stop_event)
         remote = RemoteWorkspaceClient(
             cast(object, ssh_runner),  # type: ignore[arg-type]
             target=spec.target,

@@ -23,7 +23,6 @@ from remote_sandbox.daemon import (
     StopResult,
     SupervisorClient,
     SupervisorRuntime,
-    daemon_control_status,
     daemon_status,
     ensure_daemon,
     poke_daemon,
@@ -55,7 +54,6 @@ from remote_sandbox.shell import (
     ConnectRequestEvent,
     ConnectResponse,
     InitialShellDirection,
-    ReadyProbeResult,
     enter_shell_loop,
 )
 from remote_sandbox.ssh import SubprocessSshRunner
@@ -909,27 +907,6 @@ def enter_and_bind(*, target: str, remote: str, local: Path, open_shell: bool) -
         if status.phase.value in {"failed", "stopped"}:
             raise DaemonError(status.last_error or "workspace supervisor failed to start")
 
-        def _ready_probe() -> ReadyProbeResult:
-            try:
-                current = daemon_control_status(bound_local)
-            except DaemonError:
-                current = daemon_status(bound_local)
-                if (
-                    not current.running
-                    or current.pid is None
-                    or current.phase.value in {"failed", "stopped"}
-                    or current.conn_state == "disconnected"
-                ):
-                    return "stop"
-                return "pending"
-            if current.phase.value == "ready":
-                return "ready"
-            if current.phase.value in {"failed", "stopped"}:
-                return "stop"
-            if current.conn_state == "disconnected":
-                return "stop"
-            return "pending"
-
         _print_connection(result.connection)
         return ConnectResponse(
             ok=True,
@@ -937,7 +914,7 @@ def enter_and_bind(*, target: str, remote: str, local: Path, open_shell: bool) -
             name=result.connection.name,
             remote_root=result.connection.remote_path,
             direction=direction,
-            ready_probe=_ready_probe if direction == "local-to-remote" else None,
+            enter_immediately=True,
         )
 
     del open_shell

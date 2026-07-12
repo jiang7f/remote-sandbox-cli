@@ -101,7 +101,13 @@ class FakeManagedPtySession:
         self.output = self._session.captured_output()
         self.prompt_mode = self._session.prompt_mode
 
-    def connect(self, *, direction: str, remote_root: str) -> None:
+    def connect(
+        self,
+        *,
+        direction: str,
+        remote_root: str,
+        enter_immediately: bool = False,
+    ) -> None:
         self._session.activate_workspace(
             ConnectResponse(
                 ok=True,
@@ -109,6 +115,7 @@ class FakeManagedPtySession:
                 name="dq",
                 remote_root=remote_root,
                 direction=direction,
+                enter_immediately=enter_immediately,
             ),
             direction=direction,
         )
