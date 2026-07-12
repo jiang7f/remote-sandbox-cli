@@ -509,6 +509,33 @@ def test_runtime_lock_rejects_symlink_without_modifying_target(
     assert target.stat().st_mode & 0o777 == 0o644
 
 
+def test_runtime_lock_retries_transient_create_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_id = "00000000-0000-4000-8000-000000000109"
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("REMOTE_SANDBOX_RUNTIME_DIR", str(runtime))
+    lock_path = remote_agent_main._workspace_lock_path(workspace_id)
+    original_open = remote_agent_main.os.open
+    attempts = 0
+
+    def racing_open(path: str | bytes, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal attempts
+        if path == "control.lock":
+            attempts += 1
+            if attempts == 1:
+                raise FileNotFoundError(2, "simulated concurrent create", path)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(remote_agent_main.os, "open", racing_open)
+
+    with remote_agent_main._exclusive_lock(lock_path):
+        assert lock_path.is_file()
+
+    assert attempts == 2
+
+
 def test_watcher_log_rejects_symlink_before_spawning_or_modifying_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -728,12 +755,14 @@ def test_concurrent_start_calls_share_one_watcher_generation(tmp_path: Path) -> 
     root = tmp_path / "workspace"
     home = tmp_path / "home"
     control = tmp_path / "control"
+    runtime = tmp_path / "runtime"
     root.mkdir()
     home.mkdir()
     env = {
         **os.environ,
         "HOME": str(home),
         "REMOTE_SANDBOX_HOME": str(control),
+        "REMOTE_SANDBOX_RUNTIME_DIR": str(runtime),
     }
     workspace_id = "00000000-0000-4000-8000-000000000075"
     assert (
@@ -761,7 +790,9 @@ def test_concurrent_start_calls_share_one_watcher_generation(tmp_path: Path) -> 
         thread.join(timeout=10)
 
     assert all(not thread.is_alive() for thread in threads)
-    assert [result.returncode for result in results] == [0, 0]
+    assert [result.returncode for result in results] == [0, 0], [
+        (result.returncode, result.stdout, result.stderr) for result in results
+    ]
     assert len({int(decode_response(result.stdout).payload["pid"]) for result in results}) == 1
 
     stopped = _agent_call(archive, AgentRequest("stop", {"workspace_id": workspace_id}), env)

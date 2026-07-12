@@ -373,6 +373,7 @@ class SshFixture:
             text=True,
             timeout=20.0,
         )
+        _wait_for_ssh_python(self)
 
     def wait_for_remote_file(self, path: Path, timeout: float = 5.0) -> None:
         self._wait_until(lambda: self.remote_exists(path), f"remote file {path}", timeout)
@@ -520,9 +521,14 @@ class SshFixture:
         process_ids = _fixture_process_ids(self.state_home, self.runtime_dir)
         for record in records:
             name = record.get("name")
+            target = record.get("target")
             if isinstance(name, str):
                 try:
-                    result = self.cli("forget", name)
+                    result = (
+                        self.cli_with_password("forget", name, password=_PASSWORD)
+                        if target == self.password_host
+                        else self.cli("forget", name)
+                    )
                     if result.returncode != 0:
                         raise AssertionError(result.stdout + result.stderr)
                 except Exception as exc:
@@ -532,7 +538,6 @@ class SshFixture:
                         f"local-only forget {name}",
                         lambda value=name: self.cli("forget", value, "--local-only"),
                     )
-            target = record.get("target")
             if isinstance(target, str):
                 _record_cleanup_failure(
                     failures,

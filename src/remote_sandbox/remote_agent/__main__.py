@@ -40,6 +40,7 @@ _RUNTIME_PREFIX = "remote-sandbox"
 _CONTROL_ENV = "REMOTE_SANDBOX_CONTROL_DIR"
 _EVENT_BATCH_SIZE = 256
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_WATCHER_IDENTITY_SETTLE_S = 0.5
 
 
 def _archive_sha256() -> str:
@@ -164,6 +165,7 @@ def _handle_start(payload: dict[str, Any]) -> dict[str, object]:
                 process.terminate()
                 process.wait(timeout=5)
                 raise
+            _settle_watcher_identity(observed, workspace_id)
             return _watcher_payload(observed)
 
 
@@ -842,12 +844,19 @@ def _open_runtime_file(path: Path, flags: int) -> int:
         raise ValueError("remote runtime file path is invalid")
     *parents, name = relative.parts
     with _runtime_directory(*parents) as (_directory, parent_descriptor):
-        descriptor = os.open(
-            name,
-            flags | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600,
-            dir_fd=parent_descriptor,
-        )
+        for attempt in range(3):
+            try:
+                descriptor = os.open(
+                    name,
+                    flags | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+                break
+            except FileNotFoundError:
+                if attempt == 2:
+                    raise
+                time.sleep(0)
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -920,6 +929,15 @@ def _watcher_identity(state: WatcherState, workspace_id: str) -> str:
         return "unknown"
     required = {"_watch", workspace_id, state.token}
     return "current" if required <= set(arguments) else "mismatch"
+
+
+def _settle_watcher_identity(state: WatcherState, workspace_id: str) -> None:
+    """Keep the start lock until a freshly spawned watcher has completed exec."""
+    deadline = time.monotonic() + _WATCHER_IDENTITY_SETTLE_S
+    while process_is_alive(state.pid) and time.monotonic() < deadline:
+        if _watcher_identity(state, workspace_id) == "current":
+            return
+        time.sleep(0.01)
 
 
 def _process_arguments(pid: int) -> list[str] | None:

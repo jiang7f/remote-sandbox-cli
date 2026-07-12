@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import socket
 import threading
@@ -21,7 +22,8 @@ def _raw_request(
         client.settimeout(2.0)
         client.connect(str(supervisor_fixture.supervisor.runtime.socket))
         client.sendall(payload)
-        client.shutdown(socket.SHUT_WR)
+        with contextlib.suppress(OSError):
+            client.shutdown(socket.SHUT_WR)
         chunks: list[bytes] = []
         while chunk := client.recv(4096):
             chunks.append(chunk)

@@ -59,7 +59,7 @@ def test_local_only_forget_reports_and_leaves_remote_metadata(ssh_fixture) -> No
     result = ssh_fixture.cli("forget", "local-only", "--local-only")
 
     assert result.returncode == 0
-    assert str(remote_metadata) in result.stdout
+    assert f"~/.remote-sandbox/workspaces/{remote_metadata.name}" in result.stdout
     assert ssh_fixture.remote_exists(remote_metadata)
     assert not local_metadata.exists()
     assert not ssh_fixture.local_binding_exists("local-only")

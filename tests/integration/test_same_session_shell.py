@@ -300,7 +300,10 @@ def test_real_pty_ready_preserves_partial_readline_buffer_and_shell_process(
         time.sleep(0.35)
         assert _line_count(probe_log) == probes_after_exit
 
-        text = output.decode("utf-8", errors="replace").replace("\r", "")
+        text = _normalize_terminal_output(bytes(output)).decode(
+            "utf-8",
+            errors="replace",
+        )
         foreground_line = next(
             line for line in text.splitlines() if line.startswith("FOREGROUND:")
         )
