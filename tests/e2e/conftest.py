@@ -22,6 +22,8 @@ from types import TracebackType
 
 import pytest
 
+from remote_sandbox.namespace import ssh_control_dir
+
 _ROOT = Path(__file__).resolve().parents[2]
 _E2E_DIR = Path(__file__).resolve().parent
 _PASSWORD = "test-password"
@@ -487,7 +489,7 @@ class SshFixture:
                 "-o",
                 "ControlMaster=auto",
                 "-o",
-                f"ControlPath={self.runtime_dir}/cm/%C",
+                f"ControlPath={ssh_control_dir(self.env)}/%C",
                 "-O",
                 "exit",
                 target,
@@ -680,7 +682,7 @@ def _close_control_master(fixture: SshFixture, target: str) -> None:
             "-o",
             "ControlMaster=auto",
             "-o",
-            f"ControlPath={fixture.runtime_dir}/cm/%C",
+            f"ControlPath={ssh_control_dir(fixture.env)}/%C",
             "-O",
             "exit",
             target,

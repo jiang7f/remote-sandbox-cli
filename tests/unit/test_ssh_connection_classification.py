@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 from pathlib import Path
 
@@ -196,5 +197,6 @@ def test_control_path_uses_isolated_rsb_runtime_namespace(
     options = ssh_control_opts()
 
     control_path = next(value for value in options if value.startswith("ControlPath="))
-    assert control_path == f"ControlPath={runtime}/cm/%C"
-    assert (runtime / "cm").stat().st_mode & 0o777 == 0o700
+    control_dir = Path(control_path.removeprefix("ControlPath=")).parent
+    assert len(os.fsencode(control_dir / ("0" * 40))) < 100
+    assert control_dir.stat().st_mode & 0o777 == 0o700

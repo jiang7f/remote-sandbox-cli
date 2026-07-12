@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -39,7 +40,12 @@ def runtime_dir(env: Mapping[str, str] | None = None) -> Path:
 
 
 def ssh_control_dir(env: Mapping[str, str] | None = None) -> Path:
-    return runtime_dir(env) / "cm"
+    desired = runtime_dir(env) / "cm"
+    socket_path = desired / ("0" * 40)
+    if len(os.fsencode(socket_path)) < 100:
+        return desired
+    digest = hashlib.sha256(os.fsencode(desired)).hexdigest()[:16]
+    return Path("/tmp") / f"remote-sandbox-cm-{os.getuid()}" / digest
 
 
 def program_name() -> str:

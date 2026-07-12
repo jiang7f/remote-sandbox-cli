@@ -406,8 +406,12 @@ def _read_until(
     timeout: float,
     start: int = 0,
 ) -> None:
+    normalized_expected = _normalize_terminal_output(expected)
     deadline = time.monotonic() + timeout
-    while expected not in output[start:] and time.monotonic() < deadline:
+    while (
+        normalized_expected not in _normalize_terminal_output(bytes(output[start:]))
+        and time.monotonic() < deadline
+    ):
         readable, _, _ = select.select([fd], [], [], 0.05)
         if not readable:
             continue
@@ -418,7 +422,8 @@ def _read_until(
         if not chunk:
             break
         output.extend(chunk)
-    assert expected in output[start:], output[start:].decode("utf-8", errors="replace")
+    normalized = _normalize_terminal_output(bytes(output[start:]))
+    assert normalized_expected in normalized, normalized.decode("utf-8", errors="replace")
 
 
 def _drain(fd: int, output: bytearray) -> None:
@@ -428,9 +433,15 @@ def _drain(fd: int, output: bytearray) -> None:
 
 
 def _value_after(output: bytearray, marker: bytes, *, start: int) -> bytes:
-    begin = output.index(marker, start) + len(marker)
-    end = output.index(b"\r\n", begin)
-    return bytes(output[begin:end])
+    normalized = _normalize_terminal_output(bytes(output[start:]))
+    normalized_marker = _normalize_terminal_output(marker)
+    begin = normalized.index(normalized_marker) + len(normalized_marker)
+    end = normalized.index(b"\n", begin)
+    return normalized[begin:end]
+
+
+def _normalize_terminal_output(value: bytes) -> bytes:
+    return value.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
 
 
 def _line_count(path: Path) -> int:

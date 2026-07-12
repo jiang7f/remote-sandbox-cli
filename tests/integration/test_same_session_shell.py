@@ -548,8 +548,7 @@ def _read_command_until_prompt(
     timeout: float = 3.0,
     prompt: bytes = b"[host:dq",
 ) -> None:
-    _read_pty_until(fd, output, expected, timeout=timeout, start=start)
-    expected_at = output.index(expected, start) + len(expected)
+    expected_at = _read_pty_until(fd, output, expected, timeout=timeout, start=start)
     _read_pty_until(fd, output, prompt, timeout=timeout, start=expected_at)
 
 
@@ -584,9 +583,10 @@ def _read_pty_until(
     *,
     timeout: float,
     start: int = 0,
-) -> None:
+) -> int:
     deadline = time.monotonic() + timeout
-    while expected not in output[start:] and time.monotonic() < deadline:
+    match_end = _terminal_match_end(output, expected, start=start)
+    while match_end is None and time.monotonic() < deadline:
         readable, _, _ = select.select([fd], [], [], 0.05)
         if not readable:
             continue
@@ -597,7 +597,34 @@ def _read_pty_until(
         if not chunk:
             break
         output.extend(chunk)
-    assert expected in output[start:], output.decode("utf-8", errors="replace")
+        match_end = _terminal_match_end(output, expected, start=start)
+    normalized = _normalize_terminal_output(bytes(output[start:]))
+    normalized_expected = _normalize_terminal_output(expected)
+    assert normalized_expected in normalized, normalized.decode("utf-8", errors="replace")
+    assert match_end is not None
+    return match_end
+
+
+def _normalize_terminal_output(value: bytes) -> bytes:
+    return value.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
+def _terminal_match_end(output: bytearray, expected: bytes, *, start: int) -> int | None:
+    normalized = _normalize_terminal_output(expected)
+    variants = {
+        normalized,
+        normalized.replace(b"\n", b"\r"),
+        normalized.replace(b"\n", b"\r\n"),
+    }
+    matches = [
+        (index, variant)
+        for variant in variants
+        if (index := output.find(variant, start)) >= 0
+    ]
+    if not matches:
+        return None
+    index, variant = min(matches, key=lambda match: match[0])
+    return index + len(variant)
 
 
 def _terminate_child(pid: int) -> None:

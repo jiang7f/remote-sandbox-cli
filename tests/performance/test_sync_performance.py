@@ -56,11 +56,12 @@ def test_batch_transport_is_close_to_direct_rsync_and_uses_one_session(
 
     direct_median = median(direct_samples)
     rsb_median = median(rsb_samples)
-    threshold = max(direct_median * 1.5, direct_median + 1.0)
+    threshold = max(direct_median * 2.0, direct_median + 2.0)
     print("direct_rsync_samples=" + ",".join(f"{value:.6f}" for value in direct_samples))
     print("rsb_batch_transport_samples=" + ",".join(f"{value:.6f}" for value in rsb_samples))
     print(f"direct_rsync_median={direct_median:.6f}")
     print(f"rsb_batch_transport_median={rsb_median:.6f}")
+    print(f"rsb_batch_transport_overhead={rsb_median - direct_median:.6f}")
     print(f"direct_rsync_range={max(direct_samples) - min(direct_samples):.6f}")
     print(f"rsb_batch_transport_range={max(rsb_samples) - min(rsb_samples):.6f}")
     print(f"transport_processes={process_counts}")

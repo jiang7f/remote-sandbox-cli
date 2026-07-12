@@ -49,6 +49,8 @@ def test_real_watchdog_creation_appends_one_relative_path_to_journal(tmp_path: P
 def test_real_watchdog_preserves_a_move_as_one_journal_event(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
+    source = root / "before.py"
+    source.touch()
     recorded: list[JournalEvent] = []
     sequence = 0
 
@@ -60,14 +62,8 @@ def test_real_watchdog_preserves_a_move_as_one_journal_event(tmp_path: Path) -> 
     watcher = create_local_watcher(root, StaticPolicyEngine(), record)
     watcher.start()
     try:
-        source = root / "before.py"
-        source.touch()
-        _wait_until(
-            lambda: all(
-                any(event.kind is kind and event.path == "before.py" for event in recorded)
-                for kind in (EventKind.CREATE, EventKind.MODIFY)
-            )
-        )
+        (root / "event-barrier").touch()
+        _wait_until(lambda: any(event.path == "event-barrier" for event in recorded))
         recorded.clear()
         source.rename(root / "after.py")
         _wait_until(lambda: any(event.kind is EventKind.MOVE for event in recorded))
