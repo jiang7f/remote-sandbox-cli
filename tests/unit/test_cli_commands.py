@@ -82,12 +82,60 @@ def test_status_watch_screen_uses_alternate_screen_only_for_tty() -> None:
     rendered = terminal.getvalue()
     assert rendered.startswith(cli_module._ALT_SCREEN_ENTER)
     assert rendered.endswith(cli_module._ALT_SCREEN_LEAVE)
+    assert "\x1b[?1007h" in cli_module._ALT_SCREEN_ENTER
+    assert "\x1b[?1007l" in cli_module._ALT_SCREEN_LEAVE
 
     redirected = io.StringIO()
     with cli_module._status_watch_screen(redirected) as interactive:
         assert interactive is False
         redirected.write("frame")
     assert redirected.getvalue() == "frame"
+
+
+def test_status_watch_uses_non_echoing_input_and_restores_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TtyBuffer(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            return 17
+
+    original = [
+        0,
+        0,
+        0,
+        cli_module.termios.ECHO | cli_module.termios.ICANON | cli_module.termios.ISIG,
+        0,
+        0,
+        [1] * 32,
+    ]
+    changed: list[tuple[int, int, list[object]]] = []
+    flushed: list[tuple[int, int]] = []
+    monkeypatch.setattr(cli_module.termios, "tcgetattr", lambda _fd: original)
+    monkeypatch.setattr(
+        cli_module.termios,
+        "tcsetattr",
+        lambda fd, when, attributes: changed.append((fd, when, attributes)),
+    )
+    monkeypatch.setattr(
+        cli_module.termios,
+        "tcflush",
+        lambda fd, queue: flushed.append((fd, queue)),
+    )
+
+    with cli_module._status_watch_screen(TtyBuffer(), TtyBuffer()):
+        pass
+
+    watch_attributes = changed[0][2]
+    assert watch_attributes[3] & cli_module.termios.ECHO == 0
+    assert watch_attributes[3] & cli_module.termios.ICANON == 0
+    assert watch_attributes[3] & cli_module.termios.ISIG != 0
+    assert watch_attributes[6][cli_module.termios.VMIN] == 0
+    assert watch_attributes[6][cli_module.termios.VTIME] == 0
+    assert flushed == [(17, cli_module.termios.TCIFLUSH)]
+    assert changed[-1] == (17, cli_module.termios.TCSANOW, original)
 
 
 def test_automatic_remote_workspace_path_is_stable_and_does_not_expose_local_path(

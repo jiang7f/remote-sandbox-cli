@@ -9,10 +9,11 @@ import re
 import secrets
 import shutil
 import sys
+import termios
 import time
 import traceback
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,9 +150,15 @@ node_modules/
 """
 
 _AUTO_REMOTE_ROOT = "~/rsb-workspaces"
-_ALT_SCREEN_ENTER = "\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J"
+_ALT_SCREEN_ENTER = "\x1b[?1049h\x1b[?1007h\x1b[?25l\x1b[H\x1b[2J"
 _ALT_SCREEN_REFRESH = "\x1b[H\x1b[2J"
-_ALT_SCREEN_LEAVE = "\x1b[?25h\x1b[?1049l"
+_ALT_SCREEN_LEAVE = "\x1b[?25h\x1b[?1007l\x1b[?1049l"
+
+
+@dataclass(frozen=True, slots=True)
+class _WatchInputState:
+    fd: int
+    attributes: list[Any]
 
 
 def automatic_remote_workspace_path(local: Path, name: str | None = None) -> str:
@@ -173,17 +180,49 @@ def _connect_remote_path(args: argparse.Namespace) -> str:
 
 
 @contextlib.contextmanager
-def _status_watch_screen(stream: TextIO):  # type: ignore[no-untyped-def]
+def _status_watch_screen(
+    stream: TextIO,
+    input_stream: TextIO | None = None,
+) -> Iterator[bool]:
     interactive = stream.isatty()
-    if interactive:
-        stream.write(_ALT_SCREEN_ENTER)
-        stream.flush()
+    terminal_input = input_stream or sys.stdin
+    input_state = _prepare_watch_input(terminal_input) if interactive else None
     try:
+        if interactive:
+            stream.write(_ALT_SCREEN_ENTER)
+            stream.flush()
         yield interactive
     finally:
         if interactive:
             stream.write(_ALT_SCREEN_LEAVE)
             stream.flush()
+            _restore_watch_input(input_state)
+
+
+def _prepare_watch_input(stream: TextIO) -> _WatchInputState | None:
+    if not stream.isatty():
+        return None
+    try:
+        fd = stream.fileno()
+        attributes = termios.tcgetattr(fd)
+        watch_attributes = attributes.copy()
+        watch_attributes[6] = attributes[6].copy()
+        watch_attributes[3] &= ~(termios.ECHO | termios.ICANON)
+        watch_attributes[6][termios.VMIN] = 0
+        watch_attributes[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, watch_attributes)
+    except (OSError, ValueError):
+        return None
+    return _WatchInputState(fd, attributes)
+
+
+def _restore_watch_input(state: _WatchInputState | None) -> None:
+    if state is None:
+        return
+    with contextlib.suppress(OSError, ValueError):
+        termios.tcflush(state.fd, termios.TCIFLUSH)
+    with contextlib.suppress(OSError, ValueError):
+        termios.tcsetattr(state.fd, termios.TCSANOW, state.attributes)
 
 
 def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
@@ -673,7 +712,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status", help="List local workspace bindings")
     status.add_argument("name", nargs="?", help="Connection name; defaults to all workspaces")
-    status.add_argument("--watch", action="store_true", help="Refresh the status table")
+    status.add_argument(
+        "--watch",
+        action="store_true",
+        help="Refresh status in a top-style full-screen view",
+    )
     status.add_argument(
         "--paths",
         action="store_true",
