@@ -170,27 +170,31 @@ rsb forget <name> --local-only
 rsb skill install
 ```
 
-该命令把随软件发布的 skill 安装到 `${CODEX_HOME:-~/.codex}/skills/remote-sandbox`。重新打开 Codex 任务后，可以只告诉 AI binding 名称。
+该命令把随软件发布的 skill 安装到 `${CODEX_HOME:-~/.codex}/skills/remote-sandbox`。重新打开 Codex 任务后，无需再解释同步方式、本地路径和远程执行的分工。
+
+已知 binding 名称时，直接说任务即可。
 
 ```text
-使用 rsb 的 project binding 运行测试。
+用 sfs 修复这个问题，然后跑测试。
 ```
 
-也可以直接询问 binding 的目录和工作方式。
+当 Codex 已经打开 binding 的本地目录时，可以更短。
 
 ```text
-使用 remote-sandbox 管理 sfs。目录是什么，然后继续完成当前任务。
+这个项目在远程跑测试。
 ```
 
-如果 Codex 当前就在绑定的本地目录中，也可以只说。
+给出两端目录时，AI 会复用已有的精确 binding，或使用 `--no-shell` 建立新 binding。
 
 ```text
-这个项目使用 rsb。修改代码并在远程运行测试。
+把本地 /path/to/project 和 server:~/work/project 绑定，然后继续当前任务。
 ```
 
-给出本地和远程目录时，skill 会建立精确 binding。只给本地目录时，它会先检查已有 binding，再从 `rsb list` 选择合适服务器，并通过 `--auto-remote` 创建隔离工作区。
+只给本地项目和服务器时，AI 会使用 `--auto-remote` 在 `~/rsb-workspaces` 下选择隔离位置。
 
-skill 把 binding 当作一个工作区。本地文件由 AI 正常读取和编辑，项目环境和算力来自远程。少量命令和最终验证使用 `rsb run`，连续调试可以保持一个 `rsb shell`，不会为每条小命令重新打开连接。正常情况下只在任务开始确认一次路径，不会反复观察同步状态。
+skill 默认使用 `rsb run`。它适合普通测试、编译、脚本和长时间训练，能直接得到远程命令的输出和退出码。`rsb shell` 只用于调试器、REPL、`top`、前台服务等真正需要交互或持久状态的工作。AI 不会在每条命令前查询状态，也不会用 `status --watch` 持续监控同步。
+
+完全不提 rsb 时，AI 系统无法仅凭隐藏在用户目录中的 registry 保证触发 skill。最短且稳定的提示是“用 sfs…”或“这个项目远程跑…”。在同一个 Codex 任务里只需说一次。
 
 升级 `remote-sandbox` 后，可以更新已安装的 skill。
 
@@ -216,8 +220,10 @@ rsb skill uninstall
 This project is bound through remote-sandbox as `project`.
 
 - Read and edit only the local working tree.
-- Check the binding with `rsb status project --paths`.
+- Resolve the binding with `rsb status project --paths` once per task.
 - Run commands that need the project environment or remote compute with `rsb run project -- <command>`.
+- Prefer `rsb run`. Use `rsb shell` only for interactive or stateful programs.
+- Do not poll synchronization status unless a command or required generated file is blocked.
 - Do not edit the remote workspace directly over SSH.
 - Report remote command failures separately from synchronization warnings.
 ```

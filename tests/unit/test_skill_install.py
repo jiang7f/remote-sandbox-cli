@@ -20,6 +20,17 @@ def test_repository_skill_matches_bundled_skill() -> None:
     ).read_bytes()
 
 
+def test_bundled_skill_keeps_ai_on_the_fast_path() -> None:
+    skill = (
+        Path(skill_install.__file__).with_name("bundled_skill") / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    assert "Default to `rsb run`" in skill
+    assert "without a preliminary status call" in skill
+    assert "Never use `rsb status --watch`" in skill
+    assert "Do not ask the user to restate rsb mechanics" in skill
+
+
 def test_install_codex_skill_is_idempotent(tmp_path: Path) -> None:
     first = skill_install.install_codex_skill(codex_home=tmp_path)
     second = skill_install.install_codex_skill(codex_home=tmp_path)
