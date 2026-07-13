@@ -22,7 +22,7 @@ from remote_sandbox.manifest import (
 )
 from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _JSON_SCHEMA_VERSION = 1
 _SIDES = frozenset({"local", "remote"})
 
@@ -725,6 +725,14 @@ class WorkspaceStore:
         with self.transaction():
             self._connection.execute(
                 """
+                UPDATE conflicts
+                SET resolved_at = COALESCE(resolved_at, ?)
+                WHERE path = ? AND resolved_at IS NULL
+                """,
+                (record.created_at, record.path),
+            )
+            self._connection.execute(
+                """
                 INSERT INTO conflicts(
                     conflict_id, path, reason, local_blob, remote_blob,
                     local_fingerprint_json, remote_fingerprint_json, created_at, resolved_at
@@ -797,8 +805,15 @@ class WorkspaceStore:
             elif version == 1:
                 self._migrate_legacy_base_entries()
                 self._create_current_schema()
-            elif version in {2, 3, 4, 5}:
+            elif version in {2, 3, 4, 5, 6}:
                 self._create_current_schema()
+            self._repair_duplicate_unresolved_conflicts()
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS conflicts_one_unresolved_per_path
+                ON conflicts(path) WHERE resolved_at IS NULL
+                """
+            )
             self._connection.execute(
                 """
                 INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)
@@ -808,6 +823,31 @@ class WorkspaceStore:
             )
             self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._ensure_default_status()
+
+    def _repair_duplicate_unresolved_conflicts(self) -> None:
+        resolved_at = time.time()
+        self._connection.execute(
+            """
+            UPDATE conflicts
+            SET resolved_at = COALESCE(resolved_at, ?)
+            WHERE conflict_id IN (
+                SELECT older.conflict_id
+                FROM conflicts AS older
+                JOIN conflicts AS newer
+                  ON newer.path = older.path
+                 AND newer.resolved_at IS NULL
+                 AND (
+                      newer.created_at > older.created_at
+                      OR (
+                          newer.created_at = older.created_at
+                          AND newer.conflict_id > older.conflict_id
+                      )
+                 )
+                WHERE older.resolved_at IS NULL
+            )
+            """,
+            (resolved_at,),
+        )
 
     def _read_schema_version(self) -> int:
         user_version = _expect_int(

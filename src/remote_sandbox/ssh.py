@@ -410,10 +410,14 @@ class SubprocessSshRunner:
             )
 
     def clear_master(self, target: str) -> None:
-        """Best-effort drop of a dead/stale ControlMaster so the next call re-dials."""
+        """Retire a ControlMaster without terminating its existing sessions.
+
+        ``ssh -O exit`` also kills interactive shells multiplexed over the master.
+        ``stop`` removes it from future reuse while allowing those shells to finish.
+        """
         with contextlib.suppress(Exception):
             subprocess.run(
-                ["ssh", *ssh_control_opts(), "-O", "exit", target],
+                ["ssh", *ssh_control_opts(), "-O", "stop", target],
                 check=False,
                 capture_output=True,
                 text=True,

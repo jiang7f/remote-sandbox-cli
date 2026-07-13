@@ -61,6 +61,25 @@ def test_control_master_reuses_establishes_and_reports_failure(
     assert any("-O" in call and "check" in call for call in calls)
 
 
+def test_clear_master_retires_without_terminating_existing_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(ssh_module.subprocess, "run", run)
+
+    SubprocessSshRunner().clear_master("host")
+
+    assert len(calls) == 1
+    assert "-O" in calls[0]
+    assert "stop" in calls[0]
+    assert "exit" not in calls[0]
+
+
 def test_probe_connection_classifies_success_auth_network_and_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

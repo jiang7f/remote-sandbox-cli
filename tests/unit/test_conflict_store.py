@@ -115,6 +115,65 @@ def test_resolving_conflict_preserves_its_stored_versions(tmp_path: Path) -> Non
         assert store.list_conflicts(unresolved_only=True) == []
 
 
+def test_new_conflict_supersedes_unresolved_conflict_for_same_path(tmp_path: Path) -> None:
+    with WorkspaceStore.open(tmp_path / "state.sqlite3") as store:
+        first = store.create_conflict(
+            path="model.py",
+            reason="both-modified",
+            local_blob=b"local one\n",
+            remote_blob=b"remote one\n",
+        )
+        second = store.create_conflict(
+            path="model.py",
+            reason="both-modified",
+            local_blob=b"local two\n",
+            remote_blob=b"remote two\n",
+        )
+
+        assert store.get_conflict(first.conflict_id).resolved_at is not None
+        assert store.list_conflicts(unresolved_only=True) == [second]
+
+
+def test_schema_migration_repairs_duplicate_unresolved_conflicts(tmp_path: Path) -> None:
+    db = tmp_path / "state.sqlite3"
+    with WorkspaceStore.open(db):
+        pass
+
+    connection = sqlite3.connect(db)
+    connection.execute("DROP INDEX conflicts_one_unresolved_per_path")
+    connection.execute("UPDATE schema_meta SET value = '6' WHERE key = 'schema_version'")
+    connection.execute("PRAGMA user_version=6")
+    connection.execute(
+        """
+        INSERT INTO conflicts(
+            conflict_id, path, reason, local_blob, remote_blob,
+            local_fingerprint_json, remote_fingerprint_json, created_at, resolved_at
+        ) VALUES
+            ('older', 'model.py', 'both-modified', X'31', X'32', NULL, NULL, 1.0, NULL),
+            ('newer', 'model.py', 'both-modified', X'33', X'34', NULL, NULL, 2.0, NULL)
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with WorkspaceStore.open(db) as store:
+        unresolved = store.list_conflicts(unresolved_only=True)
+        assert [conflict.conflict_id for conflict in unresolved] == ["newer"]
+        assert store.get_conflict("older").resolved_at is not None
+
+    connection = sqlite3.connect(db)
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """
+            INSERT INTO conflicts(
+                conflict_id, path, reason, local_blob, remote_blob,
+                local_fingerprint_json, remote_fingerprint_json, created_at, resolved_at
+            ) VALUES ('third', 'model.py', 'both-modified', X'35', X'36', NULL, NULL, 3.0, NULL)
+            """
+        )
+    connection.close()
+
+
 def test_corrupt_fingerprint_json_is_rejected_on_read(tmp_path: Path) -> None:
     db = tmp_path / "state.sqlite3"
     with WorkspaceStore.open(db) as store:
