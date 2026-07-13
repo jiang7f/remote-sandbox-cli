@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -145,6 +147,26 @@ node_modules/
 # Git metadata is always local-only and cannot be re-enabled.
 """
 
+_AUTO_REMOTE_ROOT = "~/rsb-workspaces"
+
+
+def automatic_remote_workspace_path(local: Path, name: str | None = None) -> str:
+    resolved = local.expanduser().resolve(strict=False)
+    label = name or resolved.name or "workspace"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip(".-_").lower()
+    if not slug:
+        slug = "workspace"
+    digest = hashlib.sha256(os.fsencode(str(resolved))).hexdigest()[:10]
+    return f"{_AUTO_REMOTE_ROOT}/{slug[:48]}-{digest}"
+
+
+def _connect_remote_path(args: argparse.Namespace) -> str:
+    if args.remote is not None:
+        return str(args.remote)
+    if args.auto_remote:
+        return automatic_remote_workspace_path(Path(args.local), args.name)
+    raise ValueError("connect requires --remote or --auto-remote")
+
 
 def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
     if args.command == "init":
@@ -206,9 +228,10 @@ def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
         return result.returncode
 
     if args.command == "connect" and args.no_shell:
+        remote = _connect_remote_path(args)
         connection = services.connect_workspace(
             args.target,
-            args.remote,
+            remote,
             Path(args.local),
             args.name,
             args.yes,
@@ -660,11 +683,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     connect = subparsers.add_parser("connect", help="Bind a local workspace to a remote path")
     connect.add_argument("target", help="OpenSSH target, e.g. a Host alias or user@host")
-    connect.add_argument(
+    remote_selection = connect.add_mutually_exclusive_group(required=True)
+    remote_selection.add_argument(
         "-r",
         "--remote",
-        required=True,
         help="Remote workspace path: /abs, ~, or ~/path",
+    )
+    remote_selection.add_argument(
+        "--auto-remote",
+        action="store_true",
+        help="Use a safe path under ~/rsb-workspaces derived from the local path",
     )
     connect.add_argument("-l", "--local", default=".", help="Local workspace path; defaults to cwd")
     connect.add_argument("--name", default=None, help="Connection name for rsb reconnect")
@@ -1032,9 +1060,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     "interactive shell requires a TTY; rerun in a terminal or pass --no-shell"
                 )
+            remote = _connect_remote_path(args)
             connection = services.connect_workspace(
                 args.target,
-                args.remote,
+                remote,
                 Path(args.local),
                 args.name,
                 args.yes,

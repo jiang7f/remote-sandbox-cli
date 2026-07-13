@@ -1,33 +1,49 @@
 ---
 name: remote-sandbox
-description: Use remote-sandbox (`rsb`) to discover or create SSH-backed workspace bindings, keep file edits local, and run project commands in the matching remote environment. Trigger whenever the user mentions rsb, remote-sandbox, a binding name, a local and remote workspace pair, or asks Codex to edit locally while testing, building, training, or executing on a remote server.
+description: Use remote-sandbox (`rsb`) as one seamless workspace with local editing and remote execution. Trigger when the user names an rsb binding, asks for its local or remote directories, provides a local and remote directory to bind, asks to put a local project on a configured server, or wants code edited locally while tests, builds, training, or other commands run remotely.
 ---
 
 # Remote Sandbox
 
-Use `rsb` as the ownership boundary between local editing and remote execution.
+Treat a binding as one workspace. Use the local tree as the normal file view and the remote tree as its execution environment. Let rsb synchronize in the background.
 
-## Core Contract
+## Core Behavior
 
-- Read and edit source files only in the local working tree.
-- Run commands that need the project environment or remote compute with `rsb run`.
-- Use `rsb shell` only when the user explicitly needs an interactive terminal.
-- Do not edit the remote project directly through `ssh`, `scp`, or remote shell commands.
-- Do not delete either workspace root. `rsb forget` removes metadata, not project files.
+- Read, search, create, and edit files in the bound local tree with normal local tools.
+- Run environment-dependent or compute-heavy commands in the bound remote root.
+- Expect local edits to appear remotely and remote-generated project files to appear locally.
+- Do not manually copy files with `ssh`, `scp`, `rsync`, or temporary staging directories.
+- Do not make synchronization monitoring the main task. Inspect it only at the checkpoints below or when an operation actually fails.
+- Never delete a workspace root. Never resolve a conflict without user intent.
 
-## Discover the Binding
+## Route the User's Intent
 
-1. Run `rsb status --paths` before the first remote command.
-2. Prefer the binding explicitly named by the user.
-3. Otherwise select the binding whose `LOCAL` path contains the current working directory.
-4. If no unique binding matches, ask for the binding name instead of guessing.
-5. Run `rsb status <name> --paths` to capture the selected local and remote roots.
+### Existing Binding
 
-When the current directory is inside the bound local tree, commands may omit the name. Prefer the explicit name in reports and automation so the selected environment remains clear.
+When the user names a binding such as `sfs` or asks which directories it uses:
 
-## Create a Binding
+1. Run `rsb status <name> --paths` once.
+2. Read the `LOCAL` and `REMOTE` columns.
+3. State the selected binding and paths in one concise sentence.
+4. Set the working directory to `LOCAL`.
+5. Continue the requested coding task locally and use the remote execution strategy below.
 
-When the user provides an SSH target, remote path, and local path, use the noninteractive-shell form so Codex retains control of its terminal.
+Example response:
+
+```text
+Using sfs. Local: /local/project. Remote: server:/remote/project. I will edit locally and run project commands remotely.
+```
+
+Do not keep running `status` after this unless a command fails, remote output must sync back, or the task reaches a final synchronization checkpoint.
+
+### Explicit Local and Remote Directories
+
+When the user gives a local path and an exact remote endpoint such as `server:/remote/project`:
+
+1. Use the requested SSH target, local path, and remote path.
+2. Derive a short ASCII binding name from the local directory unless the user supplies one.
+3. Check `rsb status --paths` once and reuse an existing exact binding.
+4. Otherwise connect without entering an interactive shell.
 
 ```bash
 rsb connect <target> \
@@ -37,40 +53,61 @@ rsb connect <target> \
   --no-shell
 ```
 
-Do not add `--yes` until the displayed local path, remote path, and initial sync direction have been checked. Do not force a merge when both directories are nonempty and `rsb` refuses a new binding.
+Review the confirmation text before accepting it. Accept local-to-remote when the user asked to upload local content. Accept remote-to-local when the user asked to open an existing remote project locally. Stop when both sides are nonempty and rsb refuses an unverified merge.
 
-If the user wants to browse before choosing a remote path, tell them to use `rsb enter <target>` in an interactive terminal. Do not automate an interactive browsing shell when an exact path is already available.
+### Put a Local Project on a Server
 
-## Check Readiness
+When the user gives a local directory but no remote directory:
 
-Inspect `rsb status <name> --paths` after connecting and before commands that require the complete workspace.
-
-- `ready` means normal execution can proceed.
-- `initial-syncing` or `syncing` means monitor with `rsb status <name>` until ready when the command needs the complete tree.
-- `stopped` means run `rsb start <name>`, then check status again.
-- `degraded`, `disconnected`, or `failed` means report the status error and use the suggested reconnect action. Do not bypass rsb with direct remote edits.
-- A nonzero `CONFLICTS` count means inspect `rsb conflicts <name>`. Never choose local or remote conflict resolution without user intent or clear task evidence.
-
-## Run Commands
-
-Use argument-preserving remote execution.
+1. Reuse an existing binding whose `LOCAL` path matches.
+2. If the user names a server, use it. Otherwise run `rsb list` and choose a reachable server suitable for the task. Prefer the least busy suitable target. Ask only when hardware requirements or data locality make the choice materially ambiguous.
+3. Derive a short ASCII binding name from the local directory.
+4. Let rsb allocate a safe, stable directory under `~/rsb-workspaces`.
 
 ```bash
-rsb run <name> -- <command> <args...>
+rsb connect <target> \
+  --auto-remote \
+  --local <local-path> \
+  --name <name> \
+  --no-shell
 ```
 
-Examples:
+Report the chosen target, generated remote path, and binding name, then continue the task. Do not browse the server or invent a path inside an existing project tree.
+
+## Work Without Sync Chatter
+
+After selecting or creating a binding:
+
+- Treat `ready / idle` as normal and proceed.
+- Treat `degraded` with conflicts as usable for unrelated paths. Inspect `rsb conflicts <name>` only when the task touches a conflicting path or the user asks.
+- During `initial-syncing`, continue local reading and editing. Wait before running commands that require the complete remote tree.
+- For `stopped`, run `rsb start <name>`.
+- For `disconnected`, run the foreground reconnect suggested by `rsb status`.
+- For `failed`, report the error and diagnose it. Do not bypass rsb with direct remote edits.
+- Do not repeatedly compare hashes. rsb owns synchronization verification and automatically closes stale conflicts when both sides converge.
+
+## Choose an Execution Mode
+
+Use `rsb run` for one to three commands, fixed command batches, and final verification.
 
 ```bash
-rsb run project -- pytest -q
-rsb run project -- python3 train.py --epochs 10
-rsb run project -- bash -lc 'make build && make test'
+rsb run <name> -- pytest -q
+rsb run <name> -- python3 train.py --epochs 10
+rsb run <name> -- bash -lc 'make build && make test'
 ```
 
-Prefer direct argument lists. Use `bash -lc` only when shell syntax such as pipes, redirection, environment activation, or command chaining is required.
+Use one persistent `rsb shell <name>` when the task requires many short, iterative commands and the terminal tool supports a persistent session. Keep that session open instead of reopening a shell for every command. Capture command status with a marker when needed.
 
-Treat the remote command exit status as the command result. Report a synchronization warning separately rather than describing a successful remote command as failed.
+```bash
+<command>; __rsb_rc=$?; printf '\n__RSB_RC__=%s\n' "$__rsb_rc"
+```
 
-## Finish the Task
+Use direct argument lists when possible. Use `bash -lc` only for shell syntax, environment activation, pipelines, or command chaining. Return to a standalone `rsb run` for the final test so its exit status is unambiguous.
 
-Run `rsb status <name>` after commands that create or modify files. Before reporting completion, confirm that the remote command result is known and that the binding is not in `failed` or unresolved conflict state.
+Long-running commands may stay in `rsb run`. Do not move outputs to remote `/tmp` merely to avoid watcher activity.
+
+## Finish
+
+Run a final `rsb status <name>` only when remote commands generated project files, a sync warning occurred, or conflict state matters to the requested result. Otherwise report the remote command result directly.
+
+Keep synchronization warnings separate from remote command exit status. Report the binding and paths once, then describe the task as ordinary local editing with remote execution.

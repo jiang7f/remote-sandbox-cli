@@ -244,6 +244,32 @@ def test_remote_directory_delete_defers_verified_local_ancestor_for_child_confli
     assert pair.store.list_conflicts(unresolved_only=True) == []
 
 
+def test_matching_sides_auto_resolve_an_existing_conflict(
+    production_sync_pair: ProductionSyncPair,
+) -> None:
+    pair = production_sync_pair
+    path = "results.csv"
+    for root in (pair.local, pair.remote):
+        (root / path).write_bytes(b"base\n")
+    pair.seed_current_base()
+    (pair.local / path).write_bytes(b"local\n")
+    (pair.remote / path).write_bytes(b"remote\n")
+    pair.store.append_event("local", EventKind.MODIFY, path)
+    pair.remote_client.append_event(EventKind.MODIFY, path)
+
+    pair.engine.run_once("create-conflict")
+    assert len(pair.store.list_conflicts(unresolved_only=True)) == 1
+
+    for root in (pair.local, pair.remote):
+        (root / path).write_bytes(b"converged\n")
+
+    result = pair.engine.run_once("periodic-conflict-check")
+
+    assert result.completed == (path,)
+    assert pair.store.list_conflicts(unresolved_only=True) == []
+    assert pair.store.get_status().phase is WorkspacePhase.READY
+
+
 def test_engine_uses_one_transfer_batch_per_direction(sync_pair: SyncPair) -> None:
     for path in ("push.txt", "pull.txt"):
         (sync_pair.local / path).write_bytes(b"base")

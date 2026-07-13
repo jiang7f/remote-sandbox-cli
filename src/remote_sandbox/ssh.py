@@ -726,6 +726,7 @@ class SubprocessSshRunner:
             [cwd, *argv],
             capture=True,
             path_arg_count=1,
+            timeout=None,
         )
         return CommandResult(
             returncode=result.returncode,
@@ -770,6 +771,7 @@ class SubprocessSshRunner:
         input_text: str | None = None,
         capture: bool = False,
         path_arg_count: int | None = None,
+        timeout: float | None | Literal["default"] = "default",
     ) -> subprocess.CompletedProcess[str]:
         validate_target(target)
         checked_args = args if path_arg_count is None else args[:path_arg_count]
@@ -779,13 +781,14 @@ class SubprocessSshRunner:
         remote_command = " ".join(
             ["sh", "-c", shlex.quote(full_script), "sh", *(shlex.quote(arg) for arg in args)]
         )
+        effective_timeout = self.timeout_s if timeout == "default" else timeout
         return subprocess.run(
             [*self._ssh_batch_args(), target, remote_command],
             check=False,
             text=True,
             input=input_text,
             capture_output=capture,
-            timeout=self.timeout_s,
+            timeout=effective_timeout,
         )
 
     def _run_script_bytes(

@@ -155,7 +155,6 @@ class SyncEngine:
                 self._status_override = previous_override
 
     def _run_once(self, reason: str) -> EngineResult:
-        del reason
         remote_after = self.store.acknowledged_sequence("remote")
         imported = self.remote.events_after(remote_after)
         self.store.record_events(imported)
@@ -170,6 +169,9 @@ class SyncEngine:
             self._record_audit_drift()
         requeued_before = set(self.store.list_requeued_paths())
         sources = dirty_sources(local_events, remote_events, requeued_before)
+        if reason != "initial-replay":
+            for conflict in self.store.list_conflicts(unresolved_only=True):
+                sources.setdefault(conflict.path, set()).add("conflict")
         dirty = tuple(sorted(sources))
         if not dirty:
             return self._commit_noop(local_events, remote_events)
@@ -506,6 +508,7 @@ class SyncEngine:
                         self.store.delete_base(path)
                     else:
                         self.store.upsert_base(state)
+                    self.store.resolve_conflicts_for_path(path)
                 for (side, _path), fingerprint in sorted(expected_echoes.items()):
                     self.store.set_expected_echo(side, fingerprint)
                 for echo in echoes:

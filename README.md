@@ -72,6 +72,16 @@ rsb connect dev-server \
   --no-shell
 ```
 
+只有本地目录、希望由工具选择安全远程位置时，使用 `--auto-remote`。远程目录会稳定生成在 `~/rsb-workspaces/<项目名>-<短哈希>` 下，并继续遵守首次同步的空目录安全规则。
+
+```bash
+rsb connect dev-server \
+  --auto-remote \
+  --local ~/projects/project \
+  --name project \
+  --no-shell
+```
+
 ### 先浏览远程目录
 
 不知道远程目录的准确路径时，可以先进入服务器。
@@ -160,10 +170,16 @@ rsb forget <name> --local-only
 rsb skill install
 ```
 
-该命令把随软件发布的 skill 安装到 `${CODEX_HOME:-~/.codex}/skills/remote-sandbox`。重新打开 Codex 任务后，只需要告诉 AI binding 名称。
+该命令把随软件发布的 skill 安装到 `${CODEX_HOME:-~/.codex}/skills/remote-sandbox`。重新打开 Codex 任务后，可以只告诉 AI binding 名称。
 
 ```text
 使用 rsb 的 project binding 运行测试。
+```
+
+也可以直接询问 binding 的目录和工作方式。
+
+```text
+使用 remote-sandbox 管理 sfs。目录是什么，然后继续完成当前任务。
 ```
 
 如果 Codex 当前就在绑定的本地目录中，也可以只说。
@@ -172,7 +188,9 @@ rsb skill install
 这个项目使用 rsb。修改代码并在远程运行测试。
 ```
 
-skill 会先运行 `rsb status --paths` 自动确认 binding。本地文件仍由 AI 直接读取和编辑，需要项目环境或远程算力的命令通过 `rsb run <name> -- <command>` 执行。只有明确需要人工交互终端时才使用 `rsb shell`。
+给出本地和远程目录时，skill 会建立精确 binding。只给本地目录时，它会先检查已有 binding，再从 `rsb list` 选择合适服务器，并通过 `--auto-remote` 创建隔离工作区。
+
+skill 把 binding 当作一个工作区。本地文件由 AI 正常读取和编辑，项目环境和算力来自远程。少量命令和最终验证使用 `rsb run`，连续调试可以保持一个 `rsb shell`，不会为每条小命令重新打开连接。正常情况下只在任务开始确认一次路径，不会反复观察同步状态。
 
 升级 `remote-sandbox` 后，可以更新已安装的 skill。
 
@@ -210,7 +228,7 @@ AI 编辑代码时仍然直接操作当前本地目录。需要远程依赖、GP
 rsb run project -- pytest -q
 ```
 
-`rsb run` 会返回远程命令的标准输出、标准错误和退出状态，比让 AI 驱动交互式 `rsb shell` 更稳定。
+`rsb run` 会返回远程命令的标准输出、标准错误和退出状态。长时间运行的命令不受内部 SSH 操作超时限制。两端内容重新一致后，陈旧冲突会自动关闭。
 
 ## 忽略规则和占位文件
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from pathlib import Path
 
 import pytest
 
@@ -41,6 +42,34 @@ def test_parser_exposes_confirmed_commands_and_debug_flag() -> None:
     )
     assert no_shell.no_shell is True
     assert no_shell.yes is True
+    automatic = parser.parse_args(
+        ["connect", "host", "--auto-remote", "--local", "/work/project"]
+    )
+    assert automatic.auto_remote is True
+    assert automatic.remote is None
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "connect",
+                "host",
+                "--remote",
+                "/work/project",
+                "--auto-remote",
+            ]
+        )
+
+
+def test_automatic_remote_workspace_path_is_stable_and_does_not_expose_local_path(
+    tmp_path: Path,
+) -> None:
+    local = tmp_path / "Project Name"
+
+    first = cli_module.automatic_remote_workspace_path(local, "Demo Project")
+    second = cli_module.automatic_remote_workspace_path(local, "Demo Project")
+
+    assert first == second
+    assert first.startswith("~/rsb-workspaces/demo-project-")
+    assert str(tmp_path) not in first
 
 
 def test_resolve_requires_exactly_one_selected_source() -> None:

@@ -788,6 +788,24 @@ class WorkspaceStore:
                 raise KeyError(conflict_id)
         return self.get_conflict(conflict_id)
 
+    def resolve_conflicts_for_path(
+        self,
+        path: str,
+        *,
+        resolved_at: float | None = None,
+    ) -> int:
+        normalized = normalize_relative_path(path)
+        timestamp = time.time() if resolved_at is None else resolved_at
+        with self.transaction():
+            cursor = self._connection.execute(
+                """
+                UPDATE conflicts SET resolved_at = COALESCE(resolved_at, ?)
+                WHERE path = ? AND resolved_at IS NULL
+                """,
+                (timestamp, normalized),
+            )
+        return cursor.rowcount
+
     def _configure_connection(self) -> None:
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")

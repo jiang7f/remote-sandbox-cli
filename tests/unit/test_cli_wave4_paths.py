@@ -147,6 +147,39 @@ def test_no_shell_connect_and_reconnect_failure_paths(
     assert rejected.exit_code == 2
     assert "sync failed" in rejected.stderr
 
+    captured: list[tuple[str, str, Path, str | None, bool]] = []
+
+    def connect_automatic(
+        target: str,
+        remote: str,
+        local: Path,
+        name: str | None,
+        assume_yes: bool,
+    ) -> ConnectedWorkspace:
+        captured.append((target, remote, local, name, assume_yes))
+        return ConnectedWorkspace(cli_fixture.record, False, 0)
+
+    cli_fixture.services.connect_workspace = connect_automatic
+    cli_fixture.services.workspace_status = lambda _record: ready
+    automatic = cli.invoke_cli(
+        [
+            "connect",
+            "host",
+            "--auto-remote",
+            "--local",
+            str(cli_fixture.pair.local),
+            "--name",
+            "project",
+            "--no-shell",
+        ],
+        services=cli_fixture.services,
+    )
+    assert automatic.exit_code == 0
+    assert captured[0][1] == cli.automatic_remote_workspace_path(
+        cli_fixture.pair.local,
+        "project",
+    )
+
     cli_fixture.services.find_record = lambda _name, _path: None
     reconnect = cli.invoke_cli(
         ["reconnect", "missing", "--no-shell"],

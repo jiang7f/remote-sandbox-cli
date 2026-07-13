@@ -178,6 +178,23 @@ def test_subprocess_runner_reports_failures_and_validates_arguments(
         runner.run_command("host", "/work", ())
 
 
+def test_run_command_does_not_use_the_internal_operation_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(argv, 0, "done\n", "")
+
+    monkeypatch.setattr(ssh_module.subprocess, "run", run)
+
+    result = SubprocessSshRunner().run_command("host", "/work", ("sleep", "60"))
+
+    assert result.returncode == 0
+    assert calls[-1]["timeout"] is None
+
+
 def test_interactive_shell_requires_a_tty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ssh_module.os, "isatty", lambda _fd: False)
 
