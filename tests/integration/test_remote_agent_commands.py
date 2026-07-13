@@ -107,6 +107,87 @@ def test_in_process_agent_workspace_command_workflow(
     assert forgotten_again["already_forgotten"] is True
 
 
+def test_execution_environment_captures_interactive_exports_without_leaking_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, workspace_id = _configure_agent(tmp_path, monkeypatch)
+    home = Path.home()
+    custom_bin = home / "custom-bin"
+    custom_bin.mkdir()
+    python = custom_bin / "python"
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    python.chmod(0o755)
+    secret_value = "remote-only-value"
+    (home / ".bashrc").write_text(
+        f'export PATH="$HOME/custom-bin:$PATH"\nexport CUSTOM_RUNTIME_TOKEN={secret_value}\n',
+        encoding="utf-8",
+    )
+    agent_main._handle_register({"workspace_id": workspace_id, "root": str(root)})
+
+    refreshed = agent_main._handle_execution_environment(
+        {"workspace_id": workspace_id, "refresh": True}
+    )
+    cached = agent_main._handle_execution_environment(
+        {"workspace_id": workspace_id, "refresh": False}
+    )
+
+    assert refreshed["available"] is True
+    assert refreshed["refreshed"] is True
+    assert refreshed["python"] == str(python)
+    assert refreshed["path"].split(os.pathsep)[0] == str(custom_bin)
+    assert refreshed["warning"] is None
+    assert secret_value not in json.dumps(refreshed)
+    export_file = Path(str(refreshed["export_file"]))
+    assert export_file.stat().st_mode & 0o777 == 0o600
+    assert f"export CUSTOM_RUNTIME_TOKEN={secret_value}" in export_file.read_text(
+        encoding="utf-8"
+    )
+    assert cached["available"] is True
+    assert cached["refreshed"] is False
+    assert cached["export_file"] == str(export_file)
+
+    second_bin = home / "second-bin"
+    second_bin.mkdir()
+    (home / ".bashrc").write_text(
+        'export PATH="$HOME/second-bin:$PATH"\n',
+        encoding="utf-8",
+    )
+    invalidated = agent_main._handle_execution_environment(
+        {"workspace_id": workspace_id, "refresh": False}
+    )
+
+    assert invalidated["refreshed"] is True
+    assert invalidated["path"].split(os.pathsep)[0] == str(second_bin)
+
+
+def test_execution_environment_capture_failure_is_cached_as_a_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, workspace_id = _configure_agent(tmp_path, monkeypatch)
+    agent_main._handle_register({"workspace_id": workspace_id, "root": str(root)})
+
+    def fail_capture(*_args: object, **_kwargs: object) -> dict[str, str]:
+        raise RuntimeError("interactive shell initialization timed out")
+
+    monkeypatch.setattr(agent_main, "_capture_shell_environment", fail_capture)
+    refreshed = agent_main._handle_execution_environment(
+        {"workspace_id": workspace_id, "refresh": True}
+    )
+    cached = agent_main._handle_execution_environment(
+        {"workspace_id": workspace_id, "refresh": False}
+    )
+
+    assert refreshed["available"] is False
+    assert refreshed["refreshed"] is True
+    assert refreshed["export_file"] is None
+    assert "timed out" in str(refreshed["warning"])
+    assert cached["available"] is False
+    assert cached["refreshed"] is False
+    assert cached["warning"] == refreshed["warning"]
+
+
 @pytest.mark.parametrize(
     "raw_request,error",
     [

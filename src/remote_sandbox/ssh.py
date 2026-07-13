@@ -79,7 +79,14 @@ class SshRunner(Protocol):
 
     def delete_workspace_path(self, target: str, root: str, path: str) -> None: ...
 
-    def run_command(self, target: str, cwd: str, argv: tuple[str, ...]) -> CommandResult: ...
+    def run_command(
+        self,
+        target: str,
+        cwd: str,
+        argv: tuple[str, ...],
+        *,
+        environment_path: str | None = None,
+    ) -> CommandResult: ...
 
     def clear_master(self, target: str) -> None: ...
 
@@ -197,6 +204,7 @@ class FakeSshRunner:
     shell_barrier_callbacks: list[Callable[[int], None] | None] = field(default_factory=list)
     python_file_calls: list[tuple[str, str, tuple[str, ...]]] = field(default_factory=list)
     command_calls: list[tuple[str, str, tuple[str, ...]]] = field(default_factory=list)
+    command_environment_paths: list[str | None] = field(default_factory=list)
     workspace_python_calls: list[tuple[str, str, str, bytes, tuple[str, ...]]] = field(
         default_factory=list
     )
@@ -321,9 +329,17 @@ class FakeSshRunner:
             return "remote-sandbox-agent 0.1.0\n"
         return "ok\n"
 
-    def run_command(self, target: str, cwd: str, argv: tuple[str, ...]) -> CommandResult:
+    def run_command(
+        self,
+        target: str,
+        cwd: str,
+        argv: tuple[str, ...],
+        *,
+        environment_path: str | None = None,
+    ) -> CommandResult:
         self._maybe_fail("run_command", cwd)
         self.command_calls.append((target, _normalize_remote_path(cwd), argv))
+        self.command_environment_paths.append(environment_path)
         return self.command_result
 
     def run_workspace_python_bytes(
@@ -726,30 +742,65 @@ class SubprocessSshRunner:
         )
         return [*self._ssh_batch_args(), target, remote_command]
 
-    def run_command(self, target: str, cwd: str, argv: tuple[str, ...]) -> CommandResult:
+    def run_command(
+        self,
+        target: str,
+        cwd: str,
+        argv: tuple[str, ...],
+        *,
+        environment_path: str | None = None,
+    ) -> CommandResult:
         if not argv:
             raise SshError("remote command is empty")
         completion_marker = _COMMAND_COMPLETION_PREFIX + secrets.token_hex(16)
-        script = (
-            "status=0\n"
-            'p=$(remote_sandbox_path "$1") || status=$?\n'
-            "shift\n"
-            'if [ "$status" -eq 0 ]; then\n'
-            '    cd -- "$p" || status=$?\n'
-            "fi\n"
-            'if [ "$status" -eq 0 ]; then\n'
-            '    "$@"\n'
-            "    status=$?\n"
-            "fi\n"
-            f"printf '\\036{completion_marker}:%s\\037' \"$status\" >&2\n"
-            'exit "$status"\n'
+        script_parts = [
+            "_rsb_status=0\n",
+            '_rsb_workspace=$(remote_sandbox_path "$1") || _rsb_status=$?\n',
+        ]
+        args = [cwd, *argv]
+        path_arg_count = 1
+        if environment_path is not None:
+            script_parts.extend(
+                [
+                    '_rsb_environment=$(remote_sandbox_path "$2") || _rsb_status=$?\n',
+                    "shift 2\n",
+                    'if [ "$_rsb_status" -eq 0 ]; then\n',
+                    '    if [ -L "$_rsb_environment" ]; then\n',
+                    '        printf "rsb: refusing symlinked execution environment\\n" >&2\n',
+                    "        _rsb_status=2\n",
+                    '    elif [ -r "$_rsb_environment" ]; then\n',
+                    '        . "$_rsb_environment" || _rsb_status=$?\n',
+                    "    else\n",
+                    '        printf "rsb: captured execution environment is unavailable; '
+                    'using SSH environment\\n" >&2\n',
+                    "    fi\n",
+                    "fi\n",
+                ]
+            )
+            args = [cwd, environment_path, *argv]
+            path_arg_count = 2
+        else:
+            script_parts.append("shift\n")
+        script_parts.extend(
+            [
+                'if [ "$_rsb_status" -eq 0 ]; then\n',
+                '    cd -- "$_rsb_workspace" || _rsb_status=$?\n',
+                "fi\n",
+                'if [ "$_rsb_status" -eq 0 ]; then\n',
+                '    "$@"\n'
+                "    _rsb_status=$?\n",
+                "fi\n",
+                f"printf '\\036{completion_marker}:%s\\037' \"$_rsb_status\" >&2\n",
+                'exit "$_rsb_status"\n',
+            ]
         )
+        script = "".join(script_parts)
         result = self._run_script(
             target,
             script,
-            [cwd, *argv],
+            args,
             capture=True,
-            path_arg_count=1,
+            path_arg_count=path_arg_count,
             timeout=None,
         )
         remote_status, stderr = _extract_command_completion(

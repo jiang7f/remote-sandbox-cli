@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -13,10 +14,12 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +44,31 @@ _CONTROL_ENV = "REMOTE_SANDBOX_CONTROL_DIR"
 _EVENT_BATCH_SIZE = 256
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _WATCHER_IDENTITY_SETTLE_S = 0.5
+_EXECUTION_ENVIRONMENT_VERSION = 1
+_EXECUTION_ENVIRONMENT_STATE = "execution-environment.json"
+_EXECUTION_ENVIRONMENT_EXPORTS = "execution-environment.sh"
+_EXECUTION_ENVIRONMENT_TIMEOUT_S = 5.0
+_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_EXCLUDED_EXECUTION_ENVIRONMENT_NAMES = {
+    "_",
+    "BASH_ENV",
+    "BASHOPTS",
+    "BASHPID",
+    "CDPATH",
+    "COLORTERM",
+    "OLDPWD",
+    "PROMPT_COMMAND",
+    "PS1",
+    "PS2",
+    "PS4",
+    "PWD",
+    "SHELLOPTS",
+    "SHLVL",
+    "SSH_CLIENT",
+    "SSH_CONNECTION",
+    "SSH_TTY",
+    "TERM",
+}
 
 
 def _archive_sha256() -> str:
@@ -313,6 +341,232 @@ def _handle_snapshot(payload: dict[str, Any]) -> dict[str, object]:
                 "entries": snapshot_entries(workspace.root),
                 "latest_sequence": store.latest_sequence(),
             }
+
+
+def _handle_execution_environment(payload: dict[str, Any]) -> dict[str, object]:
+    workspace_id = validate_workspace_id(_expect_string(payload, "workspace_id"))
+    refresh = _expect_boolean(payload, "refresh", default=False)
+    home = _remote_home()
+    with _exclusive_lock(_workspace_lock_path(workspace_id)):
+        entry = _lookup_workspace(home, workspace_id)
+        with RemoteStore(entry.state_path) as store:
+            workspace = _require_workspace(store, entry)
+        metadata = _workspace_directory(home, workspace_id)
+        state_path = metadata / _EXECUTION_ENVIRONMENT_STATE
+        export_path = metadata / _EXECUTION_ENVIRONMENT_EXPORTS
+        signatures = _shell_source_signatures()
+        state = _read_execution_environment_state(state_path)
+        stale = (
+            state is None
+            or state.get("source_signatures") != signatures
+            or state.get("available") is True
+            and not export_path.is_file()
+        )
+        refreshed = refresh or stale
+        if refreshed:
+            state = _refresh_execution_environment(
+                workspace.root,
+                metadata,
+                export_path,
+                signatures,
+            )
+            _write_private_json(state_path, state)
+        assert state is not None
+        return _execution_environment_payload(state, export_path, refreshed=refreshed)
+
+
+def _refresh_execution_environment(
+    workspace_root: Path,
+    metadata: Path,
+    export_path: Path,
+    source_signatures: list[dict[str, object]],
+) -> dict[str, object]:
+    captured_at = datetime.now(UTC).isoformat(timespec="seconds")
+    shell = shutil.which("bash")
+    try:
+        if shell is None:
+            raise RuntimeError("bash is unavailable on the remote machine")
+        environment = _capture_shell_environment(workspace_root, metadata, shell)
+        environment = _sanitize_execution_environment(environment)
+        _write_execution_environment_exports(export_path, environment)
+        path_value = environment.get("PATH")
+        return {
+            "version": _EXECUTION_ENVIRONMENT_VERSION,
+            "available": True,
+            "captured_at": captured_at,
+            "shell": shell,
+            "path": path_value,
+            "python": shutil.which("python", path=path_value),
+            "python3": shutil.which("python3", path=path_value),
+            "warning": None,
+            "source_signatures": source_signatures,
+        }
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+        with suppress(FileNotFoundError):
+            export_path.unlink()
+        return {
+            "version": _EXECUTION_ENVIRONMENT_VERSION,
+            "available": False,
+            "captured_at": captured_at,
+            "shell": shell,
+            "path": None,
+            "python": None,
+            "python3": None,
+            "warning": str(exc),
+            "source_signatures": source_signatures,
+        }
+
+
+def _capture_shell_environment(
+    workspace_root: Path,
+    metadata: Path,
+    shell: str,
+) -> dict[str, str]:
+    marker = secrets.token_hex(24)
+    start = f"RSB_ENV_START_{marker}"
+    end = f"RSB_ENV_END_{marker}"
+    rc_path = metadata / f".execution-environment-{marker}.bashrc"
+    rc_path.write_text(
+        "if [ -f /etc/bash.bashrc ]; then . /etc/bash.bashrc; fi\n"
+        "if [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n",
+        encoding="utf-8",
+    )
+    rc_path.chmod(0o600)
+    command = (
+        f"printf '%s\\0' {shlex.quote(start)}; "
+        f"env -0; printf '%s\\0' {shlex.quote(end)}"
+    )
+    try:
+        result = subprocess.run(
+            [shell, "--noprofile", "--rcfile", str(rc_path), "-i", "-c", command],
+            cwd=workspace_root,
+            env=os.environ.copy(),
+            check=False,
+            capture_output=True,
+            timeout=_EXECUTION_ENVIRONMENT_TIMEOUT_S,
+        )
+    finally:
+        with suppress(FileNotFoundError):
+            rc_path.unlink()
+    start_frame = os.fsencode(start) + b"\0"
+    end_frame = os.fsencode(end) + b"\0"
+    start_at = result.stdout.find(start_frame)
+    end_at = result.stdout.find(end_frame, start_at + len(start_frame))
+    if result.returncode != 0 or start_at < 0 or end_at < 0:
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"interactive shell environment capture exited with status {result.returncode}"
+            )
+        raise RuntimeError("interactive shell did not publish an environment")
+    raw_environment = result.stdout[start_at + len(start_frame) : end_at]
+    environment: dict[str, str] = {}
+    for raw_entry in raw_environment.split(b"\0"):
+        if not raw_entry or b"=" not in raw_entry:
+            continue
+        raw_name, raw_value = raw_entry.split(b"=", 1)
+        name = os.fsdecode(raw_name)
+        value = os.fsdecode(raw_value)
+        environment[name] = value
+    if not environment:
+        raise RuntimeError("interactive shell returned an empty environment")
+    return environment
+
+
+def _sanitize_execution_environment(environment: dict[str, str]) -> dict[str, str]:
+    return {
+        name: value
+        for name, value in environment.items()
+        if _ENVIRONMENT_NAME.fullmatch(name)
+        and name not in _EXCLUDED_EXECUTION_ENVIRONMENT_NAMES
+        and not name.startswith("REMOTE_SANDBOX_")
+        and not name.startswith("BASH_FUNC_")
+        and not name.startswith("_rsb_")
+    }
+
+
+def _write_execution_environment_exports(path: Path, environment: dict[str, str]) -> None:
+    lines = ["# Generated by remote-sandbox. Do not edit."]
+    lines.extend(
+        f"export {name}={shlex.quote(value)}"
+        for name, value in sorted(environment.items())
+    )
+    _write_private_text(path, "\n".join(lines) + "\n")
+
+
+def _shell_source_signatures() -> list[dict[str, object]]:
+    signatures: list[dict[str, object]] = []
+    for path in (Path("/etc/bash.bashrc"), Path.home() / ".bashrc"):
+        try:
+            status = path.stat()
+        except FileNotFoundError:
+            signatures.append({"path": str(path), "missing": True})
+        else:
+            signatures.append(
+                {
+                    "path": str(path),
+                    "missing": False,
+                    "size": status.st_size,
+                    "mtime_ns": status.st_mtime_ns,
+                }
+            )
+    return signatures
+
+
+def _read_execution_environment_state(path: Path) -> dict[str, object] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(raw, dict) or raw.get("version") != _EXECUTION_ENVIRONMENT_VERSION:
+        return None
+    return raw
+
+
+def _write_private_json(path: Path, payload: dict[str, object]) -> None:
+    _write_private_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n",
+    )
+
+
+def _write_private_text(path: Path, content: str) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        with suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def _execution_environment_payload(
+    state: dict[str, object],
+    export_path: Path,
+    *,
+    refreshed: bool,
+) -> dict[str, object]:
+    available = state.get("available") is True and export_path.is_file()
+    return {
+        "available": available,
+        "refreshed": refreshed,
+        "export_file": str(export_path) if available else None,
+        "captured_at": state.get("captured_at"),
+        "shell": state.get("shell"),
+        "path": state.get("path"),
+        "python": state.get("python"),
+        "python3": state.get("python3"),
+        "warning": state.get("warning"),
+    }
 
 
 def _handle_hash_paths(payload: dict[str, Any]) -> dict[str, object]:
@@ -1063,6 +1317,7 @@ _HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, object]]] = {
     "metadata-paths": _handle_metadata_paths,
     "hash-paths": _handle_hash_paths,
     "read-path": _handle_read_path,
+    "execution-environment": _handle_execution_environment,
     "forget": _handle_forget,
 }
 

@@ -10,6 +10,7 @@ import remote_sandbox.cli as cli
 import remote_sandbox.daemon as daemon_module
 from remote_sandbox.daemon import StopResult
 from remote_sandbox.registry import BindingRecord, upsert_binding_record
+from remote_sandbox.remote_client import RemoteExecutionEnvironment
 from remote_sandbox.ssh import CommandResult
 from remote_sandbox.state import WorkspaceStore
 from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
@@ -34,6 +35,65 @@ def test_main_routes_service_commands_and_double_dash(
     assert "ran" in output.out
     assert "warn" in output.err
     assert cli_fixture.services.run_remote is not None
+
+
+def test_run_clean_environment_bypasses_captured_environment(
+    cli_fixture: CliHarness,
+) -> None:
+    calls: list[tuple[tuple[str, ...], bool]] = []
+
+    def run_remote(
+        _record: BindingRecord,
+        command: tuple[str, ...],
+        clean_environment: bool,
+    ) -> cli.RemoteCommandResult:
+        calls.append((command, clean_environment))
+        return cli.RemoteCommandResult(0)
+
+    cli_fixture.services.run_remote = run_remote
+
+    result = cli_fixture.run(["run", "dq", "--clean-env", "--", "python", "--flag"])
+
+    assert result.exit_code == 0
+    assert calls == [(('python', '--flag'), True)]
+
+
+def test_env_show_and_refresh_render_non_sensitive_summary(
+    cli_fixture: CliHarness,
+) -> None:
+    calls: list[bool] = []
+
+    def execution_environment(
+        _record: BindingRecord,
+        refresh: bool,
+    ) -> RemoteExecutionEnvironment:
+        calls.append(refresh)
+        return RemoteExecutionEnvironment(
+            available=True,
+            refreshed=refresh,
+            export_file="/remote/private/environment.sh",
+            captured_at="2026-07-13T10:00:00+00:00",
+            shell="/bin/bash",
+            path="/opt/runtime/bin:/usr/bin",
+            python="/opt/runtime/bin/python",
+            python3="/opt/runtime/bin/python3",
+            warning=None,
+        )
+
+    cli_fixture.services.execution_environment = execution_environment
+
+    shown = cli_fixture.run(["env", "show", "dq"])
+    refreshed = cli_fixture.run(["env", "refresh", "dq"])
+
+    assert shown.exit_code == 0
+    assert refreshed.exit_code == 0
+    assert calls == [False, True]
+    assert "Binding: dq" in shown.stdout
+    assert "Shell: /bin/bash" in shown.stdout
+    assert "PATH: /opt/runtime/bin:/usr/bin" in shown.stdout
+    assert "Python: /opt/runtime/bin/python" in shown.stdout
+    assert "/remote/private/environment.sh" not in shown.stdout
+    assert "Refreshed: yes" in refreshed.stdout
 
 
 def test_main_routes_non_service_commands_and_tty_guards(
@@ -100,7 +160,15 @@ class _Runner:
     def __init__(self) -> None:
         self.deleted: list[tuple[str, str]] = []
 
-    def run_command(self, target: str, cwd: str, argv: tuple[str, ...]) -> CommandResult:
+    def run_command(
+        self,
+        target: str,
+        cwd: str,
+        argv: tuple[str, ...],
+        *,
+        environment_path: str | None = None,
+    ) -> CommandResult:
+        assert environment_path == "/remote/private/execution-environment.sh"
         return CommandResult(9, f"{target}:{cwd}:{argv[0]}", "stderr")
 
     def delete_path(self, target: str, path: str) -> None:
@@ -121,6 +189,19 @@ class _Remote:
 
     def close(self) -> None:
         self.closed = True
+
+    def execution_environment(self, *, refresh: bool = False) -> RemoteExecutionEnvironment:
+        return RemoteExecutionEnvironment(
+            available=True,
+            refreshed=refresh,
+            export_file="/remote/private/execution-environment.sh",
+            captured_at="2026-07-13T10:00:00+00:00",
+            shell="/bin/bash",
+            path="/usr/bin",
+            python=None,
+            python3="/usr/bin/python3",
+            warning=None,
+        )
 
 
 def test_default_services_adapters_use_isolated_runtime_boundaries(
@@ -162,7 +243,8 @@ def test_default_services_adapters_use_isolated_runtime_boundaries(
     assert services.workspace_status(record) == ready
     assert services.ensure_supervisor(record) == ready
     assert services.request_sync(record) is True
-    assert services.run_remote(record, ("false",)).returncode == 9
+    assert services.run_remote(record, ("false",), False).returncode == 9
+    assert services.execution_environment(record, False).available is True
 
     paths = workspace_paths(record.workspace_id)
     with WorkspaceStore.open(paths.state_db):

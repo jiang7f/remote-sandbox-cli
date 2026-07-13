@@ -24,9 +24,11 @@ def test_remote_exit_code_wins_when_sync_followup_fails(cli_fixture: CliHarness)
 def test_run_distinguishes_incomplete_ssh_transport_from_remote_failure(
     cli_fixture: CliHarness,
 ) -> None:
-    cli_fixture.services.run_remote = lambda _record, _command: cli_module.RemoteCommandResult(
-        255,
-        transport_complete=False,
+    cli_fixture.services.run_remote = (
+        lambda _record, _command, _clean: cli_module.RemoteCommandResult(
+            255,
+            transport_complete=False,
+        )
     )
 
     result = cli_fixture.run(["run", "dq", "--", "long-command"])
@@ -34,6 +36,25 @@ def test_run_distinguishes_incomplete_ssh_transport_from_remote_failure(
     assert result.exit_code == 255
     assert "SSH transport ended before the remote command completed" in result.stderr
     assert "remote process may still be running" in result.stderr
+
+
+def test_run_warns_when_captured_environment_is_unavailable(
+    cli_fixture: CliHarness,
+) -> None:
+    cli_fixture.services.run_remote = (
+        lambda _record, _command, _clean: cli_module.RemoteCommandResult(
+            0,
+            stdout="ran\n",
+            environment_warning="interactive shell initialization timed out",
+        )
+    )
+
+    result = cli_fixture.run(["run", "dq", "--", "true"])
+
+    assert result.exit_code == 0
+    assert result.stdout == "ran\n"
+    assert "remote execution environment unavailable" in result.stderr
+    assert "using SSH non-interactive environment" in result.stderr
 
 
 def test_status_explains_foreground_reconnect_for_password_auth(

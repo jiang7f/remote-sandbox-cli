@@ -46,7 +46,7 @@ from remote_sandbox.registry import (
     registry_path,
 )
 from remote_sandbox.remote_agent import AGENT_VERSION
-from remote_sandbox.remote_client import RemoteWorkspaceClient
+from remote_sandbox.remote_client import RemoteExecutionEnvironment, RemoteWorkspaceClient
 from remote_sandbox.resources import ProbeResult, probe_target_resources
 from remote_sandbox.settings import (
     format_size_compact,
@@ -75,6 +75,7 @@ class RemoteCommandResult:
     stdout: str = ""
     stderr: str = ""
     transport_complete: bool = True
+    environment_warning: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +96,11 @@ class CliServices:
     daemon_status: Callable[[BindingRecord], object]
     ensure_supervisor: Callable[[BindingRecord], object]
     request_sync: Callable[[BindingRecord], bool]
-    run_remote: Callable[[BindingRecord, tuple[str, ...]], RemoteCommandResult]
+    run_remote: Callable[[BindingRecord, tuple[str, ...], bool], RemoteCommandResult]
+    execution_environment: Callable[
+        [BindingRecord, bool],
+        RemoteExecutionEnvironment,
+    ]
     connect_workspace: Callable[[str, str, Path, str | None, bool], ConnectedWorkspace]
     wait_initial_sync: Callable[[BindingRecord, int], WorkspaceStatus]
     fetch_placeholders: Callable[
@@ -269,10 +274,17 @@ def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
         return 0
 
     if args.command == "run":
-        name, command = _parse_run_items(args.items)
+        name, command, clean_environment = _parse_run_items(args.items)
         record = _service_record(services, name)
         services.ensure_supervisor(record)
-        result = services.run_remote(record, tuple(command))
+        result = services.run_remote(record, tuple(command), clean_environment)
+        if result.environment_warning is not None:
+            print(
+                "rsb: remote execution environment unavailable: "
+                + _one_line(result.environment_warning, max_len=500)
+                + "; using SSH non-interactive environment",
+                file=sys.stderr,
+            )
         if result.stdout:
             sys.stdout.write(result.stdout)
         if result.stderr:
@@ -296,6 +308,16 @@ def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
                     file=sys.stderr,
                 )
         return result.returncode
+
+    if args.command == "env":
+        record = _service_record(services, args.name)
+        services.ensure_supervisor(record)
+        environment = services.execution_environment(
+            record,
+            args.env_command == "refresh",
+        )
+        print(_format_execution_environment(record, environment))
+        return 0
 
     if args.command == "connect" and args.no_shell:
         remote = _connect_remote_path(args)
@@ -464,6 +486,30 @@ def _service_status_table(
     return table if not guidance else table + "\n\n" + "\n".join(guidance)
 
 
+def _format_execution_environment(
+    record: BindingRecord,
+    environment: RemoteExecutionEnvironment,
+) -> str:
+    lines = [
+        f"Binding: {record.name}",
+        f"Available: {'yes' if environment.available else 'no'}",
+        f"Refreshed: {'yes' if environment.refreshed else 'no'}",
+    ]
+    if environment.captured_at is not None:
+        lines.append(f"Captured: {environment.captured_at}")
+    if environment.shell is not None:
+        lines.append(f"Shell: {environment.shell}")
+    if environment.path is not None:
+        lines.append(f"PATH: {environment.path}")
+    if environment.python is not None:
+        lines.append(f"Python: {environment.python}")
+    if environment.python3 is not None:
+        lines.append(f"Python3: {environment.python3}")
+    if environment.warning is not None:
+        lines.append(f"Warning: {_one_line(environment.warning, max_len=500)}")
+    return "\n".join(lines)
+
+
 def default_cli_services() -> CliServices:
     registry = registry_path()
 
@@ -485,15 +531,46 @@ def default_cli_services() -> CliServices:
     def run_remote(
         record: BindingRecord,
         argv: tuple[str, ...],
+        clean_environment: bool,
     ) -> RemoteCommandResult:
-        runner = _connected_runner(record.target)
-        result = runner.run_command(record.target, record.remote_path, argv)
-        return RemoteCommandResult(
-            result.returncode,
-            result.stdout,
-            result.stderr,
-            result.transport_complete,
-        )
+        runner, remote, _transport = _production_remote_components(record)
+        try:
+            environment = (
+                None if clean_environment else remote.execution_environment(refresh=False)
+            )
+            result = runner.run_command(
+                record.target,
+                record.remote_path,
+                argv,
+                environment_path=(
+                    environment.export_file
+                    if environment is not None and environment.available
+                    else None
+                ),
+            )
+            return RemoteCommandResult(
+                result.returncode,
+                result.stdout,
+                result.stderr,
+                result.transport_complete,
+                (
+                    environment.warning or "interactive shell environment capture failed"
+                    if environment is not None and not environment.available
+                    else None
+                ),
+            )
+        finally:
+            remote.close()
+
+    def execution_environment(
+        record: BindingRecord,
+        refresh: bool,
+    ) -> RemoteExecutionEnvironment:
+        _runner, remote, _transport = _production_remote_components(record)
+        try:
+            return remote.execution_environment(refresh=refresh)
+        finally:
+            remote.close()
 
     def connect_workspace(
         target: str,
@@ -625,6 +702,7 @@ def default_cli_services() -> CliServices:
         ensure_supervisor=ensure_supervisor,
         request_sync=request_sync,
         run_remote=run_remote,
+        execution_environment=execution_environment,
         connect_workspace=connect_workspace,
         wait_initial_sync=wait_initial_sync,
         fetch_placeholders=fetch_registered,
@@ -708,7 +786,7 @@ def build_parser() -> argparse.ArgumentParser:
     skill_install.add_argument(
         "--force",
         action="store_true",
-        help="Replace a different installed copy",
+        help="Reinstall and replace any existing managed files",
     )
     skill_uninstall = skill_subparsers.add_parser(
         "uninstall",
@@ -745,7 +823,32 @@ def build_parser() -> argparse.ArgumentParser:
     shell.add_argument("name", nargs="?", help="Connection name; defaults to current workspace")
 
     run = subparsers.add_parser("run", help="Run one command in a bound remote workspace")
-    run.add_argument("items", nargs=argparse.REMAINDER, help="[name] -- command")
+    run.add_argument(
+        "items",
+        nargs=argparse.REMAINDER,
+        help="[name] [--clean-env] -- command",
+    )
+
+    environment = subparsers.add_parser("env", help="Inspect the remote execution environment")
+    environment_subparsers = environment.add_subparsers(dest="env_command", required=True)
+    environment_show = environment_subparsers.add_parser(
+        "show",
+        help="Show the captured remote execution environment",
+    )
+    environment_show.add_argument(
+        "name",
+        nargs="?",
+        help="Connection name; defaults to current workspace",
+    )
+    environment_refresh = environment_subparsers.add_parser(
+        "refresh",
+        help="Recapture the remote interactive-shell environment",
+    )
+    environment_refresh.add_argument(
+        "name",
+        nargs="?",
+        help="Connection name; defaults to current workspace",
+    )
 
     set_parser = subparsers.add_parser("set", help="Set user defaults")
     set_subparsers = set_parser.add_subparsers(dest="setting", required=True)
@@ -951,7 +1054,7 @@ def _poke_or_restart_daemon(local_root: Path, source: str) -> None:
         )
 
 
-def _parse_run_items(items: list[str]) -> tuple[str | None, list[str]]:
+def _parse_run_items(items: list[str]) -> tuple[str | None, list[str], bool]:
     try:
         separator = items.index("--")
     except ValueError as exc:
@@ -960,9 +1063,20 @@ def _parse_run_items(items: list[str]) -> tuple[str | None, list[str]]:
     command = items[separator + 1 :]
     if not command:
         raise ValueError("run requires a command after --")
-    if len(before) > 1:
+    clean_environment = False
+    names: list[str] = []
+    for item in before:
+        if item == "--clean-env":
+            if clean_environment:
+                raise ValueError("run accepts --clean-env at most once")
+            clean_environment = True
+        elif item.startswith("-"):
+            raise ValueError(f"unknown run option before --: {item}")
+        else:
+            names.append(item)
+    if len(names) > 1:
         raise ValueError("run accepts at most one connection name before --")
-    return (before[0] if before else None), command
+    return (names[0] if names else None), command, clean_environment
 
 
 def _record_for_execution(name: str | None) -> BindingRecord:
@@ -1088,7 +1202,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "skill" and args.skill_command == "install":
             install_result = install_codex_skill(force=args.force)
-            action = "Installed" if install_result.changed else "Already installed"
+            if install_result.reinstalled:
+                action = "Reinstalled"
+            elif install_result.changed:
+                action = "Installed"
+            else:
+                action = "Already up to date"
             print(f"{action} remote-sandbox skill at {install_result.path}")
             return 0
         if args.command == "skill" and args.skill_command == "uninstall":
@@ -1102,6 +1221,7 @@ def main(argv: list[str] | None = None) -> int:
             "init",
             "status",
             "run",
+            "env",
             "forget",
             "fetch",
             "peek",

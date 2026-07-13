@@ -95,7 +95,7 @@ def test_status_empty_missing_and_watch_refresh_paths(
 def test_run_reports_sync_failures_without_changing_remote_exit_code(
     cli_fixture: CliHarness,
 ) -> None:
-    cli_fixture.services.run_remote = lambda _record, _argv: RemoteCommandResult(
+    cli_fixture.services.run_remote = lambda _record, _argv, _clean: RemoteCommandResult(
         7,
         "stdout\n",
         "stderr\n",
@@ -449,7 +449,7 @@ def test_shell_poke_parse_record_and_runner_helpers(
     cli._poke_or_restart_daemon(local, "test")
     assert "did not accept sync notification" in capsys.readouterr().err
 
-    assert cli._parse_run_items(["--", "true"]) == (None, ["true"])
+    assert cli._parse_run_items(["--", "true"]) == (None, ["true"], False)
     for items, message in (
         (["true"], "requires --"),
         (["--"], "requires a command"),

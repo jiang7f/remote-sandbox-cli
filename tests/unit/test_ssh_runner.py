@@ -240,6 +240,48 @@ def test_run_command_extracts_remote_completion_without_polluting_stderr(
     assert result.transport_complete is True
 
 
+def test_run_command_sources_captured_environment_without_changing_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(ssh_module.secrets, "token_hex", lambda _size: "env123")
+
+    def run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "done\n",
+            "\x1eRSB-COMMAND-COMPLETE-env123:0\x1f",
+        )
+
+    monkeypatch.setattr(ssh_module.subprocess, "run", run)
+    environment_path = "/home/u/.remote-sandbox/workspaces/w1/execution-environment.sh"
+
+    result = SubprocessSshRunner().run_command(
+        "host",
+        "/work",
+        ("python", "-c", "print('value')"),
+        environment_path=environment_path,
+    )
+
+    remote_command = calls[-1][-1]
+    assert result.returncode == 0
+    assert environment_path in remote_command
+    assert "python" in remote_command
+    assert "value" in remote_command
+
+
+def test_run_command_rejects_invalid_environment_path() -> None:
+    with pytest.raises(ValueError, match="remote path"):
+        SubprocessSshRunner().run_command(
+            "host",
+            "/work",
+            ("true",),
+            environment_path="../environment.sh",
+        )
+
+
 def test_run_command_reports_incomplete_transport_when_marker_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

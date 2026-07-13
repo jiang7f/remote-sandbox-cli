@@ -5,6 +5,7 @@
 正式命令只有 `rsb`。
 
 - 本地和远程同时运行文件 watcher，修改会持续同步。
+- `rsb run` 自动复用远程交互 shell 导出的 PATH 和运行环境。
 - 首次同步显示扫描、规划、传输和重放状态。
 - 远程 shell 的提示符会动态显示同步状态，例如 `[dev-server:project sync 40%]`。
 - 工具元数据保存在工作区之外，不会向项目目录写入 `.remote-sandbox`。
@@ -139,6 +140,35 @@ rsb shell project
 
 如果工作区正在同步，从 `rsb shell` 打开的其他 shell 也会显示同一个动态状态前缀。
 
+## 远程执行环境
+
+`rsb run` 第一次执行时，会在远程工作区中启动一次受控的交互 Bash，复用与
+`rsb shell` 相同的初始化逻辑，并捕获它导出的环境变量。后续命令仍按原始 argv
+非交互执行，不使用 alias 或 shell function。
+
+查看当前捕获的非敏感摘要：
+
+```bash
+rsb env show project
+```
+
+修改了 `.bashrc`、module 或运行环境后，可以显式刷新：
+
+```bash
+rsb env refresh project
+```
+
+远程初始化文件变化时，下一次使用也会自动刷新。环境快照和完整变量值只保存在
+远程 rsb 元数据目录，不会复制到本地。`env show` 只显示 shell、PATH、Python
+路径、捕获时间和警告。
+
+捕获失败时，`rsb run` 会显示警告并退回 SSH 非交互环境，不会自动换环境重跑
+命令。需要有意绕过捕获环境进行诊断时使用：
+
+```bash
+rsb run project --clean-env -- env
+```
+
 ## 常用命令
 
 ```bash
@@ -147,7 +177,9 @@ rsb status [name] [--watch] [--paths]
 rsb start [name]
 rsb stop [name]
 rsb shell [name]
-rsb run [name] -- <command>
+rsb run [name] [--clean-env] -- <command>
+rsb env show [name]
+rsb env refresh [name]
 rsb reconnect <name> [--local <path>] [--no-shell]
 rsb conflicts [name]
 rsb resolve <path> --use-local
@@ -202,7 +234,9 @@ Using rsb binding sfs. Local: /local/project. Remote: server:/remote/project. I 
 
 只给本地项目和服务器时，AI 会使用 `--auto-remote` 在 `~/rsb-workspaces` 下选择隔离位置。
 
-skill 默认使用 `rsb run`。它适合普通测试、编译、脚本和长时间训练，能直接得到远程命令的输出和退出码。`rsb shell` 只用于调试器、REPL、`top`、前台服务等真正需要交互或持久状态的工作。AI 不会在每条命令前查询状态，也不会用 `status --watch` 持续监控同步。
+skill 默认使用 `rsb run`。它适合普通测试、编译、脚本和长时间训练，能直接得到远程命令的输出和退出码。首次运行环境相关命令前，AI 会读取项目说明并使用 `rsb env show` 检查远程执行环境。发现环境缺失时会先进行只读检查，不会仅根据非交互 PATH 就创建 venv 或安装依赖。持久化创建环境或安装依赖需要用户明确同意。
+
+`rsb shell` 只用于调试器、REPL、`top`、前台服务等真正需要交互或持久状态的工作。AI 不会在每条命令前查询状态，也不会用 `status --watch` 持续监控同步。
 
 升级 `remote-sandbox` 后，可以更新已安装的 skill。
 

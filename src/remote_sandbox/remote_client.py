@@ -33,6 +33,19 @@ class RemoteSnapshot:
     signatures: dict[str, AuditSignature] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteExecutionEnvironment:
+    available: bool
+    refreshed: bool
+    export_file: str | None
+    captured_at: str | None
+    shell: str | None
+    path: str | None
+    python: str | None
+    python3: str | None
+    warning: str | None
+
+
 class _StreamProcess(Protocol):
     stdin: BinaryIO | None
     stdout: BinaryIO | None
@@ -140,6 +153,10 @@ class RemoteWorkspaceClient:
 
     def status(self) -> dict[str, Any]:
         return self._call("status")
+
+    def execution_environment(self, *, refresh: bool = False) -> RemoteExecutionEnvironment:
+        payload = self._call("execution-environment", {"refresh": refresh})
+        return _parse_execution_environment(payload)
 
     def snapshot(self) -> RemoteSnapshot:
         payload = self._call("snapshot")
@@ -562,6 +579,42 @@ def _parse_fingerprint(raw: object) -> EntryFingerprint | MissingEntry:
         )
     except ValueError as exc:
         raise RemoteProtocolError(f"invalid remote fingerprint: {exc}") from exc
+
+
+def _parse_execution_environment(payload: object) -> RemoteExecutionEnvironment:
+    if not isinstance(payload, dict):
+        raise RemoteProtocolError("remote execution environment payload is malformed")
+    available = payload.get("available")
+    refreshed = payload.get("refreshed")
+    if type(available) is not bool or type(refreshed) is not bool:
+        raise RemoteProtocolError("remote execution environment payload is malformed")
+    values: dict[str, str | None] = {}
+    for field_name in (
+        "export_file",
+        "captured_at",
+        "shell",
+        "path",
+        "python",
+        "python3",
+        "warning",
+    ):
+        value = payload.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise RemoteProtocolError("remote execution environment payload is malformed")
+        values[field_name] = value
+    if available != (values["export_file"] is not None):
+        raise RemoteProtocolError("remote execution environment payload is malformed")
+    return RemoteExecutionEnvironment(
+        available=available,
+        refreshed=refreshed,
+        export_file=values["export_file"],
+        captured_at=values["captured_at"],
+        shell=values["shell"],
+        path=values["path"],
+        python=values["python"],
+        python3=values["python3"],
+        warning=values["warning"],
+    )
 
 
 def _parse_audit_signature(raw: object) -> AuditSignature | None:

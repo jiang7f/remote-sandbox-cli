@@ -11,6 +11,7 @@ SKILL_NAME = "remote-sandbox"
 class SkillInstallResult:
     path: Path
     changed: bool
+    reinstalled: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +33,7 @@ def install_codex_skill(
 ) -> SkillInstallResult:
     source = Path(__file__).with_name("bundled_skill")
     target = (codex_home or default_codex_home()) / "skills" / SKILL_NAME
+    target_existed = target.exists()
     files = {
         Path("SKILL.md"): (source / "SKILL.md").read_bytes(),
         Path("agents/openai.yaml"): (source / "agents" / "openai.yaml").read_bytes(),
@@ -43,8 +45,8 @@ def install_codex_skill(
         raise FileExistsError(
             f"{target} already exists with different content; rerun with --force to update it"
         )
-    if not changed:
-        return SkillInstallResult(target, False)
+    if not changed and not force:
+        return SkillInstallResult(target, False, False)
 
     for relative, content in files.items():
         destination = target / relative
@@ -52,7 +54,7 @@ def install_codex_skill(
         temporary = destination.with_name(f".{destination.name}.tmp")
         temporary.write_bytes(content)
         temporary.replace(destination)
-    return SkillInstallResult(target, True)
+    return SkillInstallResult(target, True, target_existed)
 
 
 def uninstall_codex_skill(

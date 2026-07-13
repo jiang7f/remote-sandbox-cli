@@ -45,10 +45,30 @@ When no binding is named:
 3. Select the deepest `LOCAL` path containing the current directory.
 4. Ask which binding to use only when no current path matches and the choice is genuinely ambiguous.
 
-Immediately announce the selected binding once:
+Immediately announce the selected binding once. Match the user's current language. Put the
+binding, local path, and remote path on separate lines, and put the local and remote paths on
+separate lines from each other. Keep paths in code formatting.
+
+English example:
 
 ```text
-Using rsb binding sfs. Local: /local/project. Remote: server:/remote/project. I will edit locally and run commands remotely.
+Remote sandbox enabled with binding `sfs`
+
+Local path: `/local/project`
+Remote path: `server:/remote/project`
+
+I will edit project files locally and run commands in the remote environment.
+```
+
+Chinese example:
+
+```text
+已启用 rsb 绑定 `sfs`
+
+本地目录：`/local/project`
+远程目录：`server:/remote/project`
+
+后续只在本地读写项目文件，需要运行命令时使用远程环境。
 ```
 
 Do not ask the user to confirm an existing binding. Do not run status or repeat the path announcement on later turns. Resolve and announce again only when the user explicitly switches to another binding.
@@ -91,6 +111,27 @@ rsb run -- pytest -q
 ```
 
 Use one persistent `rsb shell <name>` only for interactive or stateful programs such as a debugger, REPL, `top`, or foreground server.
+
+## Resolve The Remote Execution Environment Safely
+
+- Before the first environment-dependent command, read the project's documented runtime
+  instructions and run `rsb env show <name>` once.
+- Run `rsb env refresh <name>` when the captured environment is unavailable, stale, or does not
+  contain an expected executable. Continue to use `rsb run` after refreshing.
+- A missing executable in the clean non-interactive environment does not prove that the remote
+  machine lacks that runtime. The interactive shell may export PATH entries, modules, language
+  managers, virtual environments, compiler settings, or accelerator variables.
+- Use read-only discovery before making changes. Inspect project configuration, the captured
+  execution environment, available executables, and existing environment registries without
+  assuming a specific environment manager.
+- Do not create an environment or install dependencies until read-only discovery has been
+  exhausted and explicit user approval has been obtained for that persistent remote change.
+- Once the project runtime is identified, keep using an explicit, reproducible command through
+  `rsb run`, such as an absolute executable or the runtime manager's non-interactive runner.
+- Never retry an arbitrary command automatically under a different environment because the first
+  attempt may already have produced side effects.
+- Use `rsb run <name> --clean-env -- <command>` only for diagnostics that intentionally bypass the
+  captured interactive-shell environment.
 
 ## Avoid Synchronization Chatter
 

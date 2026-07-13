@@ -19,6 +19,8 @@ def test_parser_exposes_confirmed_commands_and_debug_flag() -> None:
     assert status.watch is True
     assert status.paths is True
     assert parser.parse_args(["conflicts", "dq"]).command == "conflicts"
+    assert parser.parse_args(["env", "show", "dq"]).env_command == "show"
+    assert parser.parse_args(["env", "refresh"]).env_command == "refresh"
     skill = parser.parse_args(["skill", "install", "--force"])
     assert skill.skill_command == "install"
     assert skill.force is True
@@ -177,6 +179,18 @@ def test_run_preserves_arguments_after_double_dash() -> None:
         "print('--flag')",
         "--flag",
     ]
+
+
+def test_run_parses_clean_environment_without_touching_command_arguments() -> None:
+    parsed = build_parser().parse_args(
+        ["run", "dq", "--clean-env", "--", "python", "--clean-env"]
+    )
+
+    assert cli_module._parse_run_items(parsed.items) == (
+        "dq",
+        ["python", "--clean-env"],
+        True,
+    )
 
 
 def test_cli_exposes_in_process_service_harness_types() -> None:

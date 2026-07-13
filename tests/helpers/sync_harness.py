@@ -54,7 +54,7 @@ from remote_sandbox.registry import (
     upsert_binding_record,
 )
 from remote_sandbox.remote_agent.store import RemoteStore
-from remote_sandbox.remote_client import RemoteSnapshot
+from remote_sandbox.remote_client import RemoteExecutionEnvironment, RemoteSnapshot
 from remote_sandbox.shell import ConnectResponse, ManagedShellSession
 from remote_sandbox.state import AuditSignature, WorkspaceStore
 from remote_sandbox.status import SyncProgress, WorkspacePhase, WorkspaceStatus
@@ -929,8 +929,28 @@ def make_cli_harness(tmp_path: Path) -> CliHarness:
             raise RuntimeError(harness._followup_error)
         return True
 
-    def run_remote(_record: BindingRecord, _argv: tuple[str, ...]) -> RemoteCommandResult:
+    def run_remote(
+        _record: BindingRecord,
+        _argv: tuple[str, ...],
+        _clean_environment: bool,
+    ) -> RemoteCommandResult:
         return harness._command_result
+
+    def execution_environment(
+        _record: BindingRecord,
+        refresh: bool,
+    ) -> RemoteExecutionEnvironment:
+        return RemoteExecutionEnvironment(
+            available=True,
+            refreshed=refresh,
+            export_file="/remote/private/execution-environment.sh",
+            captured_at="2026-01-01T00:00:00+00:00",
+            shell="/bin/bash",
+            path="/usr/bin",
+            python=None,
+            python3="/usr/bin/python3",
+            warning=None,
+        )
 
     def connect_workspace(
         target: str,
@@ -1056,6 +1076,7 @@ def make_cli_harness(tmp_path: Path) -> CliHarness:
         ensure_supervisor=lambda _record: pair.store.get_status(),
         request_sync=request_sync,
         run_remote=run_remote,
+        execution_environment=execution_environment,
         connect_workspace=connect_workspace,
         wait_initial_sync=wait_initial_sync,
         fetch_placeholders=fetch_registered,

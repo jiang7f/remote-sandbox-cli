@@ -13,6 +13,7 @@ from remote_sandbox.agent import AgentInstall
 from remote_sandbox.journal import EventKind
 from remote_sandbox.manifest import EntryKind, MissingEntry
 from remote_sandbox.remote_client import (
+    RemoteExecutionEnvironment,
     RemoteProtocolError,
     RemoteSnapshot,
     RemoteWorkspaceClient,
@@ -249,6 +250,74 @@ def test_remote_client_lifecycle_calls_use_structured_workspace_requests() -> No
         {"workspace_id": "w1", "sequence": 3},
         {"workspace_id": "w1"},
     ]
+
+
+def test_remote_client_parses_execution_environment_summary() -> None:
+    runner = RecordingRunner(
+        {
+            "execution-environment": {
+                "available": True,
+                "refreshed": True,
+                "export_file": "/home/u/.remote-sandbox/workspaces/w1/environment.sh",
+                "captured_at": "2026-07-13T10:00:00+00:00",
+                "shell": "/bin/bash",
+                "path": "/home/u/bin:/usr/bin",
+                "python": "/home/u/bin/python",
+                "python3": "/usr/bin/python3",
+                "warning": None,
+            }
+        }
+    )
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
+    )
+
+    environment = client.execution_environment(refresh=True)
+
+    assert environment == RemoteExecutionEnvironment(
+        available=True,
+        refreshed=True,
+        export_file="/home/u/.remote-sandbox/workspaces/w1/environment.sh",
+        captured_at="2026-07-13T10:00:00+00:00",
+        shell="/bin/bash",
+        path="/home/u/bin:/usr/bin",
+        python="/home/u/bin/python",
+        python3="/usr/bin/python3",
+        warning=None,
+    )
+    request = decode_request(runner.calls[0][2])
+    assert request.command == "execution-environment"
+    assert request.payload == {"workspace_id": "w1", "refresh": True}
+
+
+def test_remote_client_rejects_malformed_execution_environment() -> None:
+    runner = RecordingRunner(
+        {
+            "execution-environment": {
+                "available": True,
+                "refreshed": False,
+                "export_file": None,
+                "captured_at": None,
+                "shell": None,
+                "path": None,
+                "python": None,
+                "python3": None,
+                "warning": None,
+            }
+        }
+    )
+    client = RemoteWorkspaceClient(
+        runner,
+        target="example-host",
+        workspace_id="w1",
+        agent_path="~/.remote-sandbox/agents/0.2.0-dev/agent.pyz",
+    )
+
+    with pytest.raises(RemoteProtocolError, match="execution environment"):
+        client.execution_environment()
 
 
 def test_remote_client_ensures_versioned_agent_when_path_is_not_supplied() -> None:
