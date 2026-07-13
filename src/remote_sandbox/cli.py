@@ -74,6 +74,7 @@ class RemoteCommandResult:
     returncode: int
     stdout: str = ""
     stderr: str = ""
+    transport_complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +277,12 @@ def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
             sys.stdout.write(result.stdout)
         if result.stderr:
             sys.stderr.write(result.stderr)
+        if not result.transport_complete:
+            print(
+                "rsb: SSH transport ended before the remote command completed; "
+                "its exit status is unknown and the remote process may still be running",
+                file=sys.stderr,
+            )
         try:
             if not services.request_sync(record):
                 raise DaemonError("supervisor did not accept the sync request")
@@ -481,7 +488,12 @@ def default_cli_services() -> CliServices:
     ) -> RemoteCommandResult:
         runner = _connected_runner(record.target)
         result = runner.run_command(record.target, record.remote_path, argv)
-        return RemoteCommandResult(result.returncode, result.stdout, result.stderr)
+        return RemoteCommandResult(
+            result.returncode,
+            result.stdout,
+            result.stderr,
+            result.transport_complete,
+        )
 
     def connect_workspace(
         target: str,

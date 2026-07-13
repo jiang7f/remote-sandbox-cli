@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -59,6 +60,22 @@ def test_control_master_reuses_establishes_and_reports_failure(
 
     assert all(isinstance(call, list) for call in calls)
     assert any("-O" in call and "check" in call for call in calls)
+
+
+def test_shared_control_master_owns_keepalive_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("REMOTE_SANDBOX_CONTROL_DIR", str(tmp_path / "control"))
+
+    options = ssh_module.ssh_control_opts()
+
+    control_path = next(value for value in options if value.startswith("ControlPath="))
+    assert Path(control_path.removeprefix("ControlPath=")).name.startswith("v2-")
+    assert "ControlPersist=30m" in options
+    assert "ServerAliveInterval=15" in options
+    assert "ServerAliveCountMax=4" in options
+    assert "TCPKeepAlive=yes" in options
 
 
 def test_clear_master_retires_without_terminating_existing_sessions(
@@ -181,9 +198,11 @@ def test_subprocess_runner_reports_failures_and_validates_arguments(
 def test_run_command_does_not_use_the_internal_operation_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    argvs: list[list[str]] = []
     calls: list[dict[str, object]] = []
 
     def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        argvs.append(argv)
         calls.append(kwargs)
         return subprocess.CompletedProcess(argv, 0, "done\n", "")
 
@@ -192,7 +211,48 @@ def test_run_command_does_not_use_the_internal_operation_timeout(
     result = SubprocessSshRunner().run_command("host", "/work", ("sleep", "60"))
 
     assert result.returncode == 0
+    assert result.transport_complete is False
     assert calls[-1]["timeout"] is None
+    assert "ServerAliveInterval=15" in argvs[-1]
+    assert "ServerAliveCountMax=4" in argvs[-1]
+
+
+def test_run_command_extracts_remote_completion_without_polluting_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ssh_module.secrets, "token_hex", lambda _size: "abc123")
+
+    def run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv,
+            255,
+            "done\n",
+            "warning\n\x1eRSB-COMMAND-COMPLETE-abc123:7\x1f",
+        )
+
+    monkeypatch.setattr(ssh_module.subprocess, "run", run)
+
+    result = SubprocessSshRunner().run_command("host", "/work", ("command",))
+
+    assert result.returncode == 7
+    assert result.stdout == "done\n"
+    assert result.stderr == "warning\n"
+    assert result.transport_complete is True
+
+
+def test_run_command_reports_incomplete_transport_when_marker_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ssh_module.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 255, "", ""),
+    )
+
+    result = SubprocessSshRunner().run_command("host", "/work", ("command",))
+
+    assert result.returncode == 255
+    assert result.transport_complete is False
 
 
 def test_interactive_shell_requires_a_tty(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from helpers.sync_harness import CliHarness
 
+import remote_sandbox.cli as cli_module
 from remote_sandbox.placeholder import PLACEHOLDER_MAGIC, PlaceholderMetadata, encode_placeholder
 
 
@@ -18,6 +19,21 @@ def test_remote_exit_code_wins_when_sync_followup_fails(cli_fixture: CliHarness)
     assert "sync" in result.stderr
     assert "network down" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_run_distinguishes_incomplete_ssh_transport_from_remote_failure(
+    cli_fixture: CliHarness,
+) -> None:
+    cli_fixture.services.run_remote = lambda _record, _command: cli_module.RemoteCommandResult(
+        255,
+        transport_complete=False,
+    )
+
+    result = cli_fixture.run(["run", "dq", "--", "long-command"])
+
+    assert result.exit_code == 255
+    assert "SSH transport ended before the remote command completed" in result.stderr
+    assert "remote process may still be running" in result.stderr
 
 
 def test_status_explains_foreground_reconnect_for_password_auth(

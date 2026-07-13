@@ -1,6 +1,6 @@
 interface:
   display_name: "Remote Sandbox"
-  short_description: "Edit locally and run seamlessly through rsb"
-  default_prompt: "Use $remote-sandbox for this project. Resolve the binding automatically, edit locally, and run required commands remotely."
+  short_description: "Use rsb only when explicitly requested"
+  default_prompt: "Use $remote-sandbox to resolve this project's binding, show both paths once, edit locally, and run commands remotely."
 policy:
   allow_implicit_invocation: true

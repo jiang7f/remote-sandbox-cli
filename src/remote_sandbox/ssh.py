@@ -14,6 +14,12 @@ from typing import Literal, Protocol
 
 from remote_sandbox.namespace import ssh_control_dir
 
+_CONTROL_SOCKET_VERSION = "v2"
+_CONTROL_PERSIST = "30m"
+_SERVER_ALIVE_INTERVAL = 15
+_SERVER_ALIVE_COUNT_MAX = 4
+_COMMAND_COMPLETION_PREFIX = "RSB-COMMAND-COMPLETE-"
+
 
 class SshError(RuntimeError):
     pass
@@ -136,16 +142,24 @@ def ssh_control_opts() -> list[str]:
 
     The first connection authenticates (a password is typed once); ``ControlPersist``
     keeps the master socket alive so every later connection — including the background
-    daemon — reuses it without prompting. ``%C`` derives a unique socket per target, so
-    the same option list works for every call site.
+    daemon — reuses it without prompting. Keepalive belongs here because multiplexed
+    clients cannot add transport settings to an already-running master. The versioned
+    socket path prevents an upgraded client from reusing an older master without these
+    settings. ``%C`` still derives a unique socket per target.
     """
     return [
         "-o",
         "ControlMaster=auto",
         "-o",
-        f"ControlPath={_control_dir()}/%C",
+        f"ControlPath={_control_dir()}/{_CONTROL_SOCKET_VERSION}-%C",
         "-o",
-        "ControlPersist=10m",
+        f"ControlPersist={_CONTROL_PERSIST}",
+        "-o",
+        f"ServerAliveInterval={_SERVER_ALIVE_INTERVAL}",
+        "-o",
+        f"ServerAliveCountMax={_SERVER_ALIVE_COUNT_MAX}",
+        "-o",
+        "TCPKeepAlive=yes",
     ]
 
 
@@ -170,6 +184,7 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+    transport_complete: bool = True
 
 
 @dataclass
@@ -714,11 +729,20 @@ class SubprocessSshRunner:
     def run_command(self, target: str, cwd: str, argv: tuple[str, ...]) -> CommandResult:
         if not argv:
             raise SshError("remote command is empty")
+        completion_marker = _COMMAND_COMPLETION_PREFIX + secrets.token_hex(16)
         script = (
-            'p=$(remote_sandbox_path "$1") || exit 2\n'
+            "status=0\n"
+            'p=$(remote_sandbox_path "$1") || status=$?\n'
             "shift\n"
-            'cd -- "$p" || exit\n'
-            '"$@"\n'
+            'if [ "$status" -eq 0 ]; then\n'
+            '    cd -- "$p" || status=$?\n'
+            "fi\n"
+            'if [ "$status" -eq 0 ]; then\n'
+            '    "$@"\n'
+            "    status=$?\n"
+            "fi\n"
+            f"printf '\\036{completion_marker}:%s\\037' \"$status\" >&2\n"
+            'exit "$status"\n'
         )
         result = self._run_script(
             target,
@@ -728,10 +752,15 @@ class SubprocessSshRunner:
             path_arg_count=1,
             timeout=None,
         )
+        remote_status, stderr = _extract_command_completion(
+            result.stderr,
+            completion_marker,
+        )
         return CommandResult(
-            returncode=result.returncode,
+            returncode=result.returncode if remote_status is None else remote_status,
             stdout=result.stdout,
-            stderr=result.stderr,
+            stderr=stderr,
+            transport_complete=remote_status is not None,
         )
 
     def interactive_shell(
@@ -842,10 +871,6 @@ class SubprocessSshRunner:
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=10",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=2",
         ]
 
 
@@ -861,6 +886,21 @@ _REMOTE_PATH_FUNC = (
     "  esac\n"
     "}\n"
 )
+
+
+def _extract_command_completion(stderr: str, marker: str) -> tuple[int | None, str]:
+    prefix = f"\x1e{marker}:"
+    start = stderr.rfind(prefix)
+    if start < 0:
+        return None, stderr
+    status_start = start + len(prefix)
+    end = stderr.find("\x1f", status_start)
+    if end < 0:
+        return None, stderr
+    raw_status = stderr[status_start:end]
+    if not raw_status.isdecimal():
+        return None, stderr
+    return int(raw_status), stderr[:start] + stderr[end + 1 :]
 
 
 _DELETE_WORKSPACE_PATH_CODE = (
