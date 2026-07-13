@@ -16,8 +16,9 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TextIO, cast
 
+from remote_sandbox import __version__
 from remote_sandbox.agent import RemoteAgentManager
 from remote_sandbox.bind import bind_workspace
 from remote_sandbox.daemon import (
@@ -148,6 +149,9 @@ node_modules/
 """
 
 _AUTO_REMOTE_ROOT = "~/rsb-workspaces"
+_ALT_SCREEN_ENTER = "\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J"
+_ALT_SCREEN_REFRESH = "\x1b[H\x1b[2J"
+_ALT_SCREEN_LEAVE = "\x1b[?25h\x1b[?1049l"
 
 
 def automatic_remote_workspace_path(local: Path, name: str | None = None) -> str:
@@ -166,6 +170,20 @@ def _connect_remote_path(args: argparse.Namespace) -> str:
     if args.auto_remote:
         return automatic_remote_workspace_path(Path(args.local), args.name)
     raise ValueError("connect requires --remote or --auto-remote")
+
+
+@contextlib.contextmanager
+def _status_watch_screen(stream: TextIO):  # type: ignore[no-untyped-def]
+    interactive = stream.isatty()
+    if interactive:
+        stream.write(_ALT_SCREEN_ENTER)
+        stream.flush()
+    try:
+        yield interactive
+    finally:
+        if interactive:
+            stream.write(_ALT_SCREEN_LEAVE)
+            stream.flush()
 
 
 def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
@@ -188,20 +206,26 @@ def _dispatch_services(args: argparse.Namespace, services: CliServices) -> int:
         if not records:
             print("No bound workspaces")
             return 0
-        iteration = 0
-        while True:
-            if iteration:
-                print("\x1b[H\x1b[2J", end="")
-            print(_service_status_table(records, services, include_paths=args.paths))
-            iteration += 1
-            if not args.watch or (
-                services.watch_limit is not None and iteration >= services.watch_limit
-            ):
-                break
-            try:
-                services.watch_sleep(1.0)
-            except KeyboardInterrupt:
-                break
+        screen = _status_watch_screen(sys.stdout) if args.watch else contextlib.nullcontext(False)
+        with screen as interactive:
+            iteration = 0
+            while True:
+                if iteration:
+                    if interactive:
+                        sys.stdout.write(_ALT_SCREEN_REFRESH)
+                    else:
+                        print()
+                print(_service_status_table(records, services, include_paths=args.paths))
+                sys.stdout.flush()
+                iteration += 1
+                if not args.watch or (
+                    services.watch_limit is not None and iteration >= services.watch_limit
+                ):
+                    break
+                try:
+                    services.watch_sleep(1.0)
+                except KeyboardInterrupt:
+                    break
         return 0
 
     if args.command == "run":
@@ -610,6 +634,11 @@ def _with_remote_client(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rsb")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
     parser.add_argument(
         "--debug",
         action="store_true",

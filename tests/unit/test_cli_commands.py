@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from dataclasses import fields
 from pathlib import Path
 
@@ -57,6 +58,36 @@ def test_parser_exposes_confirmed_commands_and_debug_flag() -> None:
                 "--auto-remote",
             ]
         )
+
+
+def test_version_flag_prints_the_installed_version(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(["--version"])
+
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out.startswith("rsb ")
+
+
+def test_status_watch_screen_uses_alternate_screen_only_for_tty() -> None:
+    class TtyBuffer(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    terminal = TtyBuffer()
+    with cli_module._status_watch_screen(terminal) as interactive:
+        assert interactive is True
+        terminal.write("frame")
+    rendered = terminal.getvalue()
+    assert rendered.startswith(cli_module._ALT_SCREEN_ENTER)
+    assert rendered.endswith(cli_module._ALT_SCREEN_LEAVE)
+
+    redirected = io.StringIO()
+    with cli_module._status_watch_screen(redirected) as interactive:
+        assert interactive is False
+        redirected.write("frame")
+    assert redirected.getvalue() == "frame"
 
 
 def test_automatic_remote_workspace_path_is_stable_and_does_not_expose_local_path(

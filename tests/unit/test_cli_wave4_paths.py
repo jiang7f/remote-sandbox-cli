@@ -81,7 +81,8 @@ def test_status_empty_missing_and_watch_refresh_paths(
     cli_fixture.services.watch_sleep = lambda _seconds: None
     watched = cli.invoke_cli(["status", "--watch"], services=cli_fixture.services)
     assert watched.exit_code == 0
-    assert "\x1b[H\x1b[2J" in watched.stdout
+    assert "\x1b[H\x1b[2J" not in watched.stdout
+    assert watched.stdout.count("NAME") == 2
 
     cli_fixture.services.watch_limit = None
     cli_fixture.services.watch_sleep = lambda _seconds: (_ for _ in ()).throw(

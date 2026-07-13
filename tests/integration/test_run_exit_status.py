@@ -221,9 +221,10 @@ def test_status_watch_redraws_one_table(cli_fixture: CliHarness) -> None:
 
     assert result.exit_code == 0
     assert "starting" in result.stdout
-    assert "\x1b[H\x1b[2J" in result.stdout
+    assert "\x1b[H\x1b[2J" not in result.stdout
+    assert "\n\n" in result.stdout
     assert result.stdout.rstrip().endswith("0")
-    assert "ready" in result.stdout.split("\x1b[H\x1b[2J")[-1]
+    assert "ready" in result.stdout
 
 
 def test_status_watch_ctrl_c_exits_without_traceback(cli_fixture: CliHarness) -> None:
