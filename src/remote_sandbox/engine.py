@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import stat
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -22,7 +21,7 @@ from remote_sandbox._engine_planning import (
     strengthen_deletion_targets,
     strengthen_requeued_files,
 )
-from remote_sandbox._transport_fingerprint import LocalPathChanged, ProtectedLocalRoot
+from remote_sandbox._transport_fingerprint import ProtectedLocalRoot
 from remote_sandbox.journal import EventKind, JournalEvent, coalesce_events
 from remote_sandbox.manifest import (
     EntryFingerprint,
@@ -35,7 +34,6 @@ from remote_sandbox.reconcile import (
     ActionType,
     ConflictDecision,
     PlanWarning,
-    SyncAction,
     SyncPlan,
     build_incremental_plan,
 )
@@ -356,7 +354,6 @@ class SyncEngine:
         transferred: set[str] = set()
         completed: set[str] = set()
         changed: set[str] = set()
-        adopted_changed: set[str] = set()
         base_after: dict[str, FingerprintState] = {}
         expected_echoes: dict[tuple[str, str], FingerprintState] = {}
         deferred_deletes = self._conflicting_directory_deletes(plan)
@@ -413,17 +410,6 @@ class SyncEngine:
                 transferred.update(result.completed)
                 completed.update(result.completed)
                 changed.update(result.changed_during_transfer)
-                adopted = self._adoptable_changed_destinations(
-                    direction,
-                    actions,
-                    result.changed_during_transfer,
-                )
-                adopted_changed.update(adopted)
-                base_after.update(adopted)
-                expected_echoes.update(
-                    ((destination_side, path), fingerprint)
-                    for path, fingerprint in adopted.items()
-                )
                 known_unused.update(
                     (destination_side, path) for path in result.changed_during_transfer
                 )
@@ -516,20 +502,19 @@ class SyncEngine:
         acknowledge_events = not changed
         try:
             with self.store.transaction():
-                for path in sorted(completed | adopted_changed):
+                for path in sorted(completed):
                     state = base_after[path]
                     if isinstance(state, MissingEntry):
                         self.store.delete_base(path)
                     else:
                         self.store.upsert_base(state)
-                    if path in completed:
-                        self.store.resolve_conflicts_for_path(path)
+                    self.store.resolve_conflicts_for_path(path)
                 for (side, _path), fingerprint in sorted(expected_echoes.items()):
                     self.store.set_expected_echo(side, fingerprint)
                 for echo in echoes:
                     self.store.consume_expected_echo(echo.side, echo.observed)
                 for (side, path), fingerprint in intents.items():
-                    if path in changed and path not in adopted_changed:
+                    if path in changed:
                         self.store.consume_expected_echo(side, fingerprint)
                 for conflict, local_blob, remote_blob in conflict_payloads:
                     record = self._existing_conflict(conflict)
@@ -785,29 +770,6 @@ class SyncEngine:
             base=self.store.list_base(),
         )
 
-    def _adoptable_changed_destinations(
-        self,
-        direction: TransferDirection,
-        actions: tuple[SyncAction, ...],
-        paths: tuple[str, ...],
-    ) -> dict[str, EntryFingerprint]:
-        if not paths:
-            return {}
-        planned = {action.path: action.base_after for action in actions}
-        adopted: dict[str, EntryFingerprint] = {}
-        for path in paths:
-            expected = planned.get(path)
-            if not isinstance(expected, EntryFingerprint):
-                continue
-            try:
-                observed = self._destination_hashes(direction, (path,))[path]
-            except LocalPathChanged:
-                continue
-            if _matches_installed_snapshot(expected, observed):
-                assert isinstance(observed, EntryFingerprint)
-                adopted[path] = observed
-        return adopted
-
     def _record_audit_drift(self) -> None:
         self.audit_coordinator.record_drift()
 
@@ -891,23 +853,3 @@ def _capture_matches(planned: FingerprintState, observed: FingerprintState) -> b
         and planned.mtime_ns == observed.mtime_ns
         and planned.mode == observed.mode
     )
-
-
-def _matches_installed_snapshot(
-    planned: EntryFingerprint,
-    observed: FingerprintState,
-) -> bool:
-    if not isinstance(observed, EntryFingerprint) or planned.kind is not observed.kind:
-        return False
-    if planned.is_placeholder or observed.is_placeholder:
-        return False
-    if planned.kind is EntryKind.FILE:
-        return (
-            planned.content_hash is not None
-            and planned.content_hash == observed.content_hash
-            and planned.size == observed.size
-            and stat.S_IMODE(planned.mode or 0) == stat.S_IMODE(observed.mode or 0)
-        )
-    if planned.kind is EntryKind.SYMLINK:
-        return planned.link_target == observed.link_target
-    return False

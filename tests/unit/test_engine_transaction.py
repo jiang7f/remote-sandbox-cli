@@ -17,7 +17,6 @@ from remote_sandbox.transport import (
     TransferDirection,
     TransferItem,
     TransferPreflightError,
-    TransferResult,
 )
 
 
@@ -30,102 +29,6 @@ def test_engine_does_not_ack_event_when_transfer_changes_midflight(
     assert result.requeued == ("a.py",)
     assert engine_fixture.store.acknowledged_sequence("local") == 0
     assert engine_fixture.store.get_expected_echo("remote", "a.py") is None
-
-
-def test_changed_pull_adopts_installed_snapshot_before_retry(
-    engine_fixture: EngineHarness,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    path = "checkpoint.csv"
-    for root in (engine_fixture.local, engine_fixture.remote):
-        (root / path).write_bytes(b"base\n")
-    engine_fixture.store.replace_base(  # type: ignore[arg-type]
-        engine_fixture.remote_client.hash_paths((path,))
-    )
-    (engine_fixture.remote / path).write_bytes(b"remote-v1\n")
-    engine_fixture.remote_client.append_event(EventKind.MODIFY, path)
-    original_transfer = engine_fixture.transport.transfer
-
-    def install_then_advance(
-        batch: TransferBatch,
-        on_progress: object,
-    ) -> TransferResult:
-        del on_progress
-        assert batch.direction is TransferDirection.PULL
-        shutil.copy2(engine_fixture.remote / path, engine_fixture.local / path)
-        (engine_fixture.remote / path).write_bytes(b"remote-v2\n")
-        engine_fixture.remote_client.append_event(EventKind.MODIFY, path)
-        return TransferResult((), (path,))
-
-    monkeypatch.setattr(engine_fixture.transport, "transfer", install_then_advance)
-
-    first = engine_fixture.engine.run_once("remote-checkpoint-v1")
-
-    installed = fingerprint_local(engine_fixture.local, path, with_hash=True)
-    assert isinstance(installed, EntryFingerprint)
-    assert first.requeued == (path,)
-    assert engine_fixture.store.get_base(path) == installed
-    assert engine_fixture.store.get_expected_echo("local", path) == installed
-    assert engine_fixture.store.list_conflicts(unresolved_only=True) == []
-
-    engine_fixture.store.append_event("local", EventKind.MODIFY, path)
-    monkeypatch.setattr(engine_fixture.transport, "transfer", original_transfer)
-
-    recovered = engine_fixture.engine.run_once("remote-checkpoint-v2")
-
-    assert recovered.completed == (path,)
-    assert recovered.conflict_ids == ()
-    assert (engine_fixture.local / path).read_bytes() == b"remote-v2\n"
-    assert engine_fixture.store.list_conflicts(unresolved_only=True) == []
-    assert engine_fixture.store.list_requeued_paths() == ()
-
-
-def test_changed_push_adopts_installed_snapshot_before_retry(
-    engine_fixture: EngineHarness,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    path = "checkpoint.csv"
-    for root in (engine_fixture.local, engine_fixture.remote):
-        (root / path).write_bytes(b"base\n")
-    engine_fixture.store.replace_base(  # type: ignore[arg-type]
-        engine_fixture.remote_client.hash_paths((path,))
-    )
-    (engine_fixture.local / path).write_bytes(b"local-v1\n")
-    engine_fixture.store.append_event("local", EventKind.MODIFY, path)
-    original_transfer = engine_fixture.transport.transfer
-
-    def install_then_advance(
-        batch: TransferBatch,
-        on_progress: object,
-    ) -> TransferResult:
-        del on_progress
-        assert batch.direction is TransferDirection.PUSH
-        shutil.copy2(engine_fixture.local / path, engine_fixture.remote / path)
-        (engine_fixture.local / path).write_bytes(b"local-v2\n")
-        engine_fixture.store.append_event("local", EventKind.MODIFY, path)
-        return TransferResult((), (path,))
-
-    monkeypatch.setattr(engine_fixture.transport, "transfer", install_then_advance)
-
-    first = engine_fixture.engine.run_once("local-checkpoint-v1")
-
-    installed = fingerprint_local(engine_fixture.remote, path, with_hash=True)
-    assert isinstance(installed, EntryFingerprint)
-    assert first.requeued == (path,)
-    assert engine_fixture.store.get_base(path) == installed
-    assert engine_fixture.store.get_expected_echo("remote", path) == installed
-    assert engine_fixture.store.list_conflicts(unresolved_only=True) == []
-
-    engine_fixture.remote_client.append_event(EventKind.MODIFY, path)
-    monkeypatch.setattr(engine_fixture.transport, "transfer", original_transfer)
-
-    recovered = engine_fixture.engine.run_once("local-checkpoint-v2")
-
-    assert recovered.completed == (path,)
-    assert recovered.conflict_ids == ()
-    assert (engine_fixture.remote / path).read_bytes() == b"local-v2\n"
-    assert engine_fixture.store.list_conflicts(unresolved_only=True) == []
-    assert engine_fixture.store.list_requeued_paths() == ()
 
 
 def test_expected_echo_is_committed_before_transfer_destination_changes(
