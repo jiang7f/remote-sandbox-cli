@@ -1,6 +1,6 @@
 [project]
 name = "remote-sandbox"
-version = "0.2.5"
+version = "0.2.6"
 description = "Editor-agnostic remote workspace sandbox with SSH-backed execution and sync"
 readme = "README.md"
 license = "MIT"

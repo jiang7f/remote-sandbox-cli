@@ -369,7 +369,7 @@ wheels = [
 
 [[package]]
 name = "remote-sandbox"
-version = "0.2.5"
+version = "0.2.6"
 source = { editable = "." }
 dependencies = [
     { name = "watchdog" },
